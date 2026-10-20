@@ -1,10 +1,11 @@
 """Retrieve global ERA5 fields and stage GRIB downloads."""
 
 from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
+import time
 
 import cdsapi
 from multiurl import robust
@@ -139,6 +140,7 @@ def download_batch(
         batch: Exact completed directory allocated by the caller for this
             request. Work resumes in its .partial sibling; an interrupted
             transfer restarts its bytes using the same recorded remote job.
+            Waiting messages retain the original request's elapsed time.
 
     Returns:
         The completed batch directory, reused directly if already present.
@@ -186,6 +188,21 @@ def download_batch(
             journal["cds_request_id"] = remote.request_id
             (partial / "request.json.tmp").write_text(json.dumps(journal) + "\n", encoding="utf-8")
             (partial / "request.json.tmp").replace(partial / "request.json")
+        last_notice = time.monotonic()
+        poll_delay = 1.0
+        while not remote.results_ready:
+            now = time.monotonic()
+            if now - last_notice >= 30:
+                elapsed = datetime.now(UTC) - datetime.fromisoformat(journal["started_at"])
+                elapsed = timedelta(seconds=int(elapsed.total_seconds()))
+                status = "queued (accepted)" if remote.last_status == "accepted" else remote.last_status
+                print(
+                    f"CDS request {remote.request_id}: still {status}; "
+                    f"{elapsed} since request started. Still checking CDS.", flush=True,
+                )
+                last_notice = now
+            time.sleep(poll_delay)
+            poll_delay = min(poll_delay * 1.5, CLIENT_OPTIONS["sleep_max"])
         remote.download(str(target))
     retrieved_at = datetime.now(UTC).isoformat()
     with target.open("rb") as stream:

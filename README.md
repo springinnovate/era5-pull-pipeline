@@ -65,7 +65,13 @@ From the directory containing `.cdsapirc`, run:
 
 This retrieves three complete UTC days on the global grid, in one-day batches, and publishes `1999/12/era5.zarr` and `2000/01/era5.zarr` beneath the archive directory. `--batch-days` defaults to 7. Requests stop at month boundaries and are subdivided further to respect CDS field limits. It limits calendar days per batch; compressed GRIB sizes vary by variable and data values.
 
-CDS prints the request ID and status changes, such as `accepted`, `running`, and `successful`. Once the file transfer begins, a progress bar shows downloaded bytes, transfer rate, and an estimated remaining transfer time. While a request stays queued, its status can remain unchanged; the transfer estimate does not include queue time. These messages also appear when resuming a saved CDS job.
+CDS prints the request ID and status changes, such as `accepted`, `running`, and `successful`. While waiting, the pipeline also reports a successful status check approximately every 30 seconds, showing whether the job is queued or running and the elapsed time since the request started. That elapsed time includes earlier invocations when resuming a saved job. For example:
+
+```text
+CDS request <job-id>: still queued (accepted); 0:15:30 since request started. Still checking CDS.
+```
+
+Once the file transfer begins, a progress bar shows downloaded bytes, transfer rate, and an estimated remaining transfer time. The transfer estimate does not include queue time; CDS does not provide a queue completion estimate.
 
 Repeat the same command to verify coverage: a completed range prints `completed=0, skipped=144` and makes no CDS calls. Counts are **variable-hours**: two variables over three 24-hour days total 144. `completed` counts fields published in this invocation; `skipped` counts already stored fields; `unavailable` counts requested hours absent from CDS's availability snapshot. `failed` identifies a failed batch or monthly publication, and `pending` counts remaining unattempted or staged fields. A failure prints the summary and original error. Hours marked unavailable are requested again on a subsequent run.
 
