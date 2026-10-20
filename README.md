@@ -24,12 +24,6 @@ url: https://cds.climate.copernicus.eu/api
 key: YOUR_PERSONAL_ACCESS_TOKEN
 ```
 
-At startup, the pipeline reads the local file and validates that both `url` and `key` are present and nonempty. It then sets `CDSAPI_URL` and `CDSAPI_KEY` in its Python process before creating the CDS client. The local file replaces both environment values for that process. It does not change your shell or system environment.
-
-A malformed or incomplete local file stops the run with a configuration error before either environment value changes. If the local file is absent, the client uses its normal credential configuration, including environment variables or the home-directory `.cdsapirc`. See the [CDS client configuration](https://github.com/ecmwf/cdsapi/blob/master/cdsapi/api.py).
-
-The access token is never logged or copied into the archive. `.cdsapirc` is excluded from version control.
-
 ## Data
 
 The source is [ERA5 hourly data on single levels](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels), using the regular 0.25° latitude/longitude grid.
@@ -38,7 +32,7 @@ The archive retains source units, grid coordinates, UTC timestamps, decoded nume
 
 ## Pipeline steps
 
-1. **Load credentials.** Read the local `.cdsapirc` into the process environment and create the CDS client using the credential rules above.
+1. **Load credentials.** Authenticate with CDS using the local `.cdsapirc` file.
 2. **Find missing coverage.** Compare the requested dates and variables with the archive's SQLite catalog. Already stored variable/hour combinations are skipped; gaps and newly requested variables are included.
 3. **Download GRIB batches.** Split requests according to the download batch size, stopping at calendar-month boundaries. Batch size is independent of the Zarr storage layout.
 4. **Assemble the month.** Decode the GRIB fields into arrays with dimensions `(time, latitude, longitude)`. Combine batches in a staging area for the relevant month. For an existing month, merge new or refreshed values with its published contents, preserving all other variables and hours. During a historical backfill, assemble all requested batches for a month before publishing it.
