@@ -1,14 +1,15 @@
-"""Download and archive global ERA5 batches or check CDS access."""
+"""Download and archive global ERA5 date ranges or check CDS access."""
 
 import argparse
 from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 import sys
+from uuid import uuid4
 
 from era5_pull_pipeline.cds import DEFAULT_MAX_DAYS, build_batch_request, check_access, download_batch
 from era5_pull_pipeline.credentials import load_credentials
-from era5_pull_pipeline.pipeline import ingest_batch, pull_batch
+from era5_pull_pipeline.pipeline import ingest_batch, pull_batch, pull_range
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -56,16 +57,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             "calendar-month interval. Stored fields are preserved and skipped."
         ),
     )
-    for selection in (batch, pull):
+    date_range = commands.add_parser(
+        "pull",
+        help="Fill a date range using resumable batches and monthly publication.",
+        description=(
+            "Download missing global fields across an inclusive UTC date range. "
+            "Reuse verified staged work, publish each month once, and exit. "
+            "Unavailable hours remain missing for the next run."
+        ),
+    )
+    for selection in (batch, pull, date_range):
         selection.add_argument("--start-date", type=date.fromisoformat, required=True, metavar="YYYY-MM-DD")
         selection.add_argument("--end-date", type=date.fromisoformat, required=True, metavar="YYYY-MM-DD")
         selection.add_argument("--variables", nargs="+", required=True, metavar="NAME", help="CDS variable names.")
+    for selection in (batch, pull):
         selection.add_argument(
             "--max-days",
             type=int,
             default=DEFAULT_MAX_DAYS,
             help=f"Maximum days in this request (default: {DEFAULT_MAX_DAYS}); not a byte or RAM limit.",
         )
+    date_range.add_argument(
+        "--batch-days", type=int, default=DEFAULT_MAX_DAYS,
+        help=f"Maximum days per download batch (default: {DEFAULT_MAX_DAYS}); not a byte or RAM limit.",
+    )
     batch.add_argument(
         "--staging",
         type=Path,
@@ -77,7 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Publish an existing completed download without contacting CDS.",
     )
     ingest.add_argument("--batch", type=Path, required=True, help="Completed download directory.")
-    for storage in (pull, ingest):
+    for storage in (pull, ingest, date_range):
         storage.add_argument(
             "--archive", type=Path, default=Path("archive"),
             help="Archive directory (default: archive).",
@@ -104,9 +119,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             completed = download_batch(
                 credentials,
                 build_batch_request(args.start_date, args.end_date, args.variables, args.max_days),
-                args.staging,
+                args.staging / f"{args.start_date}_{args.end_date}_{uuid4().hex}",
             )
             print(f"Saved completed batch to {completed}.")
+        elif args.command == "pull":
+            pull_range(
+                args.start_date, args.end_date, args.variables, args.archive,
+                tuple(args.spatial_chunks), args.batch_days,
+            )
         elif args.command == "pull-batch":
             print(
                 f"Checking archive coverage for {args.start_date} through {args.end_date}. "

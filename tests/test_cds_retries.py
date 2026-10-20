@@ -46,7 +46,7 @@ def _response(
 
 @pytest.mark.parametrize(
     ("status", "attempts", "message"),
-    [(503, 2, "503 Server Error"), (403, 1, "cost limits exceeded")],
+    [(503, 3, "503 Server Error"), (403, 1, "cost limits exceeded")],
 )
 def test_execution_failure_retry_policy(
     tmp_path: Path,
@@ -86,15 +86,16 @@ def test_execution_failure_retry_policy(
         cds.download_batch(
             CREDENTIALS,
             cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
-            tmp_path,
+            tmp_path / "batch",
         )
 
     assert len(failures) == attempts
     assert caught.value.response is failures[-1]
-    assert sleeps == ([2] if attempts == 2 else [])
+    assert sleeps == ([2, 4] if attempts == 3 else [])
     (partial,) = tmp_path.iterdir()
     assert partial.suffix == ".partial"
-    assert list(partial.iterdir()) == []
+    assert [path.name for path in partial.iterdir()] == ["request.json"]
+    assert "cds_request_id" not in json.loads((partial / "request.json").read_text())
     if status == 403:
         assert "please reduce your selection" in str(caught.value)
 
@@ -102,15 +103,19 @@ def test_execution_failure_retry_policy(
 def test_interrupted_transfer_exhausts_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Retry a real streaming download once and preserve its final interruption."""
+    """Retry a real streaming download with backoff and preserve its interruption."""
     failure = requests.exceptions.ChunkedEncodingError("Connection interrupted")
     ranges: list[str | None] = []
     sleeps: list[float] = []
+    submissions: list[str] = []
+    fail_transfer = True
 
     def interrupted_stream(chunk_size: int) -> Iterator[bytes]:
         """Deliver a partial body before the simulated transport disconnects."""
-        yield b"part"
-        raise failure
+        if fail_transfer:
+            yield b"part"
+            raise failure
+        yield b"fresh-source"
 
     def request(
         self: requests.Session, method: str, url: str, **kwargs: Any
@@ -133,7 +138,7 @@ def test_interrupted_transfer_exhausts_retries(
             f"{PROCESS_URL}/execution": {
                 "links": [{"rel": "monitor", "href": JOB_URL}]
             },
-            JOB_URL: {"status": "successful"},
+            JOB_URL: {"status": "successful", "links": [{"rel": "self", "href": JOB_URL}]},
             f"{JOB_URL}/results": {
                 "asset": {
                     "value": {
@@ -144,6 +149,8 @@ def test_interrupted_transfer_exhausts_retries(
                 }
             },
         }
+        if method.lower() == "post":
+            submissions.append(url)
         return _response(method, url, bodies[url])
 
     monkeypatch.setattr(requests.Session, "request", request)
@@ -152,13 +159,24 @@ def test_interrupted_transfer_exhausts_retries(
         cds.download_batch(
             CREDENTIALS,
             cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
-            tmp_path,
+            tmp_path / "batch",
         )
 
     assert caught.value is failure
-    assert ranges == [None, "bytes=4-"]
-    assert sleeps == [2]
+    assert ranges == [None, "bytes=4-", "bytes=8-"]
+    assert sleeps == [2, 4]
     (partial,) = tmp_path.iterdir()
     assert partial.suffix == ".partial"
-    assert (partial / "data.grib").read_bytes() == b"partpart"
+    assert (partial / "data.grib").read_bytes() == b"partpartpart"
     assert not (partial / "metadata.json").exists()
+
+    fail_transfer = False
+    completed = cds.download_batch(
+        CREDENTIALS,
+        cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
+        tmp_path / "batch",
+    )
+    assert submissions == [f"{PROCESS_URL}/execution"]
+    assert ranges == [None, "bytes=4-", "bytes=8-", None]
+    assert completed == partial.with_suffix("")
+    assert (completed / "data.grib").read_bytes() == b"fresh-source"

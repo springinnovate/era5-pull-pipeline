@@ -5,9 +5,9 @@ from datetime import UTC, date, datetime
 import hashlib
 import json
 from pathlib import Path
-from tempfile import mkdtemp
 
 import cdsapi
+from multiurl import robust
 import requests
 import xarray as xr
 
@@ -17,6 +17,9 @@ DATASET = "reanalysis-era5-single-levels"
 DEFAULT_MAX_DAYS = 7
 # Published CDS ERA5 hourly single-level limit; CDS also applies dynamic limits.
 MAX_REQUEST_FIELDS = 120_000
+CATALOGUE_URL = f"https://cds.climate.copernicus.eu/api/catalogue/v1/collections/{DATASET}"
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF = (2, 30, 2)
 CLIENT_OPTIONS = {
     "verify": True,
     "quiet": True,
@@ -125,35 +128,45 @@ def build_batch_request(
 def download_batch(
     credentials: CdsCredentials,
     request: dict[str, str | list[str] | list[float]],
-    staging: Path,
+    batch: Path,
 ) -> Path:
-    """Stream a selected batch to disk and complete its staging directory.
+    """Download or resume one batch at its recorded destination.
 
     Args:
         credentials: Connection settings from the local .cdsapirc.
         request: Bounded single-month selection from build_batch_request, or a
             subset of its variables, days, and hours selected by the planner.
-        staging: Parent directory for completed and partial batch directories.
+        batch: Exact completed directory allocated by the caller for this
+            request. Work resumes in its .partial sibling; an interrupted
+            transfer restarts its bytes using the same recorded remote job.
 
     Returns:
-        A new directory containing data.grib and metadata.json.
+        The completed batch directory, reused directly if already present.
 
     Raises:
         Exception: File or CDS errors propagate. Unfinished batches retain the
             .partial directory suffix.
     """
+    if batch.exists():
+        return batch
     identity = json.dumps(
         {"dataset": DATASET, "request": request}, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
-    period = f"{request['year'][0]}-{request['month'][0]}"
-    start = f"{period}-{min(request['day'])}"
-    end = f"{period}-{max(request['day'])}"
-    staging.mkdir(parents=True, exist_ok=True)
-    partial = Path(
-        mkdtemp(prefix=f"{start}_{end}_", suffix=".partial", dir=staging)
-    )
+    request_sha256 = hashlib.sha256(identity).hexdigest()
+    partial = batch.with_suffix(".partial")
+    partial.mkdir(parents=True, exist_ok=True)
+    if (partial / "request.json").exists():
+        journal = json.loads((partial / "request.json").read_text(encoding="utf-8"))
+    else:
+        journal = {
+            "dataset": DATASET,
+            "request": request,
+            "request_sha256": request_sha256,
+            "started_at": datetime.now(UTC).isoformat(),
+        }
+        (partial / "request.json.tmp").write_text(json.dumps(journal) + "\n", encoding="utf-8")
+        (partial / "request.json.tmp").replace(partial / "request.json")
     target = partial / "data.grib"
-    started_at = datetime.now(UTC).isoformat()
     with requests.Session() as session:
         client = cdsapi.Client(
             url=credentials.url,
@@ -162,7 +175,17 @@ def download_batch(
             wait_until_complete=False,
             **CLIENT_OPTIONS,
         )
-        remote = client.retrieve(DATASET, request)
+        # The native client passes this bounded exponential schedule through to
+        # multiurl for submission, polling, and transfer retries.
+        client.client.maximum_tries = RETRY_ATTEMPTS
+        client.client.retry_after = RETRY_BACKOFF
+        if "cds_request_id" in journal:
+            remote = client.client.get_remote(journal["cds_request_id"])
+        else:
+            remote = client.retrieve(DATASET, request)
+            journal["cds_request_id"] = remote.request_id
+            (partial / "request.json.tmp").write_text(json.dumps(journal) + "\n", encoding="utf-8")
+            (partial / "request.json.tmp").replace(partial / "request.json")
         remote.download(str(target))
     retrieved_at = datetime.now(UTC).isoformat()
     with target.open("rb") as stream:
@@ -170,9 +193,9 @@ def download_batch(
     metadata = {
         "dataset": DATASET,
         "request": request,
-        "request_sha256": hashlib.sha256(identity).hexdigest(),
+        "request_sha256": request_sha256,
         "cds_request_id": remote.request_id,
-        "started_at": started_at,
+        "started_at": journal["started_at"],
         "retrieved_at": retrieved_at,
         "file": target.name,
         "size_bytes": target.stat().st_size,
@@ -181,6 +204,28 @@ def download_batch(
     (partial / "metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
-    completed = partial.with_suffix("")
-    partial.rename(completed)
-    return completed
+    partial.rename(batch)
+    return batch
+
+
+def load_availability() -> list[dict[str, list[str]]]:
+    """Read the provider's current ERA5 availability constraint cubes.
+
+    Returns:
+        Cartesian selections whose union describes the provider's available
+        products, variables, dates, and UTC hours.
+
+    Raises:
+        Exception: HTTP or JSON errors propagate after bounded transient retries.
+    """
+    with requests.Session() as session:
+        get = robust(session.get, maximum_tries=RETRY_ATTEMPTS, retry_after=RETRY_BACKOFF)
+        response = get(CATALOGUE_URL, timeout=30)
+        response.raise_for_status()
+        constraints_url = next(
+            link["href"] for link in response.json()["links"]
+            if link["rel"] == "constraints"
+        )
+        response = get(constraints_url, timeout=30)
+        response.raise_for_status()
+        return response.json()

@@ -95,13 +95,11 @@ def test_download_batch_command(
 
     credentials, *selection = download.call_args.args
     assert credentials.key == "test-token"
-    assert selection == [
-        cli.build_batch_request(
-            date(2000, 1, 1), date(2000, 1, 2),
-            ["2m_temperature", "total_precipitation"], 2,
-        ),
-        Path("staging"),
-    ]
+    assert selection[0] == cli.build_batch_request(
+        date(2000, 1, 1), date(2000, 1, 2),
+        ["2m_temperature", "total_precipitation"], 2,
+    )
+    assert selection[1].parent == Path("staging")
     assert f"Saved completed batch to {completed}" in capsys.readouterr().out
 
 
@@ -127,3 +125,20 @@ def test_archive_commands_do_not_load_credentials_before_catalog_lookup(
     assert cli.main(["ingest-batch", "--batch", "completed"]) == 0
     ingest.assert_called_once_with(Path("completed"), Path("archive"), (32, 32))
     assert capsys.readouterr().out.count(f"Published data available at {published}") == 2
+
+
+def test_range_command_accepts_month_boundaries_and_batch_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expose resumable range processing with separate batching and storage inputs."""
+    pull = Mock()
+    monkeypatch.setattr(cli, "pull_range", pull)
+    assert cli.main([
+        "pull", "--start-date", "1999-12-31", "--end-date", "2000-01-02",
+        "--variables", "2m_temperature", "total_precipitation", "--batch-days", "1",
+        "--archive", "downloads/manual-archive-13", "--spatial-chunks", "16", "32",
+    ]) == 0
+    pull.assert_called_once_with(
+        date(1999, 12, 31), date(2000, 1, 2), ["2m_temperature", "total_precipitation"],
+        Path("downloads/manual-archive-13"), (16, 32), 1,
+    )

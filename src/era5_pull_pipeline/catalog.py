@@ -21,6 +21,15 @@ CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS staged_batches (
+    id TEXT PRIMARY KEY,
+    year INTEGER NOT NULL,
+    month INTEGER NOT NULL,
+    request_json TEXT NOT NULL,
+    batch_path TEXT UNIQUE NOT NULL,
+    metadata_json TEXT,
+    report_json TEXT
+);
 CREATE TABLE IF NOT EXISTS revisions (
     id TEXT PRIMARY KEY,
     year INTEGER NOT NULL,
@@ -29,7 +38,7 @@ CREATE TABLE IF NOT EXISTS revisions (
     status TEXT NOT NULL CHECK (status IN ('preparing', 'ready', 'published')),
     staged_path TEXT NOT NULL,
     final_path TEXT NOT NULL,
-    batch_path TEXT NOT NULL,
+    batch_paths_json TEXT NOT NULL,
     provenance_json TEXT NOT NULL,
     report_json TEXT,
     created_at TEXT NOT NULL,
@@ -56,68 +65,28 @@ CREATE TABLE IF NOT EXISTS coverage (
     step_units TEXT NOT NULL,
     step_type TEXT NOT NULL,
     source_revision_id TEXT NOT NULL REFERENCES revisions(id),
+    source_request_sha256 TEXT NOT NULL,
     PRIMARY KEY (revision_id, variable, valid_time)
 );
-DROP INDEX IF EXISTS published_month;
 CREATE UNIQUE INDEX IF NOT EXISTS ready_month
     ON revisions (year, month) WHERE status = 'ready';
 """
 
 
-def _initialize_catalog(db: sqlite3.Connection) -> None:
-    """Create the catalog or migrate its first single-revision schema.
-
-    Args:
-        db: Catalog connection protected by the publication lock.
-
-    Raises:
-        ValueError: The catalog has an unsupported schema version.
-        sqlite3.Error: Creating or migrating the catalog fails.
-    """
-    version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version == 1:
-        return
-    if version != 0:
-        raise ValueError(f"Unsupported catalog schema version: {version}.")
-    with db:
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
-        columns = {row[1] for row in db.execute("PRAGMA table_info(revisions)")}
-        if "parent_revision_id" not in columns:
-            db.execute("ALTER TABLE revisions ADD COLUMN parent_revision_id TEXT REFERENCES revisions(id)")
-            db.execute("ALTER TABLE revisions ADD COLUMN backup_path TEXT")
-        columns = {row[1] for row in db.execute("PRAGMA table_info(coverage)")}
-        if "source_revision_id" not in columns:
-            db.execute("ALTER TABLE coverage ADD COLUMN source_revision_id TEXT REFERENCES revisions(id)")
-            db.execute("UPDATE coverage SET source_revision_id = revision_id")
-        db.execute(
-            """INSERT INTO months (year, month, current_revision_id)
-               SELECT year, month, id FROM revisions WHERE status = 'published'"""
-        )
-        db.execute("PRAGMA user_version = 1")
-
-
 def _check_store(path: Path, revision: sqlite3.Row) -> None:
-    """Match a store to its journal entry, accepting original archive metadata.
+    """Match a store's revision identifier to its publication journal entry.
 
     Args:
         path: Existing Zarr store.
         revision: Catalog revision expected at that path.
 
     Raises:
-        ValueError: The store identifies another revision or source request.
+        ValueError: The store identifies another revision.
         Exception: Zarr reading errors propagate.
     """
     attrs = zarr.open_group(path, mode="r").attrs
-    identity = attrs.get("revision_id")
-    if identity is not None:
-        matches = identity == revision["id"]
-    else:
-        matches = (
-            revision["parent_revision_id"] is None
-            and attrs["provenance"]["request_sha256"] == revision["request_sha256"]
-        )
-    if not matches:
-        raise ValueError(f"The store at {path} belongs to a different revision or request.")
+    if attrs["revision_id"] != revision["id"]:
+        raise ValueError(f"The store at {path} belongs to a different revision.")
 
 
 def _rename_store(source: Path, destination: Path) -> None:
@@ -182,7 +151,8 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                 """INSERT INTO coverage
                    (revision_id, variable, valid_time, reference_time, interval_start,
                     interval_end, start_step, end_step, step_units, step_type,
-                    source_revision_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    source_revision_id, source_request_sha256)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         revision["id"], field["variable"], field["valid_time"],
@@ -190,6 +160,7 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                         field["interval_end"], field["start_step"], field["end_step"],
                         field["step_units"], field["step_type"],
                         field.get("source_revision_id", revision["id"]),
+                        field["source_request_sha256"],
                     )
                     for field in report["fields"]
                 ],
@@ -238,18 +209,35 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                 db.execute("UPDATE revisions SET backup_path = NULL WHERE id = ?", (revision["id"],))
 
     for revision in db.execute(
-        "SELECT id, batch_path FROM revisions WHERE status = 'published' AND grib_removed = 0"
+        "SELECT id, batch_paths_json FROM revisions WHERE status = 'published' AND grib_removed = 0"
     ).fetchall():
         try:
-            (Path(revision["batch_path"]) / "data.grib").unlink(missing_ok=True)
+            batches = [Path(path) for path in json.loads(revision["batch_paths_json"])]
+            for batch in batches:
+                (batch / "data.grib").unlink(missing_ok=True)
+            owned = (archive / "staging" / "batches").resolve()
+            for batch in batches:
+                batch = batch.resolve()
+                if batch == owned or not batch.is_relative_to(owned):
+                    continue
+                checkpoint = batch / "converted.zarr"
+                target = checkpoint.resolve()
+                if target == batch or not target.is_relative_to(batch):
+                    raise ValueError(f"The converted checkpoint is outside its batch directory: {checkpoint}.")
+                if checkpoint.exists():
+                    shutil.rmtree(target)
         except OSError as exc:
             warnings.warn(
-                f"Published data are available; source GRIB cleanup remains pending: {exc}",
+                f"Published data are available; source cleanup remains pending: {exc}",
                 RuntimeWarning,
                 stacklevel=2,
             )
         else:
             with db:
+                db.executemany(
+                    "DELETE FROM staged_batches WHERE batch_path = ?",
+                    [(str(batch.resolve()),) for batch in batches],
+                )
                 db.execute(
                     "UPDATE revisions SET grib_removed = 1 WHERE id = ?", (revision["id"],)
                 )
@@ -278,7 +266,7 @@ def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
             with portalocker.Lock(
                 archive / ".publication.lock", "a", flags=portalocker.LOCK_EX
             ):
-                _initialize_catalog(db)
+                db.executescript(SCHEMA)
                 _recover_publications(db, archive)
             yield db
 
@@ -354,49 +342,65 @@ def missing_fields(
         """SELECT provenance_json FROM revisions
            WHERE year = ? AND month = ? AND status = 'published'""", (year, month)
     ):
-        request = json.loads(revision["provenance_json"])["request"]
-        selected = missing.keys() & request["variable"]
-        if not selected:
-            continue
-        covered = {
-            int(datetime.fromisoformat(
-                f"{year:04d}-{month:02d}-{int(day):02d}T{hour}:00+00:00"
-            ).timestamp())
-            for day in request["day"] for hour in request["time"]
-        }
-        for variable in selected:
-            missing[variable].difference_update(covered)
+        provenance = json.loads(revision["provenance_json"])
+        for source in provenance.get("sources", [provenance]):
+            request = source["request"]
+            selected = missing.keys() & request["variable"]
+            if not selected:
+                continue
+            covered = {
+                int(datetime.fromisoformat(
+                    f"{year:04d}-{month:02d}-{int(day):02d}T{hour}:00+00:00"
+                ).timestamp())
+                for day in request["day"] for hour in request["time"]
+            }
+            for variable in selected:
+                missing[variable].difference_update(covered)
     return {
         variable: sorted(times) for variable, times in missing.items() if times
     }
 
 
 def prepare_revision(
-    db: sqlite3.Connection, archive: Path, batch: Path, metadata: dict[str, Any]
+    db: sqlite3.Connection, archive: Path, batches: Sequence[Path], metadata: dict[str, Any]
 ) -> tuple[str, Path]:
-    """Record a conversion attempt and the current month it will replace.
+    """Replace abandoned assembly attempts and record the month to publish.
 
     Args:
         db: Catalog connection from archive_session.
         archive: Archive directory.
-        batch: Completed source download directory.
-        metadata: Download provenance and canonical request identity.
+        batches: Completed source download directories contributing to this revision.
+        metadata: Download provenance or a monthly manifest of source requests.
 
     Returns:
         Revision identifier and the Zarr path to build in staging.
 
     Raises:
         FileExistsError: An uncataloged store occupies the monthly path.
+        ValueError: An abandoned store is outside the archive revision directory.
         Exception: File and catalog errors propagate.
     """
-    year = int(metadata["request"]["year"][0])
-    month = int(metadata["request"]["month"][0])
+    source = metadata.get("sources", [metadata])[0]
+    year = int(source["request"]["year"][0])
+    month = int(source["request"]["month"][0])
     final = Path(f"{year:04d}") / f"{month:02d}" / "era5.zarr"
     parent = db.execute(
         "SELECT current_revision_id FROM months WHERE year = ? AND month = ?", (year, month)
     ).fetchone()
     if parent is None and (archive / final).exists():
         raise FileExistsError(f"An uncataloged store occupies the target month: {archive / final}")
+    owned = (archive / "staging" / "revisions").resolve()
+    for attempt in db.execute(
+        "SELECT id, staged_path FROM revisions WHERE year = ? AND month = ? AND status = 'preparing'",
+        (year, month),
+    ).fetchall():
+        abandoned = (archive / attempt["staged_path"]).resolve()
+        if abandoned == owned or not abandoned.is_relative_to(owned):
+            raise ValueError(f"The abandoned revision is outside the archive revision directory: {abandoned}.")
+        if abandoned.exists():
+            shutil.rmtree(abandoned)
+        with db:
+            db.execute("DELETE FROM revisions WHERE id = ?", (attempt["id"],))
     revision_id = uuid4().hex
     stage = Path("staging") / "revisions" / f"{revision_id}.zarr"
     backup = stage.with_name(f"{revision_id}.previous.zarr") if parent is not None else None
@@ -405,11 +409,12 @@ def prepare_revision(
         db.execute(
             """INSERT INTO revisions
             (id, year, month, request_sha256, status, staged_path, final_path,
-             batch_path, provenance_json, created_at, parent_revision_id, backup_path)
+             batch_paths_json, provenance_json, created_at, parent_revision_id, backup_path)
             VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 revision_id, year, month, metadata["request_sha256"], stage.as_posix(),
-                final.as_posix(), str(batch.resolve()), json.dumps(metadata),
+                final.as_posix(),
+                json.dumps([str(batch.resolve()) for batch in batches]), json.dumps(metadata),
                 datetime.now(UTC).isoformat(), parent[0] if parent is not None else None,
                 backup.as_posix() if backup is not None else None,
             ),
@@ -515,7 +520,7 @@ def open_month(archive: Path, year: int, month: int) -> Iterator[xr.Dataset]:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA foreign_keys = ON")
             db.execute("PRAGMA synchronous = FULL")
-            _initialize_catalog(db)
+            db.executescript(SCHEMA)
             _recover_publications(db, archive)
             current = current_month(db, archive, year, month)
             if current is None:

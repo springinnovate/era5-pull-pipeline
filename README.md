@@ -54,6 +54,24 @@ Repeat the same command to check access again; it replaces the probe file. Use `
 
 The installed `era5-pull check-access` command provides the same check. Use `--help` to see its options.
 
+## Download a date range
+
+From the directory containing `.cdsapirc`, run:
+
+```powershell
+.\.venv\Scripts\python.exe -m era5_pull_pipeline pull --start-date 1999-12-31 --end-date 2000-01-02 --variables 2m_temperature total_precipitation --archive downloads/manual-archive-13 --batch-days 1
+```
+
+This retrieves three complete UTC days on the global grid, in one-day batches, and publishes `1999/12/era5.zarr` and `2000/01/era5.zarr` beneath the archive directory. `--batch-days` defaults to 7. Requests stop at month boundaries and are subdivided further to respect CDS field limits. It limits calendar days per batch; compressed GRIB sizes vary by variable and data values.
+
+Repeat the same command to verify coverage: a completed range prints `completed=0, skipped=144` and makes no CDS calls. Counts are **variable-hours**: two variables over three 24-hour days total 144. `completed` counts fields published in this invocation; `skipped` counts already stored fields; `unavailable` counts requested hours absent from CDS's availability snapshot. `failed` identifies a failed batch or monthly publication, and `pending` counts remaining unattempted or staged fields. A failure prints the summary and original error. Hours marked unavailable are requested again on a subsequent run.
+
+To add wind for the same dates, run the command with `--variables 10m_u_component_of_wind 10m_v_component_of_wind`. Existing temperature and precipitation remain in the monthly stores. Use `--spatial-chunks LAT LON` when creating an archive to change the default `32 32` tile shape; subsequent writes must use the archive's existing shape.
+
+Press Ctrl+C to stop. Run the same command to resume: the pipeline uses SQLite's staged batch records to recover submitted CDS jobs and reuse completed downloads and conversions. An interrupted transfer restarts from the beginning; an interrupted conversion is rebuilt from its retained GRIB. Completed artifacts are immutable and reused directly. CDS requests run serially with bounded retries and backoff for transient service failures.
+
+If CDS reports that a saved job has failed or expired, remove that job's `.partial` directory under `staging/batches/` and rerun to submit it again. Its `request.json` identifies the selection and CDS job ID. Completed batches remain reusable.
+
 ## Tests
 
 Install the optional test dependencies and run the automated tests from the repository directory:
@@ -63,7 +81,7 @@ Install the optional test dependencies and run the automated tests from the repo
 .\.venv\Scripts\python.exe -m pytest -q --basetemp .pytest_cache/manual-check
 ```
 
-The tests use local fixtures and simulated service responses. They do not need credentials or contact CDS; `check-access` is the explicit live test.
+The tests use local fixtures and simulated service responses. They do not need credentials or contact CDS. `check-access` and `pull` contact the live service when a download is needed.
 
 ## Data
 
@@ -73,14 +91,14 @@ The archive retains source units, grid coordinates, UTC timestamps, decoded nume
 
 ## Pipeline steps
 
-1. **Load credentials.** Authenticate with CDS using the local `.cdsapirc` file.
-2. **Find missing coverage.** Compare the requested dates and variables with the archive's SQLite catalog. Already stored variable/hour combinations are skipped; gaps and newly requested variables are included.
+1. **Find missing coverage.** Compare the requested dates and variables with the archive's SQLite catalog. Already stored variable/hour combinations are skipped; gaps and newly requested variables are included. Match missing fields against CDS's availability constraints, including partially available days.
+2. **Load credentials when needed.** Authenticate with CDS using the local `.cdsapirc` file when a download is required. A completed repeat needs no credentials or service calls.
 3. **Download GRIB batches.** Split the requested time interval according to the download batch size, stopping at calendar-month boundaries. Every downloaded field covers the full global grid. Batch size is independent of the Zarr storage layout.
-4. **Assemble the month.** Decode the GRIB fields into arrays with dimensions `(time, latitude, longitude)`. Combine batches in a staging area for the relevant month. For an existing month, merge new or refreshed values with its published contents, preserving all other variables and hours. During a historical backfill, assemble all requested batches for a month before publishing it.
+4. **Assemble the month.** Decode the GRIB fields into arrays with dimensions `(time, latitude, longitude)` and save validated, compressed batch checkpoints. Assemble all selected batches for the month in staging, preserving existing variables and hours. Publish each affected month once per invocation.
 5. **Validate and publish.** Check the variables, global grid, timestamps, interval metadata, numerical values, and readability of the compressed output. Publish the validated monthly dataset and record its coverage and revision in SQLite.
-6. **Remove the GRIB downloads.** Delete the corresponding temporary GRIB files only after publication and the catalog update succeed. The Zarr datasets are the retained data archive.
+6. **Remove temporary sources.** Delete the corresponding GRIB files and conversion checkpoints only after publication and the catalog update succeed. The monthly Zarr datasets are the retained data archive.
 
-The staging area holds downloaded GRIB files alongside the monthly Zarr data until publication succeeds. Conversion also uses temporary disk-backed, decoded arrays, so available disk space must accommodate all three. It processes one global field at a time and writes spatial shards without loading a whole month into RAM. The latest month can contain only part of a month. Dates that are not yet available from CDS remain missing, so a subsequent run can retrieve them. The catalog distinguishes partial coverage from a complete requested interval.
+Processing is serial and limited to one month at a time. Peak disk use includes that month's GRIBs, compressed batch checkpoints, one batch's temporary decoded arrays, the staged monthly replacement, and any previous published month being replaced. Decoded arrays use disk-backed storage; each global float64 field occupies about 8.3 MB before compression. Conversion processes one global field at a time and assembles bounded spatial shards without loading a whole month into RAM. Smaller day batches reduce decoded scratch space. The latest month can contain only part of a month, and unavailable hours remain absent from catalog coverage.
 
 ## Archive layout
 
@@ -114,7 +132,7 @@ The monthly directories form one continuous archive. A reader selects the releva
 
 ## Repeat runs and source updates
 
-SQLite records coverage by variable and hour on the fixed global grid, together with source dataset and grid metadata. The catalog also retains source request details, retrieval times, GRIB checksums, validation results, and published revisions after temporary downloads are removed.
+SQLite records each staged request and destination before downloading, then records download and conversion completion. It also records published coverage by variable and hour on the fixed global grid. Source request details, retrieval times, GRIB checksums, validation results, and published revisions remain in the catalog after temporary downloads are removed.
 
 Requesting an additional variable, a longer interval, or an interior gap downloads only missing variable/hour combinations. The planner uses CDS variable names and successfully published source requests to identify completed selections, even when requested in a different combination of variables or dates. Ordinary requests preserve already stored values, including fields whose grid cells are all missing. Published field provenance continues to identify the retrieval that supplied each field through subsequent monthly replacements.
 
