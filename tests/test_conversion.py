@@ -260,72 +260,6 @@ def test_inconsistent_input_never_produces_validated_output(
     assert not list(tmp_path.glob(".decoded-*"))
 
 
-def test_legacy_numeric_names_migrate_only_in_the_replacement(
-    tmp_path: Path,
-    batch: tuple[Path, dict[str, Any], list[dict[str, Any]]],
-) -> None:
-    """Rename stored parameters while retaining their values, intervals, and origins."""
-    grib, metadata, messages = batch
-    original = write_grib(grib, messages)
-    previous = tmp_path / "legacy.zarr"
-    previous_report = conversion.convert_batch(grib, metadata, previous, (2, 2))
-    legacy_names = {"2_metre_temperature": "param_167", "total_precipitation": "param_228"}
-    group = zarr.open_group(previous, mode="r+")
-    for readable, legacy in legacy_names.items():
-        attributes = group[readable].attrs
-        attributes["ancillary_variables"] = attributes["ancillary_variables"].replace(readable, legacy)
-        for name in list(group.array_keys()):
-            if name == readable or name.startswith(f"{readable}_"):
-                (previous / name).rename(previous / name.replace(readable, legacy, 1))
-    del group.attrs["source_provenance"]
-    previous_report["variables"] = {
-        legacy_names[name]: attributes for name, attributes in previous_report["variables"].items()
-    }
-    for field in previous_report["fields"]:
-        field["variable"] = legacy_names[field["variable"]]
-        field["source_revision_id"] = "legacy-source"
-
-    incoming_metadata = deepcopy(metadata)
-    incoming_metadata["request"].update({
-        "variable": ["2m_temperature", "total_precipitation", "10m_u_component_of_wind"],
-        "time": ["01:00", "02:00"],
-    })
-    incoming = tmp_path / "addition.grib"
-    added = write_grib(incoming, [
-        {"dataTime": 100, "values": np.full(12, 999.0)},
-        {"dataTime": 200, "values": np.full(12, 282.0)},
-        {"paramId": 228, "stepType": "accum", "startStep": 0, "endStep": 1,
-         "values": np.full(12, 999.0)},
-        {"paramId": 228, "stepType": "accum", "startStep": 1, "endStep": 2,
-         "values": np.full(12, 0.003)},
-        {"paramId": 165, "dataTime": 100, "values": np.full(12, 1.0)},
-        {"paramId": 165, "dataTime": 200, "values": np.full(12, 2.0)},
-    ])
-    output = tmp_path / "replacement.zarr"
-    report = conversion.convert_batch(
-        incoming, incoming_metadata, output, (2, 2),
-        previous=previous, previous_report=previous_report,
-    )
-    stored = zarr.open_group(output, mode="r")
-    assert set(report["variables"]) == {
-        "2_metre_temperature", "total_precipitation", "10_metre_u_wind_component",
-    }
-    assert not any(name.startswith("param_") for name in stored.array_keys())
-    assert np.array_equal(stored["2_metre_temperature"][:], np.stack([original[0], original[2], added[1]]))
-    assert np.array_equal(stored["total_precipitation"][:], np.stack([original[1], original[3], added[3]]))
-    for old in previous_report["fields"]:
-        readable = next(name for name, legacy in legacy_names.items() if legacy == old["variable"])
-        assert {**old, "variable": readable} in report["fields"]
-    assert stored["total_precipitation_interval_start"][0] == int(datetime(1999, 12, 31, 23, tzinfo=UTC).timestamp())
-    assert stored.attrs["source_provenance"] == [metadata, incoming_metadata]
-    unchanged = zarr.open_group(previous, mode="r")
-    assert np.array_equal(unchanged["param_167"][:], np.stack([original[0], original[2]]))
-    assert np.array_equal(unchanged["param_228"][:], np.stack([original[1], original[3]]))
-    assert "2_metre_temperature" not in unchanged
-    assert all(field["variable"].startswith("param_") for field in previous_report["fields"])
-    assert grib.exists() and incoming.exists()
-
-
 def test_add_variable_with_independent_coverage_then_fill_its_gaps(
     tmp_path: Path,
     batch: tuple[Path, dict[str, Any], list[dict[str, Any]]],
@@ -563,7 +497,7 @@ def test_assemble_checkpoints_preserves_old_fields_and_tracks_new_sources(
     assert grib.exists() and all(source.exists() for source in source_gribs)
 
 
-@pytest.mark.parametrize("conflict", ["overlap", "month", "manifest"])
+@pytest.mark.parametrize("conflict", ["overlap", "month"])
 def test_assembly_rejects_conflicting_checkpoint_selections(
     tmp_path: Path,
     batch: tuple[Path, dict[str, Any], list[dict[str, Any]]],
@@ -591,10 +525,8 @@ def test_assembly_rejects_conflicting_checkpoint_selections(
         "dataset": metadata["dataset"], "request_sha256": "f" * 64,
         "sources": [metadata, second_metadata],
     }
-    if conflict == "manifest":
-        manifest["sources"] = [second_metadata, metadata]
     output = tmp_path / "month.zarr"
-    match = {"overlap": "duplicate", "month": "same calendar month", "manifest": "differs"}[conflict]
+    match = {"overlap": "duplicate", "month": "same calendar month"}[conflict]
     with pytest.raises(ValueError, match=match):
         conversion.assemble_month([(first, first_report), (second, second_report)], manifest, output, (2, 2))
     assert not output.exists()

@@ -272,16 +272,16 @@ def assemble_month(
     previous: Path | None = None,
     previous_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Assemble verified batch checkpoints into one validated monthly replacement.
+    """Assemble completed batch checkpoints into one validated monthly replacement.
 
-    The caller verifies each checkpoint's manifest and file checksums before
-    calling. This function reads those stores by spatial shard without decoding
-    GRIB again. Previously published fields take precedence over incoming data.
+    The caller supplies completed checkpoints and their recorded reports. This
+    function reads those stores by spatial shard without decoding GRIB again.
+    Previously published fields take precedence over incoming data.
 
     Args:
         checkpoints: Checkpoint Zarr paths and their validated conversion reports.
         metadata: Monthly publication manifest with dataset, request_sha256, and
-            the ordered source download metadata in sources.
+            the source download metadata in sources.
         output: New directory for the unpublished monthly store.
         spatial_chunks: Latitude and longitude cells per read chunk.
         previous: Published monthly store to preserve, when present.
@@ -291,27 +291,16 @@ def assemble_month(
         A JSON-compatible report of all retained and newly assembled fields.
 
     Raises:
-        ValueError: Sources conflict, overlap, or differ from the manifest.
+        ValueError: Sources conflict or overlap.
         Exception: Zarr and filesystem errors propagate from their libraries.
     """
     incoming = []
-    provenance = []
     for path, report in checkpoints:
         group = zarr.open_group(path, mode="r")
-        source = group.attrs["provenance"]
-        provenance.append(source)
         incoming.append((
             {variable: group[variable] for variable in report["variables"]},
-            {
-                **report,
-                "fields": [
-                    {**field, "source_request_sha256": source["request_sha256"]}
-                    for field in report["fields"]
-                ],
-            },
+            report,
         ))
-    if metadata["sources"] != provenance:
-        raise ValueError("The monthly manifest differs from its checkpoint sources.")
     return _write_month(
         incoming, metadata, output, spatial_chunks,
         previous=previous, previous_report=previous_report,
@@ -366,9 +355,7 @@ def _write_month(
             {variable: prior[variable] for variable in previous_report["variables"]},
             previous_report,
         ))
-        source_provenance = list(prior.attrs.get(
-            "source_provenance", [prior.attrs["provenance"]]
-        ))
+        source_provenance = list(prior.attrs["source_provenance"])
     source_provenance.extend(metadata.get("sources", [metadata]))
     variables: dict[str, Any] = {}
     parameter_names: dict[int, str] = {}
@@ -380,9 +367,7 @@ def _write_month(
         if (report["year"], report["month"], report["grid"]) != (year, month, grid):
             raise ValueError("Monthly sources must share the same calendar month and grid.")
         source_times = np.array(sorted({field["valid_time"] for field in report["fields"]}), dtype=np.int64)
-        renamed = {}
-        for original, attributes in report["variables"].items():
-            variable = re.sub(r"[^a-z0-9]+", "_", attributes["name"].lower()).strip("_")
+        for variable, attributes in report["variables"].items():
             matching = parameter_names.get(attributes["paramId"])
             if matching is not None and variables[matching] != attributes:
                 raise ValueError(f"{variable} has different metadata between monthly sources.")
@@ -390,24 +375,23 @@ def _write_month(
                 raise ValueError(f"Different parameters share the array name {variable}.")
             variables[variable] = attributes
             parameter_names[attributes["paramId"]] = variable
-            renamed[original] = variable
-        selected = {original: set() for original in arrays}
+        selected = {variable: set() for variable in arrays}
         for field in report["fields"]:
-            variable = renamed[field["variable"]]
+            variable = field["variable"]
             identity = variable, field["valid_time"]
             if not is_previous:
                 if identity in incoming_fields:
                     raise ValueError(f"Incoming checkpoints duplicate {variable} at {field['valid_time']}.")
                 incoming_fields.add(identity)
             if identity not in merged_fields:
-                merged_fields[identity] = {**field, "variable": variable}
-                selected[field["variable"]].add(field["valid_time"])
-        for original, selected_times in selected.items():
+                merged_fields[identity] = field
+                selected[variable].add(field["valid_time"])
+        for variable, selected_times in selected.items():
             if selected_times:
                 rows = np.array([
                     index for index, value in enumerate(source_times) if int(value) in selected_times
                 ], dtype=np.intp)
-                pending_sources.append((renamed[original], arrays[original], rows, source_times[rows]))
+                pending_sources.append((variable, arrays[variable], rows, source_times[rows]))
     fields = sorted(merged_fields.values(), key=lambda field: (field["variable"], field["valid_time"]))
     times = np.array(sorted({field["valid_time"] for field in fields}), dtype=np.int64)
     time_indices = {int(value): index for index, value in enumerate(times)}
