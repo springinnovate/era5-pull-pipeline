@@ -1,6 +1,7 @@
 """Verify command-line behavior without contacting CDS."""
 
 from pathlib import Path
+from datetime import date
 from unittest.mock import Mock
 
 import pytest
@@ -69,3 +70,33 @@ def test_cli_rejects_geographic_selection() -> None:
     with pytest.raises(SystemExit) as caught:
         cli.main(["check-access", "--area", "0,0,1,1"])
     assert caught.value.code == 2
+
+
+def test_download_batch_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pass the selected dates, variables, and batch settings to the downloader."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".cdsapirc").write_text(
+        "url: https://example.test/api\nkey: test-token\n", encoding="utf-8"
+    )
+    completed = Path("staging/completed-batch")
+    download = Mock(return_value=completed)
+    monkeypatch.setattr(cli, "download_batch", download)
+
+    assert cli.main([
+        "download-batch",
+        "--start-date", "2000-01-01",
+        "--end-date", "2000-01-02",
+        "--variables", "2m_temperature", "total_precipitation",
+        "--max-days", "2",
+        "--staging", "staging",
+    ]) == 0
+
+    credentials, *selection = download.call_args.args
+    assert credentials.key == "test-token"
+    assert selection == [
+        date(2000, 1, 1), date(2000, 1, 2),
+        ["2m_temperature", "total_precipitation"], Path("staging"), 2,
+    ]
+    assert f"Saved completed batch to {completed}" in capsys.readouterr().out
