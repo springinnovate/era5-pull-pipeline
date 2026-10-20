@@ -125,7 +125,7 @@ def test_completed_download_has_request_and_integrity_metadata(
         cds.build_batch_request(
             date(2000, 1, 1), date(2000, 1, 2), ["total_precipitation", "2m_temperature"]
         ),
-        staging,
+        staging / "batch",
     )
 
     assert completed.parent == staging
@@ -171,7 +171,7 @@ def test_repeat_selection_has_new_directory_and_same_request_identity(
         cds.build_batch_request(
             date(2000, 1, 1), date(2000, 1, 1), ["total_precipitation", "2m_temperature"]
         ),
-        tmp_path,
+        tmp_path / "first",
     )
     second = cds.download_batch(
         CREDENTIALS,
@@ -179,7 +179,7 @@ def test_repeat_selection_has_new_directory_and_same_request_identity(
             date(2000, 1, 1), date(2000, 1, 1),
             ["2m_temperature", "total_precipitation", "2m_temperature"],
         ),
-        tmp_path,
+        tmp_path / "second",
     )
 
     assert first != second
@@ -210,7 +210,7 @@ def test_interrupted_transfer_remains_partial(
         cds.download_batch(
             CREDENTIALS,
             cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
-            tmp_path,
+            tmp_path / "batch",
         )
 
     assert caught.value is error
@@ -254,7 +254,7 @@ def test_failed_metadata_write_keeps_directory_partial(
         cds.download_batch(
             CREDENTIALS,
             cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
-            tmp_path,
+            tmp_path / "batch",
         )
 
     assert caught.value is failure
@@ -279,7 +279,7 @@ def test_resume_reuses_recorded_remote_job(
 
     remote.download.side_effect = interrupt
     with pytest.raises(KeyboardInterrupt):
-        cds.download_batch(CREDENTIALS, request, tmp_path, resume=True)
+        cds.download_batch(CREDENTIALS, request, tmp_path / "batch")
     (partial,) = tmp_path.iterdir()
     journal_text = (partial / "request.json").read_text(encoding="utf-8")
     journal = json.loads(journal_text)
@@ -290,7 +290,7 @@ def test_resume_reuses_recorded_remote_job(
     resumed = client_factory.return_value.client.get_remote.return_value
     resumed.request_id = remote.request_id
     resumed.download.side_effect = lambda target: Path(target).write_bytes(PAYLOAD)
-    completed = cds.download_batch(CREDENTIALS, request, tmp_path, resume=True)
+    completed = cds.download_batch(CREDENTIALS, request, tmp_path / "batch")
 
     assert completed == partial.with_suffix("")
     assert (completed / "data.grib").read_bytes() == PAYLOAD
@@ -308,16 +308,29 @@ def test_resume_after_submission_failure_and_different_selection(
     request = cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"])
     client_factory.return_value.retrieve.side_effect = requests.ConnectionError("submit failed")
     with pytest.raises(requests.ConnectionError):
-        cds.download_batch(CREDENTIALS, request, tmp_path, resume=True)
+        cds.download_batch(CREDENTIALS, request, tmp_path / "batch")
     (partial,) = tmp_path.iterdir()
     journal = json.loads((partial / "request.json").read_text(encoding="utf-8"))
     assert "cds_request_id" not in journal
     client_factory.return_value.retrieve.side_effect = None
     other = {**request, "variable": ["total_precipitation"]}
-    different = cds.download_batch(CREDENTIALS, other, tmp_path, resume=True)
+    different = cds.download_batch(CREDENTIALS, other, tmp_path / "other-batch")
     assert partial.exists()
     assert different != partial.with_suffix("")
-    completed = cds.download_batch(CREDENTIALS, request, tmp_path, resume=True)
+    completed = cds.download_batch(CREDENTIALS, request, tmp_path / "batch")
     assert completed == partial.with_suffix("")
     assert (completed / "data.grib").read_bytes() == PAYLOAD
     client_factory.return_value.client.get_remote.assert_not_called()
+
+
+def test_completed_batch_returns_without_transfer_or_hashing(
+    tmp_path: Path, client_factory: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recover the completion rename before the caller records it in SQLite."""
+    request = cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"])
+    batch = tmp_path / "batch"
+    assert cds.download_batch(CREDENTIALS, request, batch) == batch
+    client_factory.reset_mock()
+    monkeypatch.setattr(cds.hashlib, "file_digest", Mock(side_effect=AssertionError("rehash")))
+    assert cds.download_batch(CREDENTIALS, request, batch) == batch
+    client_factory.assert_not_called()

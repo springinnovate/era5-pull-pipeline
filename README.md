@@ -68,7 +68,7 @@ Repeat the same command to verify coverage: a completed range prints `completed=
 
 To add wind for the same dates, run the command with `--variables 10m_u_component_of_wind 10m_v_component_of_wind`. Existing temperature and precipitation remain in the monthly stores. Use `--spatial-chunks LAT LON` when creating an archive to change the default `32 32` tile shape; subsequent writes must use the archive's existing shape.
 
-Press Ctrl+C to stop. Run the same command to resume: the pipeline recovers submitted CDS jobs, verifies and reuses completed GRIBs and conversion checkpoints, and reconciles any interrupted publication. An interrupted file transfer restarts from the beginning. Corrupted conversion checkpoints are rebuilt from their verified GRIBs; a source checksum mismatch stops the run. CDS requests run serially with bounded retries and backoff for transient service failures.
+Press Ctrl+C to stop. Run the same command to resume: the pipeline uses SQLite's staged batch records to recover submitted CDS jobs and reuse completed downloads and conversions. An interrupted transfer restarts from the beginning; an interrupted conversion is rebuilt from its retained GRIB. Completed artifacts are immutable and reused directly. CDS requests run serially with bounded retries and backoff for transient service failures.
 
 If CDS reports that a saved job has failed or expired, remove that job's `.partial` directory under `staging/batches/` and rerun to submit it again. Its `request.json` identifies the selection and CDS job ID. Completed batches remain reusable.
 
@@ -132,7 +132,7 @@ The monthly directories form one continuous archive. A reader selects the releva
 
 ## Repeat runs and source updates
 
-SQLite records coverage by variable and hour on the fixed global grid, together with source dataset and grid metadata. The catalog also retains source request details, retrieval times, GRIB checksums, validation results, and published revisions after temporary downloads are removed.
+SQLite records each staged request and destination before downloading, then records download and conversion completion. It also records published coverage by variable and hour on the fixed global grid. Source request details, retrieval times, GRIB checksums, validation results, and published revisions remain in the catalog after temporary downloads are removed.
 
 Requesting an additional variable, a longer interval, or an interior gap downloads only missing variable/hour combinations. The planner uses CDS variable names and successfully published source requests to identify completed selections, even when requested in a different combination of variables or dates. Ordinary requests preserve already stored values, including fields whose grid cells are all missing. Published field provenance continues to identify the retrieval that supplied each field through subsequent monthly replacements.
 

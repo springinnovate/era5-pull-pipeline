@@ -21,6 +21,15 @@ CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS staged_batches (
+    id TEXT PRIMARY KEY,
+    year INTEGER NOT NULL,
+    month INTEGER NOT NULL,
+    request_json TEXT NOT NULL,
+    batch_path TEXT UNIQUE NOT NULL,
+    metadata_json TEXT,
+    report_json TEXT
+);
 CREATE TABLE IF NOT EXISTS revisions (
     id TEXT PRIMARY KEY,
     year INTEGER NOT NULL,
@@ -217,7 +226,6 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                     raise ValueError(f"The converted checkpoint is outside its batch directory: {checkpoint}.")
                 if checkpoint.exists():
                     shutil.rmtree(target)
-                (batch / "checkpoint.json").unlink(missing_ok=True)
         except OSError as exc:
             warnings.warn(
                 f"Published data are available; source cleanup remains pending: {exc}",
@@ -226,6 +234,10 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
             )
         else:
             with db:
+                db.executemany(
+                    "DELETE FROM staged_batches WHERE batch_path = ?",
+                    [(str(batch.resolve()),) for batch in batches],
+                )
                 db.execute(
                     "UPDATE revisions SET grib_removed = 1 WHERE id = ?", (revision["id"],)
                 )

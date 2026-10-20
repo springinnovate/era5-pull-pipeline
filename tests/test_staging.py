@@ -1,47 +1,22 @@
-"""Verify staged request reuse and conversion checkpoint integrity."""
+"""Exercise cataloged staging and interruption recovery with real SQLite and Zarr."""
 
-from copy import deepcopy
-import hashlib
 import json
 from pathlib import Path
+import sqlite3
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import zarr
 
-from era5_pull_pipeline import staging
-
-
-def source_batch(path: Path, request: dict[str, Any]) -> dict[str, Any]:
-    """Write source bytes and their exact request and content digests.
-
-    Args:
-        path: Completed batch directory to create.
-        request: Canonical source selection.
-
-    Returns:
-        Download metadata matching the saved source bytes.
-    """
-    path.mkdir(parents=True)
-    data = b"source bytes verified independently of format decoding"
-    (path / "data.grib").write_bytes(data)
-    identity = {"dataset": staging.DATASET, "request": request}
-    metadata = {
-        **identity,
-        "request_sha256": hashlib.sha256(json.dumps(
-            identity, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")).hexdigest(),
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "size_bytes": len(data),
-    }
-    (path / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    return metadata
+from era5_pull_pipeline import catalog, staging
+from era5_pull_pipeline.cds import DATASET
 
 
 @pytest.fixture
 def request_selection() -> dict[str, Any]:
-    """Describe a small global ERA5 selection with room for expanded availability."""
+    """Describe a global selection whose available hours can grow between runs."""
     return {
         "product_type": ["reanalysis"], "variable": ["2m_temperature"],
         "year": ["2000"], "month": ["01"], "day": ["01"],
@@ -50,112 +25,193 @@ def request_selection() -> dict[str, Any]:
     }
 
 
-def test_find_downloads_reuses_disjoint_subsets_without_hashing_other_sources(
-    tmp_path: Path,
-    request_selection: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reuse earlier hours after availability expands and skip unrelated bytes."""
-    month = tmp_path / "2000-01"
-    early = {**request_selection, "time": ["00:00", "01:00"]}
-    first = month / "00-early" / "complete"
-    first_metadata = source_batch(first, early)
-    overlap = month / "01-overlap" / "complete"
-    source_batch(overlap, {**request_selection, "time": ["01:00", "02:00"]})
-    (overlap / "data.grib").write_bytes(b"not verified because this overlaps")
-    later = month / "02-later" / "complete"
-    later_metadata = source_batch(later, {**request_selection, "time": ["03:00"]})
-    for name, change in (
-        ("variable", {"variable": ["total_precipitation"]}),
-        ("month", {"month": ["02"]}),
-        ("grid", {"grid": [0.5, 0.5]}),
-    ):
-        unrelated = month / f"03-{name}" / "complete"
-        source_batch(unrelated, {**request_selection, **change})
-        (unrelated / "data.grib").write_bytes(b"unrelated corrupt bytes")
-    removed = month / "04-removed" / "complete"
-    source_batch(removed, request_selection)
-    (removed / "data.grib").unlink()
-    partial = month / "05-partial" / "download.partial"
-    source_batch(partial, request_selection)
-    (partial / "data.grib").write_bytes(b"incomplete")
-    verified = []
-    original_verify = staging.verify_source
+def completed_download(db: sqlite3.Connection, batch: sqlite3.Row) -> dict[str, Any]:
+    """Record a small completed source for the conversion boundary tests.
 
-    def record_verification(batch: Path, metadata: dict[str, Any]) -> None:
-        """Record actual source verification at the file boundary."""
-        verified.append(batch)
-        original_verify(batch, metadata)
+    Args:
+        db: Open archive catalog.
+        batch: Registered request and destination path.
 
-    monkeypatch.setattr(staging, "verify_source", record_verification)
-    found = staging.find_downloads(month, [request_selection])
-    assert found == [(first, first_metadata), (later, later_metadata)]
-    assert verified == [first, later]
+    Returns:
+        Source metadata recorded in SQLite and the completed batch directory.
+    """
+    path = Path(batch["batch_path"])
+    path.mkdir(parents=True)
+    (path / "data.grib").write_bytes(b"source bytes")
+    metadata = {
+        "dataset": DATASET, "request": json.loads(batch["request_json"]),
+        "request_sha256": "source-request",
+    }
+    (path / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    with db:
+        db.execute(
+            "UPDATE staged_batches SET metadata_json = ? WHERE id = ?",
+            (json.dumps(metadata), batch["id"]),
+        )
+    return metadata
 
 
-@pytest.mark.parametrize("corruption", ["request", "bytes"])
-def test_matching_download_requires_valid_identity_and_bytes(
-    tmp_path: Path, request_selection: dict[str, Any], corruption: str,
-) -> None:
-    """Reject a reusable selection whose request identity or source bytes changed."""
-    batch = tmp_path / "selection" / "complete"
-    metadata = source_batch(batch, request_selection)
-    if corruption == "request":
-        metadata["request_sha256"] = "0" * 64
-        (batch / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    else:
-        (batch / "data.grib").write_bytes(b"corrupt")
-    with pytest.raises(ValueError, match="identity|checksum"):
-        staging.find_downloads(tmp_path, [request_selection])
-
-
-@pytest.mark.parametrize("corruption", ["report", "store"])
-def test_checkpoint_rebuilds_changed_report_or_store_and_removes_owned_scratch(
-    tmp_path: Path,
-    request_selection: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-    corruption: str,
-) -> None:
-    """Keep intact checkpoints reusable and rebuild corrupted progress safely."""
-    batch = tmp_path / "complete"
-    metadata = source_batch(batch, request_selection)
-    expected_report = {"fields": [{"variable": "temperature", "valid_time": 946684800}]}
-    conversions = 0
-
-    def write_validated_store(
-        grib: Path, provenance: dict[str, Any], output: Path, chunks: tuple[int, int],
+@pytest.fixture
+def writer(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Replace decoding with a small real Zarr write and observable call count."""
+    def write_store(
+        grib: Path, metadata: dict[str, Any], output: Path, chunks: tuple[int, int],
     ) -> dict[str, Any]:
-        """Stand in for separately tested decoding while writing real Zarr bytes."""
-        nonlocal conversions
-        conversions += 1
-        assert not list(batch.glob(".decoded-*"))
-        group = zarr.open_group(output, mode="w-", zarr_format=3)
-        group.create_array("temperature", data=np.array([280.0, 281.0]))
-        return deepcopy(expected_report)
+        """Write a completed store for the separately tested GRIB decoder.
 
-    monkeypatch.setattr(staging, "convert_batch", write_validated_store)
-    output, report, reused = staging.conversion_checkpoint(batch, metadata, (2, 2))
-    assert not reused and report == expected_report
-    assert staging.conversion_checkpoint(batch, metadata, (2, 2)) == (output, expected_report, True)
-    assert conversions == 1
-    manifest = batch / "checkpoint.json"
-    if corruption == "report":
-        saved = json.loads(manifest.read_text(encoding="utf-8"))
-        saved["report"]["fields"][0]["valid_time"] += 3600
-        manifest.write_text(json.dumps(saved), encoding="utf-8")
-    else:
-        zarr.open_group(output, mode="r+")["temperature"][0] = 999.0
-    abandoned = batch / ".decoded-killed-process"
-    abandoned.mkdir()
-    (abandoned / "raw.bin").write_bytes(b"abandoned decoded values")
-    sibling = tmp_path / ".decoded-another-batch"
-    sibling.mkdir()
-    notes = batch / "notes"
-    notes.mkdir()
-    output, report, reused = staging.conversion_checkpoint(batch, metadata, (2, 2))
-    assert not reused and report == expected_report
-    assert conversions == 2
-    assert not abandoned.exists()
-    assert sibling.exists() and notes.exists()
-    assert (batch / "data.grib").exists()
-    assert zarr.open_group(output, mode="r")["temperature"][0] == 280.0
+        Args:
+            grib: Retained source file.
+            metadata: Download provenance.
+            output: Unpublished conversion destination.
+            chunks: Requested spatial chunk shape.
+
+        Returns:
+            The conversion report to record in the catalog.
+        """
+        assert grib.read_bytes() == b"source bytes"
+        group = zarr.open_group(output, mode="w-", zarr_format=3)
+        group.attrs["provenance"] = metadata
+        group.create_array("temperature", data=np.array([280.0, 281.0]))
+        return {
+            "layout": {"spatial_chunks": list(chunks)},
+            "fields": [{"variable": "temperature", "valid_time": 946684800}],
+        }
+
+    convert = Mock(side_effect=write_store)
+    monkeypatch.setattr(staging, "convert_batch", convert)
+    return convert
+
+
+def test_expanded_selection_reuses_disjoint_cataloged_pending_requests(
+    tmp_path: Path, request_selection: dict[str, Any],
+) -> None:
+    """Retain submitted selections across regrouping before any files are created."""
+    archive = tmp_path / "archive"
+    with catalog.archive_session(archive) as db:
+        first = staging.prepare_batches(db, archive, [{
+            **request_selection, "time": ["00:00", "01:00"],
+        }])[0]
+        overlap = staging.prepare_batches(db, archive, [{
+            **request_selection, "time": ["01:00", "02:00"],
+        }])[0]
+        later = staging.prepare_batches(db, archive, [{
+            **request_selection, "time": ["03:00"],
+        }])[0]
+        other_month = staging.prepare_batches(db, archive, [{
+            **request_selection, "month": ["02"],
+        }])[0]
+        planned = staging.prepare_batches(db, archive, [request_selection])
+        ids = [row["id"] for row in planned]
+        assert ids[:2] == [first["id"], later["id"]]
+        assert overlap["id"] not in ids and other_month["id"] not in ids
+        hours = [hour for row in planned for hour in json.loads(row["request_json"])["time"]]
+        assert sorted(hours) == request_selection["time"]
+        assert all(row["metadata_json"] is None for row in planned)
+        assert all(not Path(row["batch_path"]).exists() for row in planned)
+    with catalog.archive_session(archive) as db:
+        regrouped = staging.prepare_batches(db, archive, [
+            {**request_selection, "time": ["00:00"]},
+            {**request_selection, "time": ["01:00", "02:00", "03:00"]},
+        ])
+        assert [row["id"] for row in regrouped] == ids
+
+
+def test_unregistered_directory_is_not_discovered(
+    tmp_path: Path, request_selection: dict[str, Any],
+) -> None:
+    """Use registered destinations even when matching metadata exists elsewhere."""
+    archive = tmp_path / "archive"
+    unrelated = archive / "staging" / "batches" / "2000-01" / "unregistered"
+    unrelated.mkdir(parents=True)
+    (unrelated / "metadata.json").write_text(
+        json.dumps({"dataset": DATASET, "request": request_selection}), encoding="utf-8",
+    )
+    (unrelated / "data.grib").write_bytes(b"unregistered source")
+    with catalog.archive_session(archive) as db:
+        rows = staging.prepare_batches(db, archive, [request_selection])
+        assert len(rows) == 1
+        assert Path(rows[0]["batch_path"]) != unrelated
+        assert rows[0]["metadata_json"] is None
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == 1
+    assert (unrelated / "data.grib").read_bytes() == b"unregistered source"
+
+
+def test_completed_conversion_is_reused_from_catalog(
+    tmp_path: Path, request_selection: dict[str, Any], writer: Mock,
+) -> None:
+    """Reuse a recorded conversion after reopening the archive without decoding."""
+    archive = tmp_path / "archive"
+    with catalog.archive_session(archive) as db:
+        row = staging.prepare_batches(db, archive, [request_selection])[0]
+        metadata = completed_download(db, row)
+        output, report, reused = staging.conversion_checkpoint(db, row, metadata, (2, 2))
+        assert not reused
+        recorded = db.execute("SELECT report_json FROM staged_batches WHERE id = ?", (row["id"],)).fetchone()[0]
+        assert json.loads(recorded) == report
+    with catalog.archive_session(archive) as db:
+        row = staging.prepare_batches(db, archive, [request_selection])[0]
+        assert staging.conversion_checkpoint(db, row, metadata, (2, 2)) == (output, report, True)
+    assert writer.call_count == 1
+    np.testing.assert_array_equal(zarr.open_group(output, mode="r")["temperature"][:], [280.0, 281.0])
+    assert (output.parent / "data.grib").exists()
+
+
+def test_interrupted_conversion_rebuilds_only_owned_incomplete_work(
+    tmp_path: Path, request_selection: dict[str, Any], writer: Mock,
+) -> None:
+    """Leave no completion record after interruption and retain the source for retry."""
+    archive = tmp_path / "archive"
+    complete_write = writer.side_effect
+    with catalog.archive_session(archive) as db:
+        row = staging.prepare_batches(db, archive, [request_selection])[0]
+        metadata = completed_download(db, row)
+        path = Path(row["batch_path"])
+        scratch = path / ".decoded-interrupted"
+        outside = path.parent / ".decoded-another-batch"
+        outside.mkdir()
+
+        def interrupted(
+            grib: Path, provenance: dict[str, Any], output: Path, chunks: tuple[int, int],
+        ) -> dict[str, Any]:
+            """Stop after partial output and decoded scratch have reached disk."""
+            output.mkdir()
+            (output / "unfinished").write_bytes(b"partial Zarr write")
+            scratch.mkdir()
+            (scratch / "raw.bin").write_bytes(b"decoded scratch")
+            raise KeyboardInterrupt
+
+        writer.side_effect = interrupted
+        with pytest.raises(KeyboardInterrupt):
+            staging.conversion_checkpoint(db, row, metadata, (2, 2))
+        assert db.execute("SELECT report_json FROM staged_batches WHERE id = ?", (row["id"],)).fetchone()[0] is None
+        assert (path / "data.grib").exists()
+    writer.side_effect = complete_write
+    with catalog.archive_session(archive) as db:
+        row = staging.prepare_batches(db, archive, [request_selection])[0]
+        output, _, reused = staging.conversion_checkpoint(db, row, metadata, (2, 2))
+        assert not reused
+    assert writer.call_count == 2
+    assert not (output / "unfinished").exists()
+    assert not scratch.exists()
+    assert outside.exists()
+    assert (path / "data.grib").exists()
+
+
+def test_changed_chunk_setting_rebuilds_recorded_conversion(
+    tmp_path: Path, request_selection: dict[str, Any], writer: Mock,
+) -> None:
+    """Apply a changed input layout to an unpublished checkpoint."""
+    archive = tmp_path / "archive"
+    with catalog.archive_session(archive) as db:
+        row = staging.prepare_batches(db, archive, [request_selection])[0]
+        metadata = completed_download(db, row)
+        output, _, _ = staging.conversion_checkpoint(db, row, metadata, (2, 2))
+        row = staging.prepare_batches(db, archive, [request_selection])[0]
+        rebuilt, report, reused = staging.conversion_checkpoint(db, row, metadata, (4, 4))
+        assert rebuilt == output
+        assert not reused
+        assert report["layout"]["spatial_chunks"] == [4, 4]
+        row = staging.prepare_batches(db, archive, [request_selection])[0]
+        assert staging.conversion_checkpoint(db, row, metadata, (4, 4)) == (output, report, True)
+    assert writer.call_count == 2
+    assert (output.parent / "data.grib").exists()

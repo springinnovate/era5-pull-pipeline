@@ -86,7 +86,7 @@ def test_execution_failure_retry_policy(
         cds.download_batch(
             CREDENTIALS,
             cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
-            tmp_path,
+            tmp_path / "batch",
         )
 
     assert len(failures) == attempts
@@ -159,7 +159,7 @@ def test_interrupted_transfer_exhausts_retries(
         cds.download_batch(
             CREDENTIALS,
             cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
-            tmp_path,
+            tmp_path / "batch",
         )
 
     assert caught.value is failure
@@ -174,8 +174,7 @@ def test_interrupted_transfer_exhausts_retries(
     completed = cds.download_batch(
         CREDENTIALS,
         cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
-        tmp_path,
-        resume=True,
+        tmp_path / "batch",
     )
     assert submissions == [f"{PROCESS_URL}/execution"]
     assert ranges == [None, "bytes=4-", "bytes=8-", None]

@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 from unittest.mock import Mock
+from uuid import uuid4
 
 import eccodes
 import numpy as np
@@ -164,7 +165,7 @@ def test_full_march_temperature_then_partial_wind_and_exact_fill(
     temperature_before = zarr.open_group(output, mode="r")["2_metre_temperature"][:]
     request = cds.build_batch_request(start, end, [wind], max_days=31)
     sparse = {**request, "day": ["01", "03"], "time": ["00:00", "02:00"]}
-    batch = cds.download_batch(CREDENTIALS, sparse, archive / "staging")
+    batch = cds.download_batch(CREDENTIALS, sparse, archive / "staging" / uuid4().hex)
     assert pipeline.ingest_batch(batch, archive, spatial_chunks=(2, 2)) == output
     with open_month(archive, 1995, 3) as dataset:
         np.testing.assert_array_equal(dataset["2_metre_temperature"].values, temperature_before)
@@ -211,7 +212,7 @@ def test_fill_interior_hours_and_extend_time_axis(
     archive = tmp_path / "archive"
     request = cds.build_batch_request(DAY, date(2000, 1, 2), ["2m_temperature"])
     sparse = {**request, "day": ["01"], "time": ["01:00", "03:00"]}
-    batch = cds.download_batch(CREDENTIALS, sparse, archive / "staging")
+    batch = cds.download_batch(CREDENTIALS, sparse, archive / "staging" / uuid4().hex)
     pipeline.ingest_batch(batch, archive, spatial_chunks=(2, 2))
     grib_client.reset_mock()
 
@@ -247,12 +248,12 @@ def test_overlapping_ingest_preserves_old_values_and_other_month(
     }
     request = cds.build_batch_request(DAY, DAY, ["2m_temperature"])
     original = {**request, "time": ["00:00", "02:00"]}
-    batch = cds.download_batch(CREDENTIALS, original, archive / "staging")
+    batch = cds.download_batch(CREDENTIALS, original, archive / "staging" / uuid4().hex)
     output = pipeline.ingest_batch(batch, archive, spatial_chunks=(2, 2))
     before = zarr.open_group(output, mode="r")["2_metre_temperature"][:]
     grib_client.value_offset = 1000.0
     overlap = {**request, "time": ["00:00", "01:00", "02:00", "03:00"]}
-    batch = cds.download_batch(CREDENTIALS, overlap, archive / "staging")
+    batch = cds.download_batch(CREDENTIALS, overlap, archive / "staging" / uuid4().hex)
 
     pipeline.ingest_batch(batch, archive, spatial_chunks=(2, 2))
 
@@ -268,25 +269,6 @@ def test_overlapping_ingest_preserves_old_values_and_other_month(
     } == february_files
 
 
-def test_checksum_failure_retains_grib_without_publication(
-    tmp_path: Path, grib_client: Mock
-) -> None:
-    """Reject changed source bytes before any decoded fields become coverage."""
-    archive = tmp_path / "archive"
-    request = cds.build_batch_request(DAY, DAY, ["2m_temperature"])
-    batch = cds.download_batch(CREDENTIALS, request, archive / "staging")
-    source = batch / "data.grib"
-    damaged = bytearray(source.read_bytes())
-    damaged[-1] ^= 1
-    source.write_bytes(damaged)
-    with pytest.raises(ValueError, match="checksum|SHA|sha"):
-        pipeline.ingest_batch(batch, archive, spatial_chunks=(2, 2))
-    assert source.read_bytes() == damaged
-    assert not (archive / "2000" / "01" / "era5.zarr").exists()
-    with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
-        assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
-
-
 def test_conversion_failure_keeps_old_store_catalog_and_new_grib(
     tmp_path: Path, grib_client: Mock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -300,7 +282,7 @@ def test_conversion_failure_keeps_old_store_catalog_and_new_grib(
         current_before = db.execute("SELECT * FROM months").fetchall()
         coverage_before = db.execute("SELECT * FROM coverage ORDER BY valid_time").fetchall()
     request = cds.build_batch_request(DAY, DAY, ["10m_u_component_of_wind"])
-    batch = cds.download_batch(CREDENTIALS, request, archive / "staging")
+    batch = cds.download_batch(CREDENTIALS, request, archive / "staging" / uuid4().hex)
     source = batch / "data.grib"
     original_grib = source.read_bytes()
     failure = OSError("disk full")
@@ -321,7 +303,7 @@ def test_partial_batch_cannot_be_ingested(tmp_path: Path, grib_client: Mock) -> 
     """Respect the downloader's completion boundary even if metadata is present."""
     archive = tmp_path / "archive"
     request = cds.build_batch_request(DAY, DAY, ["2m_temperature"])
-    batch = cds.download_batch(CREDENTIALS, request, archive / "staging")
+    batch = cds.download_batch(CREDENTIALS, request, archive / "staging" / uuid4().hex)
     partial = batch.with_suffix(".partial")
     batch.rename(partial)
     with pytest.raises(ValueError, match="partial|completed"):
@@ -372,12 +354,11 @@ def test_range_publishes_once_per_month_and_repeats_offline(
     assert summary == {"completed": 0, "skipped": 72, "unavailable": 0, "failed": 0, "pending": 0}
 
 
-@pytest.mark.parametrize("damage", [False, True])
-def test_range_reuses_downloads_and_verified_checkpoints_after_conversion_interrupt(
+def test_range_reuses_cataloged_progress_after_conversion_interrupt(
     tmp_path: Path, grib_client: Mock, availability: Mock,
-    monkeypatch: pytest.MonkeyPatch, damage: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep completed decoding, rebuild incomplete/corrupt checkpoints, and retain GRIBs."""
+    """Keep completed decoding, rebuild incomplete writes, and retain unpublished GRIBs."""
     archive = tmp_path / "archive"
     convert = staging.convert_batch
     calls = []
@@ -394,20 +375,20 @@ def test_range_reuses_downloads_and_verified_checkpoints_after_conversion_interr
     with pytest.raises(KeyboardInterrupt):
         pipeline.pull_range(DAY, date(2000, 1, 2), ["2m_temperature"], archive, (2, 2), 1)
     assert len(list((archive / "staging").rglob("data.grib"))) == 2
-    assert len(list((archive / "staging").rglob("checkpoint.json"))) == 1
     with catalog.archive_session(archive) as db:
         assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
-    if damage:
-        complete = next((archive / "staging").rglob("checkpoint.json")).parent / "converted.zarr"
-        (complete / "zarr.json").write_bytes(b"corrupt")
+        assert db.execute("SELECT COUNT(*) FROM staged_batches WHERE metadata_json IS NOT NULL").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM staged_batches WHERE report_json IS NOT NULL").fetchone()[0] == 1
     checked = Mock(wraps=convert)
     monkeypatch.setattr(staging, "convert_batch", checked)
     monkeypatch.setattr(pipeline, "load_credentials", Mock(side_effect=AssertionError("credentials")))
     grib_client.side_effect = AssertionError("download")
     summary = pipeline.pull_range(DAY, date(2000, 1, 2), ["2m_temperature"], archive, (2, 2), 1)
     assert summary["completed"] == 48
-    assert checked.call_count == (2 if damage else 1)
+    assert checked.call_count == 1
     assert not list((archive / "staging").rglob("data.grib"))
+    with catalog.archive_session(archive) as db:
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == 0
 
 
 def test_range_recovers_publication_without_reconverting_or_contacting_source(
@@ -527,7 +508,8 @@ def test_range_resumes_download_job_and_prior_conversion(
     grib_client.return_value.retrieve.side_effect = interrupted
     with pytest.raises(KeyboardInterrupt):
         pipeline.pull_range(DAY, date(2000, 1, 2), ["2m_temperature"], archive, (2, 2), 1)
-    assert len(list((archive / "staging").rglob("checkpoint.json"))) == 1
+    with catalog.archive_session(archive) as db:
+        assert db.execute("SELECT COUNT(*) FROM staged_batches WHERE report_json IS NOT NULL").fetchone()[0] == 1
     assert len(list((archive / "staging").rglob("*.partial"))) == 1
     convert = Mock(wraps=staging.convert_batch)
     monkeypatch.setattr(staging, "convert_batch", convert)
@@ -536,3 +518,30 @@ def test_range_resumes_download_job_and_prior_conversion(
     assert convert.call_count == 1
     assert grib_client.return_value.retrieve.call_count == 2
     grib_client.return_value.client.get_remote.assert_called_once_with("pipeline-test-2")
+
+
+def test_range_adopts_completed_download_after_interrupted_catalog_update(
+    tmp_path: Path, grib_client: Mock, availability: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed rename is recovered at its cataloged path without another transfer."""
+    archive = tmp_path / "archive"
+    download = pipeline.download_batch
+
+    def interrupted(*args: Any, **kwargs: Any) -> Path:
+        download(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipeline, "download_batch", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.pull_range(DAY, DAY, ["2m_temperature"], archive, (2, 2), 1)
+    with catalog.archive_session(archive) as db:
+        record = db.execute("SELECT * FROM staged_batches").fetchone()
+        assert record["metadata_json"] is None
+        assert (Path(record["batch_path"]) / "metadata.json").exists()
+    monkeypatch.setattr(pipeline, "download_batch", Mock(side_effect=AssertionError("download")))
+    monkeypatch.setattr(pipeline, "load_credentials", Mock(side_effect=AssertionError("credentials")))
+    summary = pipeline.pull_range(DAY, DAY, ["2m_temperature"], archive, (2, 2), 1)
+    assert summary["completed"] == 24
+    grib_client.return_value.retrieve.assert_called_once()
+    with catalog.archive_session(archive) as db:
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == 0

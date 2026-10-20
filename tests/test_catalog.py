@@ -159,23 +159,37 @@ def _stage_multiple(
         batch.mkdir(parents=True)
         (batch / "data.grib").write_bytes(b"verified source")
         (batch / "metadata.json").write_text(json.dumps(source), encoding="utf-8")
-        (batch / "checkpoint.json").write_text("{}", encoding="utf-8")
         (batch / "converted.zarr").mkdir()
         (batch / "converted.zarr" / "zarr.json").write_text("{}", encoding="utf-8")
         batches.append(batch)
         sources.append(source)
         valid_time = int(timestamp.timestamp())
-        report["fields"].append({
+        field = {
             "variable": variable, "valid_time": valid_time,
             "reference_time": valid_time, "interval_start": valid_time,
             "interval_end": valid_time, "start_step": 0, "end_step": 0,
             "step_units": "s", "step_type": "instant",
             "source_request_sha256": source["request_sha256"],
-        })
+        }
+        report["fields"].append(field)
         report["variables"][variable] = {
             "paramId": param_id, "units": "K" if param_id == 167 else "m s**-1",
             "step_type": "instant",
         }
+        source_report = {
+            **report,
+            "variables": {variable: report["variables"][variable]},
+            "fields": [field],
+            "validation": {"fields": 1, "roundtrip": True},
+        }
+        with db:
+            db.execute(
+                """INSERT INTO staged_batches
+                   (id, year, month, request_json, batch_path, metadata_json, report_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (source["request_sha256"], 2000, 1, json.dumps(source["request"]),
+                 str(batch.resolve()), json.dumps(source), json.dumps(source_report)),
+            )
     metadata = {
         "dataset": template["dataset"], "request_sha256": "monthly-request",
         "sources": sources,
@@ -203,7 +217,6 @@ def test_publication_records_coverage_then_removes_source(tmp_path: Path) -> Non
     with catalog.archive_session(archive) as db:
         revision, stage, batch, report = _stage(db, archive)
         (batch / "converted.zarr").mkdir()
-        (batch / "checkpoint.json").write_text("external checkpoint", encoding="utf-8")
         assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
         assert (batch / "data.grib").exists()
         final = catalog.publish_revision(db, archive, revision, report)
@@ -211,7 +224,6 @@ def test_publication_records_coverage_then_removes_source(tmp_path: Path) -> Non
         assert not stage.exists()
         assert not (batch / "data.grib").exists()
         assert (batch / "converted.zarr").is_dir()
-        assert (batch / "checkpoint.json").read_text(encoding="utf-8") == "external checkpoint"
         row = db.execute("SELECT * FROM revisions WHERE id = ?", (revision,)).fetchone()
         assert row["status"] == "published"
         assert row["grib_removed"] == 1
@@ -273,11 +285,13 @@ def test_multiple_sources_preserve_exact_coverage_and_origins(tmp_path: Path) ->
     with catalog.archive_session(archive) as db:
         revision, _, batches, report, metadata = _stage_multiple(db, archive)
         original = report["fields"][0]
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == len(batches)
         catalog.publish_revision(db, archive, revision, report)
         row = db.execute("SELECT * FROM revisions WHERE id = ?", (revision,)).fetchone()
         assert json.loads(row["batch_paths_json"]) == [str(batch.resolve()) for batch in batches]
         assert json.loads(row["provenance_json"]) == metadata
         assert row["grib_removed"] == 1
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM revisions WHERE status = 'published'").fetchone()[0] == 2
         current = catalog.current_month(db, archive, 2000, 1)[1]
         fields = {(field["variable"], field["valid_time"]): field for field in current["fields"]}
@@ -298,10 +312,9 @@ def test_multiple_sources_preserve_exact_coverage_and_origins(tmp_path: Path) ->
         assert (batch / "metadata.json").exists()
         assert not (batch / "data.grib").exists()
         assert not (batch / "converted.zarr").exists()
-        assert not (batch / "checkpoint.json").exists()
 
 
-@pytest.mark.parametrize("failure", ["grib", "checkpoint"])
+@pytest.mark.parametrize("failure", ["grib", "converted_store"])
 def test_multiple_source_cleanup_resumes_after_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -309,32 +322,41 @@ def test_multiple_source_cleanup_resumes_after_failure(
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
         revision, _, batches, report, _ = _stage_multiple(db, archive)
-        unlink = Path.unlink
+        recorded = [dict(row) for row in db.execute("SELECT * FROM staged_batches ORDER BY id")]
+        assert len(recorded) == len(batches)
+        remove = Path.unlink if failure == "grib" else catalog.shutil.rmtree
+        failed_path = batches[1] / ("data.grib" if failure == "grib" else "converted.zarr")
 
         def fail_second_source(path: Path, *args: Any, **kwargs: Any) -> None:
             """Leave one contributing source pending after earlier cleanup succeeds."""
-            if path == batches[1] / ("data.grib" if failure == "grib" else "checkpoint.json"):
+            if Path(path) == failed_path:
                 raise PermissionError("source is open")
-            unlink(path, *args, **kwargs)
+            remove(path, *args, **kwargs)
 
         with monkeypatch.context() as patch:
-            patch.setattr(Path, "unlink", fail_second_source)
+            if failure == "grib":
+                patch.setattr(Path, "unlink", fail_second_source)
+            else:
+                patch.setattr(catalog.shutil, "rmtree", fail_second_source)
             with pytest.warns(RuntimeWarning, match="cleanup remains pending"):
                 catalog.publish_revision(db, archive, revision, report)
             assert db.execute("SELECT grib_removed FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == 0
             assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == revision
+            assert [dict(row) for row in db.execute("SELECT * FROM staged_batches ORDER BY id")] == recorded
             assert not (batches[0] / "data.grib").exists()
-            if failure == "checkpoint":
+            if failure == "converted_store":
                 assert all(not (batch / "data.grib").exists() for batch in batches)
+                assert not (batches[0] / "converted.zarr").exists()
+                assert (batches[1] / "converted.zarr").exists()
             else:
                 assert (batches[1] / "data.grib").exists()
     with catalog.archive_session(archive) as db:
         assert db.execute("SELECT grib_removed FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == 0
     for batch in batches:
         assert (batch / "metadata.json").exists()
         assert not (batch / "data.grib").exists()
         assert not (batch / "converted.zarr").exists()
-        assert not (batch / "checkpoint.json").exists()
 
 
 def test_interrupted_multiple_source_publication_retains_every_batch(
@@ -353,8 +375,10 @@ def test_interrupted_multiple_source_publication_retains_every_batch(
         assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (revision,)).fetchone()[0] == 0
         assert all((batch / "data.grib").exists() for batch in batches)
         assert all((batch / "converted.zarr").exists() for batch in batches)
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == len(batches)
     with catalog.archive_session(archive) as db:
         assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == revision
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == 0
     assert all(not (batch / "data.grib").exists() for batch in batches)
     assert all(not (batch / "converted.zarr").exists() for batch in batches)
 
@@ -452,7 +476,7 @@ def test_restarting_assembly_removes_only_abandoned_same_month_store(tmp_path: P
         assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == parent
         assert all((batch / "data.grib").exists() for batch in batches)
         assert all((batch / "converted.zarr").exists() for batch in batches)
-        assert all((batch / "checkpoint.json").exists() for batch in batches)
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == len(batches)
 
 
 def test_abandoned_store_cleanup_rejects_path_outside_revision_directory(tmp_path: Path) -> None:

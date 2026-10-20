@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Any
+from uuid import uuid4
 
 from era5_pull_pipeline.catalog import (
     archive_session,
@@ -18,8 +19,8 @@ from era5_pull_pipeline.catalog import (
 from era5_pull_pipeline.cds import DATASET, DEFAULT_MAX_DAYS, build_batch_request, download_batch, load_availability
 from era5_pull_pipeline.conversion import assemble_month, convert_batch
 from era5_pull_pipeline.credentials import load_credentials
-from era5_pull_pipeline.planning import missing_requests, month_requests, subtract_requests
-from era5_pull_pipeline.staging import conversion_checkpoint, find_downloads, verify_source
+from era5_pull_pipeline.planning import missing_requests, month_requests
+from era5_pull_pipeline.staging import conversion_checkpoint, prepare_batches
 
 
 def pull_range(
@@ -90,11 +91,7 @@ def pull_range(
                     summary["pending"] -= unavailable
                 else:
                     unavailable = 0
-                month_staging = archive / "staging" / "batches" / label
-                reusable = find_downloads(month_staging, requests) if requests else []
-                remaining = subtract_requests(requests, [metadata["request"] for _, metadata in reusable])
-                work = [(metadata["request"], (batch, metadata)) for batch, metadata in reusable]
-                work.extend((request, None) for request in remaining)
+                work = prepare_batches(db, archive, requests)
                 print(
                     f"{label}: {len(work)} batches; {skipped} stored and "
                     f"{unavailable} unavailable variable-hours.", flush=True,
@@ -103,25 +100,29 @@ def pull_range(
                 sources = []
                 checkpoints = []
                 month_fields = 0
-                for index, (request, existing) in enumerate(work, 1):
+                for index, record in enumerate(work, 1):
+                    request = json.loads(record["request_json"])
+                    batch = Path(record["batch_path"])
                     active_fields = len(request["variable"]) * len(request["day"]) * len(request["time"])
                     activity = f"downloading {label} batch {index}/{len(work)}"
-                    identity = json.dumps(
-                        {"dataset": DATASET, "request": request}, sort_keys=True, separators=(",", ":")
-                    ).encode("utf-8")
-                    staging = month_staging / hashlib.sha256(identity).hexdigest()
-                    if existing is None:
-                        if credentials is None:
-                            credentials = load_credentials()
-                        print(f"{activity.capitalize()}; CDS may queue the request.", flush=True)
-                        batch = download_batch(credentials, request, staging, resume=True)
+                    if record["metadata_json"] is None:
+                        # The final rename can precede an interrupted catalog commit.
+                        if not batch.exists():
+                            if credentials is None:
+                                credentials = load_credentials()
+                            print(f"{activity.capitalize()}; CDS may queue the request.", flush=True)
+                            download_batch(credentials, request, batch)
                         metadata = json.loads((batch / "metadata.json").read_text(encoding="utf-8"))
-                        verify_source(batch, metadata)
+                        with db:
+                            db.execute(
+                                "UPDATE staged_batches SET metadata_json = ? WHERE id = ?",
+                                (json.dumps(metadata), record["id"]),
+                            )
                     else:
-                        batch, metadata = existing
-                        print(f"{label} batch {index}/{len(work)}: reusing verified GRIB.", flush=True)
+                        metadata = json.loads(record["metadata_json"])
+                        print(f"{label} batch {index}/{len(work)}: reusing completed GRIB.", flush=True)
                     activity = f"converting {label} batch {index}/{len(work)}"
-                    checkpoint, report, reused = conversion_checkpoint(batch, metadata, spatial_chunks)
+                    checkpoint, report, reused = conversion_checkpoint(db, record, metadata, spatial_chunks)
                     print(
                         f"{label} batch {index}/{len(work)}: "
                         f"{'reused' if reused else 'saved'} validated conversion.", flush=True,
@@ -199,7 +200,7 @@ def pull_batch(
             return current_month(db, archive, start.year, start.month)[0]
         credentials = load_credentials()
         for selection in selections:
-            batch = download_batch(credentials, selection, archive / "staging")
+            batch = download_batch(credentials, selection, archive / "staging" / uuid4().hex)
             metadata = json.loads((batch / "metadata.json").read_text(encoding="utf-8"))
             published = _publish_batch(db, archive, batch, metadata, spatial_chunks)
         return published
@@ -222,8 +223,8 @@ def ingest_batch(
         batch also succeeds after its GRIB has been removed.
 
     Raises:
-        ValueError: The download is incomplete, its checksum is inconsistent,
-            or its grid, layout, or variable metadata conflicts with the archive.
+        ValueError: The download is incomplete, or its grid, layout, or variable
+            metadata conflicts with the archive.
         Exception: File, conversion, and publication errors propagate.
     """
     if batch.suffix == ".partial":
@@ -240,7 +241,7 @@ def _publish_batch(
     metadata: dict[str, Any],
     spatial_chunks: tuple[int, int],
 ) -> Path:
-    """Verify the downloaded source, convert it, and commit its publication.
+    """Convert a completed source and commit its publication.
 
     Args:
         db: Catalog connection protected by the archive writer lock.
@@ -253,22 +254,14 @@ def _publish_batch(
         The published monthly directory.
 
     Raises:
-        ValueError: Source provenance, checksum, or archive selection conflicts.
+        ValueError: Source coverage or archive selection conflicts.
         Exception: Conversion and publication failures propagate, retaining GRIB.
     """
     request = metadata["request"]
-    identity = json.dumps(
-        {"dataset": metadata["dataset"], "request": request},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    if metadata["dataset"] != DATASET or hashlib.sha256(identity).hexdigest() != metadata["request_sha256"]:
-        raise ValueError("The staged source request does not match its recorded identity.")
     year, month = int(request["year"][0]), int(request["month"][0])
     previous = current_month(db, archive, year, month)
     if not missing_requests(db, request):
         return previous[0]
-    verify_source(batch, metadata)
     grib = batch / "data.grib"
     revision, staged = prepare_revision(db, archive, [batch], metadata)
     report = convert_batch(

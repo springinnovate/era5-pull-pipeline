@@ -5,7 +5,6 @@ from datetime import UTC, date, datetime
 import hashlib
 import json
 from pathlib import Path
-from tempfile import mkdtemp
 
 import cdsapi
 from multiurl import robust
@@ -129,47 +128,36 @@ def build_batch_request(
 def download_batch(
     credentials: CdsCredentials,
     request: dict[str, str | list[str] | list[float]],
-    staging: Path,
-    *,
-    resume: bool = False,
+    batch: Path,
 ) -> Path:
-    """Stream a selected batch to disk and complete its staging directory.
+    """Download or resume one batch at its recorded destination.
 
     Args:
         credentials: Connection settings from the local .cdsapirc.
         request: Bounded single-month selection from build_batch_request, or a
             subset of its variables, days, and hours selected by the planner.
-        staging: Parent directory for completed and partial batch directories.
-        resume: Reuse a matching partial batch and its recorded CDS job. An
-            interrupted transfer restarts its bytes using the same remote job.
+        batch: Exact completed directory allocated by the caller for this
+            request. Work resumes in its .partial sibling; an interrupted
+            transfer restarts its bytes using the same recorded remote job.
 
     Returns:
-        A completed directory containing data.grib and metadata.json.
+        The completed batch directory, reused directly if already present.
 
     Raises:
         Exception: File or CDS errors propagate. Unfinished batches retain the
             .partial directory suffix.
     """
+    if batch.exists():
+        return batch
     identity = json.dumps(
         {"dataset": DATASET, "request": request}, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     request_sha256 = hashlib.sha256(identity).hexdigest()
-    partial = None
-    journal = None
-    if resume and staging.exists():
-        for candidate in sorted(staging.glob("*.partial")):
-            if not (candidate / "request.json").exists():
-                continue
-            saved = json.loads((candidate / "request.json").read_text(encoding="utf-8"))
-            if saved["request_sha256"] == request_sha256:
-                partial, journal = candidate, saved
-                break
-    period = f"{request['year'][0]}-{request['month'][0]}"
-    start = f"{period}-{min(request['day'])}"
-    end = f"{period}-{max(request['day'])}"
-    staging.mkdir(parents=True, exist_ok=True)
-    if partial is None:
-        partial = Path(mkdtemp(prefix=f"{start}_{end}_", suffix=".partial", dir=staging))
+    partial = batch.with_suffix(".partial")
+    partial.mkdir(parents=True, exist_ok=True)
+    if (partial / "request.json").exists():
+        journal = json.loads((partial / "request.json").read_text(encoding="utf-8"))
+    else:
         journal = {
             "dataset": DATASET,
             "request": request,
@@ -216,9 +204,8 @@ def download_batch(
     (partial / "metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
-    completed = partial.with_suffix("")
-    partial.rename(completed)
-    return completed
+    partial.rename(batch)
+    return batch
 
 
 def load_availability() -> list[dict[str, list[str]]]:

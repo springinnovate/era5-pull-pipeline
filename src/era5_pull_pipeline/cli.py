@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 import sys
+from uuid import uuid4
 
 from era5_pull_pipeline.cds import DEFAULT_MAX_DAYS, build_batch_request, check_access, download_batch
 from era5_pull_pipeline.credentials import load_credentials
@@ -118,7 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             completed = download_batch(
                 credentials,
                 build_batch_request(args.start_date, args.end_date, args.variables, args.max_days),
-                args.staging,
+                args.staging / f"{args.start_date}_{args.end_date}_{uuid4().hex}",
             )
             print(f"Saved completed batch to {completed}.")
         elif args.command == "pull":
