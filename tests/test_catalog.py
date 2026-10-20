@@ -92,6 +92,7 @@ def _stage(
             "reference_time": timestamp, "interval_start": timestamp,
             "interval_end": timestamp, "start_step": 0, "end_step": 0,
             "step_units": "s", "step_type": "instant",
+            "source_request_sha256": metadata["request_sha256"],
         } for timestamp in timestamps],
         "validation": {"fields": len(hours), "roundtrip": True},
     }
@@ -679,89 +680,6 @@ def test_recovery_rejects_unrelated_final_store(tmp_path: Path) -> None:
     with sqlite3.connect(archive / "catalog.sqlite") as db:
         assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
     assert (batch / "data.grib").exists()
-
-
-@pytest.mark.parametrize("reader_first", [False, True])
-def test_legacy_catalog_migrates_and_remains_extendable(
-    tmp_path: Path, reader_first: bool
-) -> None:
-    """Migrate the original SQLite schema and unmarked Zarr from either API."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        first, _, _, report = _stage(db, archive)
-        final = catalog.publish_revision(db, archive, first, report)
-    # Recreate the exact schema and store attributes used before replacements.
-    (final / "2_metre_temperature").rename(final / "param_167")
-    report["variables"]["param_167"] = report["variables"].pop("2_metre_temperature")
-    report["fields"][0]["variable"] = "param_167"
-    with sqlite3.connect(archive / "catalog.sqlite") as db:
-        db.executescript("""
-            DROP TABLE months;
-            DROP INDEX ready_month;
-            ALTER TABLE revisions DROP COLUMN parent_revision_id;
-            ALTER TABLE revisions DROP COLUMN backup_path;
-            ALTER TABLE revisions DROP COLUMN batch_paths_json;
-            ALTER TABLE coverage DROP COLUMN source_revision_id;
-            ALTER TABLE coverage DROP COLUMN source_request_sha256;
-            CREATE UNIQUE INDEX published_month ON revisions (year, month)
-                WHERE status IN ('ready', 'published');
-            PRAGMA user_version = 0;
-        """)
-        db.execute("UPDATE coverage SET variable = 'param_167'")
-        db.execute("UPDATE revisions SET report_json = ? WHERE id = ?", (json.dumps(report), first))
-    del zarr.open_group(final, mode="r+").attrs["revision_id"]
-    if reader_first:
-        with catalog.open_month(archive, 2000, 1) as dataset:
-            np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
-    with catalog.archive_session(archive) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
-        current = catalog.current_month(db, archive, 2000, 1)
-        assert current[1]["revision_id"] == first
-        assert current[1]["fields"][0]["source_revision_id"] == first
-        original = db.execute("SELECT * FROM revisions WHERE id = ?", (first,)).fetchone()
-        assert current[1]["fields"][0]["source_request_sha256"] == original["request_sha256"]
-        assert json.loads(original["batch_paths_json"]) == [original["batch_path"]]
-        assert current[1]["fields"][0]["variable"] == "param_167"
-        assert catalog.missing_fields(
-            db, 2000, 1, ["2m_temperature"], [report["fields"][0]["valid_time"]]
-        ) == {}
-        assert "revision_id" not in zarr.open_group(final, mode="r").attrs
-        second, _, _, report = _stage(db, archive, variable="10_metre_u_wind_component")
-        catalog.publish_revision(db, archive, second, report)
-    with catalog.open_month(archive, 2000, 1) as dataset:
-        np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
-        np.testing.assert_array_equal(dataset["10_metre_u_wind_component"].values, 3.0)
-
-
-def test_replacement_catalog_migration_retains_original_request_origins(tmp_path: Path) -> None:
-    """Backfill retained fields from their original revision, not their current month."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        first, _, _, report = _stage(db, archive)
-        catalog.publish_revision(db, archive, first, report)
-        second, _, _, report = _stage(db, archive, variable="10_metre_u_wind_component")
-        catalog.publish_revision(db, archive, second, report)
-        expected = {
-            field["variable"]: field["source_request_sha256"]
-            for field in catalog.current_month(db, archive, 2000, 1)[1]["fields"]
-        }
-    with sqlite3.connect(archive / "catalog.sqlite") as db:
-        db.executescript("""
-            ALTER TABLE revisions DROP COLUMN batch_paths_json;
-            ALTER TABLE coverage DROP COLUMN source_request_sha256;
-            PRAGMA user_version = 1;
-        """)
-    with catalog.archive_session(archive) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
-        current = catalog.current_month(db, archive, 2000, 1)[1]
-        assert current["revision_id"] == second
-        assert {field["variable"]: field["source_request_sha256"] for field in current["fields"]} == expected
-        assert len(set(expected.values())) == 2
-        for row in db.execute("SELECT batch_path, batch_paths_json FROM revisions"):
-            assert json.loads(row["batch_paths_json"]) == [row["batch_path"]]
-        third, _, _, report = _stage(db, archive, hours=(1,))
-        catalog.publish_revision(db, archive, third, report)
-        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == third
 
 
 def test_layout_change_is_rejected_before_ready(tmp_path: Path) -> None:

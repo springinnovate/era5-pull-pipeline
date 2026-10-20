@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS revisions (
     status TEXT NOT NULL CHECK (status IN ('preparing', 'ready', 'published')),
     staged_path TEXT NOT NULL,
     final_path TEXT NOT NULL,
-    batch_path TEXT NOT NULL,
     batch_paths_json TEXT NOT NULL,
     provenance_json TEXT NOT NULL,
     report_json TEXT,
@@ -60,80 +59,25 @@ CREATE TABLE IF NOT EXISTS coverage (
     source_request_sha256 TEXT NOT NULL,
     PRIMARY KEY (revision_id, variable, valid_time)
 );
-DROP INDEX IF EXISTS published_month;
 CREATE UNIQUE INDEX IF NOT EXISTS ready_month
     ON revisions (year, month) WHERE status = 'ready';
 """
 
 
-def _initialize_catalog(db: sqlite3.Connection) -> None:
-    """Create the catalog or migrate earlier revision and source metadata.
-
-    Args:
-        db: Catalog connection protected by the publication lock.
-
-    Raises:
-        ValueError: The catalog has an unsupported schema version.
-        sqlite3.Error: Creating or migrating the catalog fails.
-    """
-    version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version == 2:
-        return
-    if version not in (0, 1):
-        raise ValueError(f"Unsupported catalog schema version: {version}.")
-    with db:
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
-        columns = {row[1] for row in db.execute("PRAGMA table_info(revisions)")}
-        if "parent_revision_id" not in columns:
-            db.execute("ALTER TABLE revisions ADD COLUMN parent_revision_id TEXT REFERENCES revisions(id)")
-            db.execute("ALTER TABLE revisions ADD COLUMN backup_path TEXT")
-        if "batch_paths_json" not in columns:
-            db.execute("ALTER TABLE revisions ADD COLUMN batch_paths_json TEXT")
-            db.executemany(
-                "UPDATE revisions SET batch_paths_json = ? WHERE id = ?",
-                [(json.dumps([row["batch_path"]]), row["id"])
-                 for row in db.execute("SELECT id, batch_path FROM revisions")],
-            )
-        columns = {row[1] for row in db.execute("PRAGMA table_info(coverage)")}
-        if "source_revision_id" not in columns:
-            db.execute("ALTER TABLE coverage ADD COLUMN source_revision_id TEXT REFERENCES revisions(id)")
-            db.execute("UPDATE coverage SET source_revision_id = revision_id")
-        if "source_request_sha256" not in columns:
-            db.execute("ALTER TABLE coverage ADD COLUMN source_request_sha256 TEXT")
-            db.execute(
-                """UPDATE coverage SET source_request_sha256 = (
-                   SELECT request_sha256 FROM revisions WHERE id = source_revision_id)"""
-            )
-        if version == 0:
-            db.execute(
-                """INSERT INTO months (year, month, current_revision_id)
-                   SELECT year, month, id FROM revisions WHERE status = 'published'"""
-            )
-        db.execute("PRAGMA user_version = 2")
-
-
 def _check_store(path: Path, revision: sqlite3.Row) -> None:
-    """Match a store to its journal entry, accepting original archive metadata.
+    """Match a store's revision identifier to its publication journal entry.
 
     Args:
         path: Existing Zarr store.
         revision: Catalog revision expected at that path.
 
     Raises:
-        ValueError: The store identifies another revision or source request.
+        ValueError: The store identifies another revision.
         Exception: Zarr reading errors propagate.
     """
     attrs = zarr.open_group(path, mode="r").attrs
-    identity = attrs.get("revision_id")
-    if identity is not None:
-        matches = identity == revision["id"]
-    else:
-        matches = (
-            revision["parent_revision_id"] is None
-            and attrs["provenance"]["request_sha256"] == revision["request_sha256"]
-        )
-    if not matches:
-        raise ValueError(f"The store at {path} belongs to a different revision or request.")
+    if attrs["revision_id"] != revision["id"]:
+        raise ValueError(f"The store at {path} belongs to a different revision.")
 
 
 def _rename_store(source: Path, destination: Path) -> None:
@@ -207,7 +151,7 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                         field["interval_end"], field["start_step"], field["end_step"],
                         field["step_units"], field["step_type"],
                         field.get("source_revision_id", revision["id"]),
-                        field.get("source_request_sha256", revision["request_sha256"]),
+                        field["source_request_sha256"],
                     )
                     for field in report["fields"]
                 ],
@@ -310,7 +254,7 @@ def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
             with portalocker.Lock(
                 archive / ".publication.lock", "a", flags=portalocker.LOCK_EX
             ):
-                _initialize_catalog(db)
+                db.executescript(SCHEMA)
                 _recover_publications(db, archive)
             yield db
 
@@ -453,11 +397,11 @@ def prepare_revision(
         db.execute(
             """INSERT INTO revisions
             (id, year, month, request_sha256, status, staged_path, final_path,
-             batch_path, batch_paths_json, provenance_json, created_at, parent_revision_id, backup_path)
-            VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?, ?, ?, ?, ?)""",
+             batch_paths_json, provenance_json, created_at, parent_revision_id, backup_path)
+            VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 revision_id, year, month, metadata["request_sha256"], stage.as_posix(),
-                final.as_posix(), str(batches[0].resolve()),
+                final.as_posix(),
                 json.dumps([str(batch.resolve()) for batch in batches]), json.dumps(metadata),
                 datetime.now(UTC).isoformat(), parent[0] if parent is not None else None,
                 backup.as_posix() if backup is not None else None,
@@ -564,7 +508,7 @@ def open_month(archive: Path, year: int, month: int) -> Iterator[xr.Dataset]:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA foreign_keys = ON")
             db.execute("PRAGMA synchronous = FULL")
-            _initialize_catalog(db)
+            db.executescript(SCHEMA)
             _recover_publications(db, archive)
             current = current_month(db, archive, year, month)
             if current is None:
