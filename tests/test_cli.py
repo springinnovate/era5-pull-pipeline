@@ -100,3 +100,27 @@ def test_download_batch_command(
         ["2m_temperature", "total_precipitation"], Path("staging"), 2,
     ]
     assert f"Saved completed batch to {completed}" in capsys.readouterr().out
+
+
+def test_archive_commands_do_not_load_credentials_before_catalog_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Allow offline ingestion and repeat requests without a local token."""
+    monkeypatch.chdir(tmp_path)
+    published = Path("archive/2000/01/era5.zarr")
+    pull = Mock(return_value=published)
+    ingest = Mock(return_value=published)
+    monkeypatch.setattr(cli, "pull_batch", pull)
+    monkeypatch.setattr(cli, "ingest_batch", ingest)
+
+    assert cli.main([
+        "pull-batch", "--start-date", "2000-01-01", "--end-date", "2000-01-01",
+        "--variables", "2m_temperature", "--spatial-chunks", "16", "32",
+    ]) == 0
+    pull.assert_called_once_with(
+        date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"],
+        Path("archive"), (16, 32), 7,
+    )
+    assert cli.main(["ingest-batch", "--batch", "completed"]) == 0
+    ingest.assert_called_once_with(Path("completed"), Path("archive"), (32, 32))
+    assert capsys.readouterr().out.count(f"Published data available at {published}") == 2
