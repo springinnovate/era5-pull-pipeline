@@ -329,13 +329,17 @@ def missing_fields(
     variables: Sequence[str],
     valid_times: Sequence[int],
 ) -> dict[str, list[int]]:
-    """Find requested variable/hour pairs absent from the current revision.
+    """Find CDS variable/hour pairs absent from completed source requests.
+
+    Published monthly replacements preserve earlier coverage. Their recorded
+    requests therefore identify completed selections independently of the
+    decoder's array names and each retained field's original retrieval.
 
     Args:
         db: Catalog connection from archive_session.
         year: Calendar year.
         month: Calendar month.
-        variables: Canonical variable identifiers such as param_167.
+        variables: Exact CDS variable names from the requested selection.
         valid_times: Requested UTC hours as integer Unix timestamps.
 
     Returns:
@@ -345,19 +349,25 @@ def missing_fields(
     Raises:
         sqlite3.Error: Reading catalog coverage fails.
     """
-    present = {variable: set() for variable in variables}
-    for field in db.execute(
-        """SELECT c.variable, c.valid_time FROM coverage c
-           JOIN months m ON m.current_revision_id = c.revision_id
-           WHERE m.year = ? AND m.month = ?""", (year, month)
+    missing = {variable: set(valid_times) for variable in variables}
+    for revision in db.execute(
+        """SELECT provenance_json FROM revisions
+           WHERE year = ? AND month = ? AND status = 'published'""", (year, month)
     ):
-        if field["variable"] in present:
-            present[field["variable"]].add(field["valid_time"])
-    requested = set(valid_times)
+        request = json.loads(revision["provenance_json"])["request"]
+        selected = missing.keys() & request["variable"]
+        if not selected:
+            continue
+        covered = {
+            int(datetime.fromisoformat(
+                f"{year:04d}-{month:02d}-{int(day):02d}T{hour}:00+00:00"
+            ).timestamp())
+            for day in request["day"] for hour in request["time"]
+        }
+        for variable in selected:
+            missing[variable].difference_update(covered)
     return {
-        variable: sorted(requested - covered)
-        for variable, covered in present.items()
-        if requested - covered
+        variable: sorted(times) for variable, times in missing.items() if times
     }
 
 

@@ -23,9 +23,10 @@ def _stage(
     db: sqlite3.Connection,
     archive: Path,
     month: int = 1,
-    variable: str = "param_167",
+    variable: str = "2_metre_temperature",
     hours: tuple[int, ...] = (0,),
     year: int = 2000,
+    requested_variables: tuple[str, ...] | None = None,
 ) -> tuple[str, Path, Path, dict[str, Any]]:
     """Build a small merged-store stand-in for catalog boundary tests.
 
@@ -36,6 +37,7 @@ def _stage(
         variable: Variable to add.
         hours: Hours since the beginning of the month.
         year: Calendar year for the fixture.
+        requested_variables: Full source request, including retained overlaps.
 
     Returns:
         Revision identifier, staged store, source batch, and converter report.
@@ -44,17 +46,30 @@ def _stage(
     batch = archive.parent / f"batch-{uuid4().hex}"
     batch.mkdir()
     (batch / "data.grib").write_bytes(b"source kept until publication")
+    cds_name, param_id = {
+        "2_metre_temperature": ("2m_temperature", 167),
+        "10_metre_u_wind_component": ("10m_u_component_of_wind", 165),
+    }[variable]
+    dates = [
+        datetime(year, month, 1, tzinfo=UTC) + timedelta(hours=hour)
+        for hour in hours
+    ]
     metadata = {
         "dataset": "reanalysis-era5-single-levels",
-        "request": {"year": [str(year)], "month": [f"{month:02d}"]},
+        "request": {
+            "product_type": ["reanalysis"],
+            "variable": list(requested_variables or (cds_name,)),
+            "year": [str(year)], "month": [f"{month:02d}"],
+            "day": sorted({value.strftime("%d") for value in dates}),
+            "time": sorted({value.strftime("%H:%M") for value in dates}),
+            "grid": [0.25, 0.25], "data_format": "grib",
+            "download_format": "unarchived",
+        },
         "request_sha256": f"request-{year}-{month}-{variable}-{hours}",
         "sha256": "source-checksum",
     }
     revision, stage = catalog.prepare_revision(db, archive, batch, metadata)
-    timestamps = [
-        int((datetime(year, month, 1, tzinfo=UTC) + timedelta(hours=hour)).timestamp())
-        for hour in hours
-    ]
+    timestamps = [int(value.timestamp()) for value in dates]
     report = {
         "year": year,
         "month": month,
@@ -66,8 +81,8 @@ def _stage(
         },
         "variables": {
             variable: {
-                "paramId": int(variable.removeprefix("param_")),
-                "units": "K" if variable == "param_167" else "m s**-1",
+                "paramId": param_id,
+                "units": "K" if variable == "2_metre_temperature" else "m s**-1",
                 "step_type": "instant",
             }
         },
@@ -82,7 +97,7 @@ def _stage(
     dataset = xr.Dataset(
         {variable: (
             ("time", "latitude", "longitude"),
-            np.full((len(hours), 2, 2), 280.0 if variable == "param_167" else 3.0),
+            np.full((len(hours), 2, 2), 280.0 if variable == "2_metre_temperature" else 3.0),
         )},
         coords={
             "time": np.array(timestamps, dtype="datetime64[s]"),
@@ -94,7 +109,10 @@ def _stage(
         with xr.open_zarr(previous[0], consolidated=False, chunks=None) as old:
             dataset = dataset.combine_first(old.load())
         report["variables"] = {**previous[1]["variables"], **report["variables"]}
-        report["fields"] = previous[1]["fields"] + report["fields"]
+        report["fields"] = list({
+            (field["variable"], field["valid_time"]): field
+            for field in report["fields"] + previous[1]["fields"]
+        }.values())
         report["validation"]["fields"] = len(report["fields"])
     dataset.attrs = {"provenance": metadata}
     dataset.to_zarr(stage, zarr_format=3, consolidated=False)
@@ -127,10 +145,10 @@ def test_publication_records_coverage_then_removes_source(tmp_path: Path) -> Non
         assert current[1]["revision_id"] == revision
         assert current[1]["fields"][0]["source_revision_id"] == revision
         assert catalog.missing_fields(
-            db, 2000, 1, ["param_167"], [report["fields"][0]["valid_time"]]
+            db, 2000, 1, ["2m_temperature"], [report["fields"][0]["valid_time"]]
         ) == {}
         with catalog.open_month(archive, 2000, 1) as dataset:
-            np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+            np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
 
 
 def test_replacement_keeps_history_and_field_origins(tmp_path: Path) -> None:
@@ -141,7 +159,7 @@ def test_replacement_keeps_history_and_field_origins(tmp_path: Path) -> None:
         final = catalog.publish_revision(db, archive, first, report)
         other, _, _, other_report = _stage(db, archive, month=2)
         catalog.publish_revision(db, archive, other, other_report)
-        second, stage, batch, report = _stage(db, archive, variable="param_165")
+        second, stage, batch, report = _stage(db, archive, variable="10_metre_u_wind_component")
         assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == first
         catalog.publish_revision(db, archive, second, report)
         assert not stage.exists()
@@ -154,12 +172,16 @@ def test_replacement_keeps_history_and_field_origins(tmp_path: Path) -> None:
         assert current[0] == final
         assert current[1]["revision_id"] == second
         assert {field["variable"]: field["source_revision_id"] for field in current[1]["fields"]} == {
-            "param_167": first, "param_165": second
+            "2_metre_temperature": first, "10_metre_u_wind_component": second
         }
+        assert catalog.missing_fields(
+            db, 2000, 1, ["2m_temperature", "10m_u_component_of_wind"],
+            [report["fields"][0]["valid_time"]],
+        ) == {}
         assert catalog.current_month(db, archive, 2000, 2)[1]["revision_id"] == other
     with catalog.open_month(archive, 2000, 1) as dataset:
-        np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
-        np.testing.assert_array_equal(dataset["param_165"].values, 3.0)
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
+        np.testing.assert_array_equal(dataset["10_metre_u_wind_component"].values, 3.0)
 
 
 def test_missing_fields_uses_independent_coverage_and_negative_timestamps(tmp_path: Path) -> None:
@@ -169,30 +191,67 @@ def test_missing_fields_uses_independent_coverage_and_negative_timestamps(tmp_pa
         revision, _, _, report = _stage(db, archive, hours=(0, 2), year=1950)
         catalog.publish_revision(db, archive, revision, report)
         revision, _, _, report = _stage(
-            db, archive, variable="param_165", hours=(0,), year=1950
+            db, archive, variable="10_metre_u_wind_component", hours=(0,), year=1950
         )
         catalog.publish_revision(db, archive, revision, report)
         start = int(datetime(1950, 1, 1, tzinfo=UTC).timestamp())
         hours = [start + 3600 * hour for hour in range(4)]
-        assert catalog.missing_fields(db, 1950, 1, ["param_167", "param_165"], hours) == {
-            "param_167": [hours[1], hours[3]],
-            "param_165": hours[1:],
+        assert catalog.missing_fields(db, 1950, 1, ["2m_temperature", "10m_u_component_of_wind"], hours) == {
+            "2m_temperature": [hours[1], hours[3]],
+            "10m_u_component_of_wind": hours[1:],
         }
-        assert catalog.missing_fields(db, 1950, 2, ["param_167"], hours) == {
-            "param_167": hours
+        assert catalog.missing_fields(db, 1950, 2, ["2m_temperature"], hours) == {
+            "2m_temperature": hours
         }
-        assert catalog.missing_fields(db, 1950, 1, ["param_167", "param_165"], hours[:1]) == {}
+        assert catalog.missing_fields(db, 1950, 1, ["2m_temperature", "10m_u_component_of_wind"], hours[:1]) == {}
+
+
+def test_overlapping_request_preserves_original_sources_and_completed_selection(
+    tmp_path: Path,
+) -> None:
+    """Treat a complete request as stored even when some fields retain old sources."""
+    archive = tmp_path / "archive"
+    names = ["2m_temperature", "10m_u_component_of_wind"]
+    with catalog.archive_session(archive) as db:
+        first, _, _, report = _stage(db, archive)
+        catalog.publish_revision(db, archive, first, report)
+        timestamp = report["fields"][0]["valid_time"]
+        second, _, _, report = _stage(
+            db, archive, variable="10_metre_u_wind_component",
+            requested_variables=tuple(names),
+        )
+        assert catalog.missing_fields(db, 2000, 1, names, [timestamp]) == {
+            "10m_u_component_of_wind": [timestamp]
+        }
+        catalog.publish_revision(db, archive, second, report)
+        current = catalog.current_month(db, archive, 2000, 1)[1]
+        assert {field["variable"]: field["source_revision_id"] for field in current["fields"]} == {
+            "2_metre_temperature": first, "10_metre_u_wind_component": second
+        }
+        assert catalog.missing_fields(db, 2000, 1, names, [timestamp]) == {}
+        third, _, _, report = _stage(db, archive, hours=(0, 1))
+        catalog.publish_revision(db, archive, third, report)
+        assert catalog.missing_fields(db, 2000, 1, names, [timestamp, timestamp + 3600]) == {
+            "10m_u_component_of_wind": [timestamp + 3600]
+        }
+        current = catalog.current_month(db, archive, 2000, 1)[1]
+        temperature = [field for field in current["fields"] if field["variable"] == "2_metre_temperature"]
+        assert [field["source_revision_id"] for field in temperature] == [first, third]
 
 
 def test_preparing_revision_is_never_readable(tmp_path: Path) -> None:
     """Leave incomplete conversion attempts without published coverage."""
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
-        revision, stage, batch, _ = _stage(db, archive)
+        revision, stage, batch, report = _stage(db, archive)
     with catalog.archive_session(archive) as db:
         assert db.execute("SELECT status FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == "preparing"
         assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
         assert catalog.current_month(db, archive, 2000, 1) is None
+        timestamp = report["fields"][0]["valid_time"]
+        assert catalog.missing_fields(db, 2000, 1, ["2m_temperature"], [timestamp]) == {
+            "2m_temperature": [timestamp]
+        }
     with pytest.raises(FileNotFoundError, match="No published"):
         with catalog.open_month(archive, 2000, 1):
             pytest.fail("Preparing data must not be exposed.")
@@ -209,7 +268,7 @@ def test_rename_failure_restores_old_month(
     with catalog.archive_session(archive) as db:
         first, _, _, report = _stage(db, archive)
         catalog.publish_revision(db, archive, first, report)
-        second, stage, batch, report = _stage(db, archive, variable="param_165")
+        second, stage, batch, report = _stage(db, archive, variable="10_metre_u_wind_component")
         rename = Path.rename
         calls = 0
 
@@ -230,9 +289,13 @@ def test_rename_failure_restores_old_month(
         assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "preparing"
         assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 0
         assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == first
+        timestamp = report["fields"][0]["valid_time"]
+        assert catalog.missing_fields(
+            db, 2000, 1, ["2m_temperature", "10m_u_component_of_wind"], [timestamp]
+        ) == {"10m_u_component_of_wind": [timestamp]}
         with catalog.open_month(archive, 2000, 1) as dataset:
-            assert set(dataset.data_vars) == {"param_167"}
-            np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+            assert set(dataset.data_vars) == {"2_metre_temperature"}
+            np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
         catalog.publish_revision(db, archive, second, report)
         assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == second
     assert not (batch / "data.grib").exists()
@@ -244,7 +307,7 @@ def test_catalog_failure_restores_old_month(tmp_path: Path) -> None:
     with catalog.archive_session(archive) as db:
         first, _, _, report = _stage(db, archive)
         catalog.publish_revision(db, archive, first, report)
-        second, stage, batch, report = _stage(db, archive, variable="param_165")
+        second, stage, batch, report = _stage(db, archive, variable="10_metre_u_wind_component")
         db.execute(
             """CREATE TRIGGER fail_month BEFORE UPDATE ON months
                BEGIN SELECT RAISE(ABORT, 'catalog failure'); END"""
@@ -257,7 +320,7 @@ def test_catalog_failure_restores_old_month(tmp_path: Path) -> None:
         assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 0
         assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "preparing"
         with catalog.open_month(archive, 2000, 1) as dataset:
-            assert set(dataset.data_vars) == {"param_167"}
+            assert set(dataset.data_vars) == {"2_metre_temperature"}
         assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == first
         db.execute("DROP TRIGGER fail_month")
         db.commit()
@@ -274,7 +337,7 @@ def test_interrupted_replacement_rolls_forward(
     with catalog.archive_session(archive) as db:
         first, _, _, report = _stage(db, archive)
         final = catalog.publish_revision(db, archive, first, report)
-        second, stage, batch, report = _stage(db, archive, variable="param_165")
+        second, stage, batch, report = _stage(db, archive, variable="10_metre_u_wind_component")
         rename = Path.rename
         calls = 0
 
@@ -296,16 +359,23 @@ def test_interrupted_replacement_rolls_forward(
         assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "ready"
         assert db.execute("SELECT current_revision_id FROM months").fetchone()[0] == first
         assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 0
+        timestamp = report["fields"][0]["valid_time"]
+        assert catalog.missing_fields(
+            db, 2000, 1, ["2m_temperature", "10m_u_component_of_wind"], [timestamp]
+        ) == {"10m_u_component_of_wind": [timestamp]}
         assert (batch / "data.grib").exists()
         assert stage.exists() == (completed_renames < 2)
         assert final.exists() == (completed_renames != 1)
     with catalog.open_month(archive, 2000, 1) as dataset:
-        np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
-        np.testing.assert_array_equal(dataset["param_165"].values, 3.0)
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
+        np.testing.assert_array_equal(dataset["10_metre_u_wind_component"].values, 3.0)
     with catalog.archive_session(archive) as db:
         assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == second
         assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 2
         assert db.execute("SELECT backup_path FROM revisions WHERE id = ?", (second,)).fetchone()[0] is None
+        assert catalog.missing_fields(
+            db, 2000, 1, ["2m_temperature", "10m_u_component_of_wind"], [timestamp]
+        ) == {}
     assert not (batch / "data.grib").exists()
 
 
@@ -317,7 +387,7 @@ def test_failed_restoration_remains_recoverable(
     with catalog.archive_session(archive) as db:
         first, _, _, report = _stage(db, archive)
         catalog.publish_revision(db, archive, first, report)
-        second, stage, batch, report = _stage(db, archive, variable="param_165")
+        second, stage, batch, report = _stage(db, archive, variable="10_metre_u_wind_component")
         rename = Path.rename
         calls = 0
 
@@ -339,7 +409,7 @@ def test_failed_restoration_remains_recoverable(
         assert stage.is_dir()
         assert (batch / "data.grib").exists()
     with catalog.open_month(archive, 2000, 1) as dataset:
-        assert set(dataset.data_vars) == {"param_167", "param_165"}
+        assert set(dataset.data_vars) == {"2_metre_temperature", "10_metre_u_wind_component"}
     assert not (batch / "data.grib").exists()
 
 
@@ -351,7 +421,7 @@ def test_cleanup_failures_do_not_hide_published_data(
     with catalog.archive_session(archive) as db:
         first, _, _, report = _stage(db, archive)
         catalog.publish_revision(db, archive, first, report)
-        second, _, batch, report = _stage(db, archive, variable="param_165")
+        second, _, batch, report = _stage(db, archive, variable="10_metre_u_wind_component")
         with monkeypatch.context() as patch:
             patch.setattr(catalog.shutil, "rmtree", Mock(side_effect=PermissionError("backup is open")))
             patch.setattr(Path, "unlink", Mock(side_effect=PermissionError("source is open")))
@@ -365,7 +435,7 @@ def test_cleanup_failures_do_not_hide_published_data(
             assert (batch / "data.grib").exists()
             with pytest.warns(RuntimeWarning, match="cleanup remains pending"):
                 with catalog.open_month(archive, 2000, 1) as dataset:
-                    np.testing.assert_array_equal(dataset["param_165"].values, 3.0)
+                    np.testing.assert_array_equal(dataset["10_metre_u_wind_component"].values, 3.0)
     with catalog.archive_session(archive) as db:
         row = db.execute("SELECT * FROM revisions WHERE id = ?", (second,)).fetchone()
         assert row["grib_removed"] == 1
@@ -406,6 +476,9 @@ def test_legacy_catalog_migrates_and_remains_extendable(
         first, _, _, report = _stage(db, archive)
         final = catalog.publish_revision(db, archive, first, report)
     # Recreate the exact schema and store attributes used before replacements.
+    (final / "2_metre_temperature").rename(final / "param_167")
+    report["variables"]["param_167"] = report["variables"].pop("2_metre_temperature")
+    report["fields"][0]["variable"] = "param_167"
     with sqlite3.connect(archive / "catalog.sqlite") as db:
         db.executescript("""
             DROP TABLE months;
@@ -417,6 +490,8 @@ def test_legacy_catalog_migrates_and_remains_extendable(
                 WHERE status IN ('ready', 'published');
             PRAGMA user_version = 0;
         """)
+        db.execute("UPDATE coverage SET variable = 'param_167'")
+        db.execute("UPDATE revisions SET report_json = ? WHERE id = ?", (json.dumps(report), first))
     del zarr.open_group(final, mode="r+").attrs["revision_id"]
     if reader_first:
         with catalog.open_month(archive, 2000, 1) as dataset:
@@ -426,12 +501,16 @@ def test_legacy_catalog_migrates_and_remains_extendable(
         current = catalog.current_month(db, archive, 2000, 1)
         assert current[1]["revision_id"] == first
         assert current[1]["fields"][0]["source_revision_id"] == first
+        assert current[1]["fields"][0]["variable"] == "param_167"
+        assert catalog.missing_fields(
+            db, 2000, 1, ["2m_temperature"], [report["fields"][0]["valid_time"]]
+        ) == {}
         assert "revision_id" not in zarr.open_group(final, mode="r").attrs
-        second, _, _, report = _stage(db, archive, variable="param_165")
+        second, _, _, report = _stage(db, archive, variable="10_metre_u_wind_component")
         catalog.publish_revision(db, archive, second, report)
     with catalog.open_month(archive, 2000, 1) as dataset:
         np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
-        np.testing.assert_array_equal(dataset["param_165"].values, 3.0)
+        np.testing.assert_array_equal(dataset["10_metre_u_wind_component"].values, 3.0)
 
 
 def test_layout_change_is_rejected_before_ready(tmp_path: Path) -> None:
@@ -448,7 +527,7 @@ def test_layout_change_is_rejected_before_ready(tmp_path: Path) -> None:
         assert stage.exists()
         assert (batch / "data.grib").exists()
         with catalog.open_month(archive, 2000, 1) as dataset:
-            np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+            np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
 
 
 def test_reader_lock_allows_conversion_and_blocks_publication(tmp_path: Path) -> None:
@@ -461,16 +540,16 @@ def test_reader_lock_allows_conversion_and_blocks_publication(tmp_path: Path) ->
             with catalog.archive_session(archive):
                 pytest.fail("A second writer must not acquire the archive.")
         with catalog.open_month(archive, 2000, 1) as dataset:
-            revision, stage, _, report = _stage(db, archive, variable="param_165")
+            revision, stage, _, report = _stage(db, archive, variable="10_metre_u_wind_component")
             assert stage.is_dir()
-            assert set(dataset.data_vars) == {"param_167"}
-            np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+            assert set(dataset.data_vars) == {"2_metre_temperature"}
+            np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
             with pytest.raises(portalocker.exceptions.LockException):
                 with portalocker.Lock(archive / ".publication.lock", "a", timeout=0):
                     pytest.fail("The reader must retain the publication lock.")
         catalog.publish_revision(db, archive, revision, report)
     with catalog.open_month(archive, 2000, 1) as dataset:
-        assert set(dataset.data_vars) == {"param_167", "param_165"}
+        assert set(dataset.data_vars) == {"2_metre_temperature", "10_metre_u_wind_component"}
 
 
 def test_writer_lock_is_released_when_process_exits(tmp_path: Path) -> None:

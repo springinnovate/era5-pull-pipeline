@@ -15,20 +15,20 @@ from era5_pull_pipeline import cds, planning
 @pytest.mark.parametrize(
     ("missing_hours", "request_count"),
     [
-        ({"param_167": [], "param_165": [], "param_166": []}, 0),
+        ({"2m_temperature": [], "10m_u_component_of_wind": [], "10m_v_component_of_wind": []}, 0),
         (
             {
-                "param_167": [0, 1, 2, 24, 25, 26, 48, 49, 50],
-                "param_165": [],
-                "param_166": [0, 1, 2, 24, 25, 26, 48, 49, 50],
+                "2m_temperature": [0, 1, 2, 24, 25, 26, 48, 49, 50],
+                "10m_u_component_of_wind": [],
+                "10m_v_component_of_wind": [0, 1, 2, 24, 25, 26, 48, 49, 50],
             },
             1,
         ),
         (
             {
-                "param_167": [0, 2, 25, 48, 50],
-                "param_165": [0, 2, 25, 48, 50],
-                "param_166": [1, 24, 26, 49],
+                "2m_temperature": [0, 2, 25, 48, 50],
+                "10m_u_component_of_wind": [0, 2, 25, 48, 50],
+                "10m_v_component_of_wind": [1, 24, 26, 49],
             },
             4,
         ),
@@ -43,16 +43,11 @@ def test_requests_cover_only_missing_cartesian_combinations(
     """Group shared selections without inventing cross-products across different gaps."""
     start = int(datetime(year, 3, 1, tzinfo=UTC).timestamp())
     missing = {
-        parameter: [start + offset * 3600 for offset in hours]
-        for parameter, hours in missing_hours.items()
+        name: [start + offset * 3600 for offset in hours]
+        for name, hours in missing_hours.items()
     }
     monkeypatch.setattr(planning, "missing_fields", Mock(return_value=missing))
-    names = {
-        "param_167": "2m_temperature",
-        "param_165": "10m_u_component_of_wind",
-        "param_166": "10m_v_component_of_wind",
-    }
-    request = cds.build_batch_request(date(year, 3, 1), date(year, 3, 3), list(names.values()))
+    request = cds.build_batch_request(date(year, 3, 1), date(year, 3, 3), list(missing_hours))
     request["time"] = ["00:00", "01:00", "02:00"]
     with closing(sqlite3.connect(":memory:")) as db:
         selections = planning.missing_requests(db, request)
@@ -67,8 +62,8 @@ def test_requests_cover_only_missing_cartesian_combinations(
         )
     ]
     expected = {
-        (names[parameter], timestamp)
-        for parameter, timestamps in missing.items()
+        (name, timestamp)
+        for name, timestamps in missing.items()
         for timestamp in timestamps
     }
     assert set(actual) == expected

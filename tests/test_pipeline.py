@@ -16,7 +16,6 @@ import zarr
 from era5_pull_pipeline import cds, conversion, pipeline
 from era5_pull_pipeline.catalog import open_month
 from era5_pull_pipeline.credentials import CdsCredentials
-from era5_pull_pipeline.variables import PARAMETER_IDS
 
 DAY = date(2000, 1, 1)
 CREDENTIALS = CdsCredentials("https://example.test/api", "pipeline-test-token")
@@ -43,7 +42,12 @@ def grib_client(monkeypatch: pytest.MonkeyPatch) -> Mock:
                 for variable, day, time in product(
                     request["variable"], request["day"], request["time"]
                 ):
-                    parameter = PARAMETER_IDS[variable]
+                    parameter = {
+                        "2m_temperature": 167,
+                        "10m_u_component_of_wind": 165,
+                        "10m_v_component_of_wind": 166,
+                        "provider_defined_dewpoint": 168,
+                    }[variable]
                     hour = int(time[:2])
                     handle = eccodes.codes_grib_new_from_samples("regular_ll_sfc_grib2")
                     try:
@@ -105,7 +109,7 @@ def test_pull_publishes_then_repeats_without_credentials_or_cds(
         [np.arange(12).reshape(3, 4) / 8 + 168 + hour for hour in range(24)]
     )
     with open_month(archive, 2000, 1) as dataset:
-        np.testing.assert_array_equal(dataset["param_167"].values, expected)
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, expected)
         np.testing.assert_array_equal(dataset.longitude.values, [0, 0.25, 0.5, 0.75])
         assert dataset.time.values[0] == np.datetime64("2000-01-01T00:00:00")
         assert dataset.time.values[-1] == np.datetime64("2000-01-01T23:00:00")
@@ -121,10 +125,29 @@ def test_pull_publishes_then_repeats_without_credentials_or_cds(
     assert pipeline.pull_batch(DAY, DAY, ["2m_temperature"], archive) == output
     assert pipeline.ingest_batch(batch, archive) == output
     assert (batch / "metadata.json").read_bytes() == metadata_before
-    np.testing.assert_array_equal(zarr.open_group(output, mode="r")["param_167"][:], expected)
+    np.testing.assert_array_equal(zarr.open_group(output, mode="r")["2_metre_temperature"][:], expected)
     with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
         assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 24
         assert db.execute("SELECT status, grib_removed FROM revisions").fetchall() == [("published", 1)]
+
+
+def test_provider_defined_request_name_publishes_and_skips_without_mapping(
+    tmp_path: Path, grib_client: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Trust the provider's requested name and derive array names from the GRIB."""
+    archive = tmp_path / "archive"
+    variables = ["provider_defined_dewpoint", "2m_temperature"]
+    output = pipeline.pull_batch(DAY, DAY, variables, archive, spatial_chunks=(2, 2))
+    with open_month(archive, 2000, 1) as dataset:
+        assert "2_metre_dewpoint_temperature" in dataset
+        assert "2_metre_temperature" in dataset
+        assert np.isfinite(dataset["2_metre_dewpoint_temperature"].values).all()
+    monkeypatch.setattr(
+        pipeline, "load_credentials", Mock(side_effect=AssertionError("Repeated credentials"))
+    )
+    grib_client.side_effect = AssertionError("Repeated CDS request")
+    assert pipeline.pull_batch(DAY, DAY, list(reversed(variables)), archive) == output
+    assert pipeline.pull_batch(DAY, DAY, ["provider_defined_dewpoint"], archive) == output
 
 
 def test_full_march_temperature_then_partial_wind_and_exact_fill(
@@ -138,15 +161,15 @@ def test_full_march_temperature_then_partial_wind_and_exact_fill(
     output = pipeline.pull_batch(
         start, end, [temperature], archive, spatial_chunks=(2, 2), max_days=31
     )
-    temperature_before = zarr.open_group(output, mode="r")["param_167"][:]
+    temperature_before = zarr.open_group(output, mode="r")["2_metre_temperature"][:]
     request = cds.build_batch_request(start, end, [wind], max_days=31)
     sparse = {**request, "day": ["01", "03"], "time": ["00:00", "02:00"]}
     batch = cds.download_batch(CREDENTIALS, sparse, archive / "staging")
     assert pipeline.ingest_batch(batch, archive, spatial_chunks=(2, 2)) == output
     with open_month(archive, 1995, 3) as dataset:
-        np.testing.assert_array_equal(dataset["param_167"].values, temperature_before)
-        assert np.isnan(dataset["param_165"].sel(time="1995-03-02T12:00:00").values).all()
-        assert np.isfinite(dataset["param_165"].sel(time="1995-03-03T02:00:00").values).all()
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, temperature_before)
+        assert np.isnan(dataset["10_metre_u_wind_component"].sel(time="1995-03-02T12:00:00").values).all()
+        assert np.isfinite(dataset["10_metre_u_wind_component"].sel(time="1995-03-03T02:00:00").values).all()
 
     grib_client.reset_mock()
     pipeline.pull_batch(
@@ -159,15 +182,15 @@ def test_full_march_temperature_then_partial_wind_and_exact_fill(
     assert len(actual) == len(expected)
     assert len(submitted) == 2
     with open_month(archive, 1995, 3) as dataset:
-        np.testing.assert_array_equal(dataset["param_167"].values, temperature_before)
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, temperature_before)
         assert dataset.sizes["time"] == 31 * 24
-        assert np.isfinite(dataset["param_165"].values).all()
+        assert np.isfinite(dataset["10_metre_u_wind_component"].values).all()
     with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
         counts = db.execute(
             "SELECT c.variable, COUNT(*) FROM coverage c JOIN months m "
             "ON c.revision_id = m.current_revision_id GROUP BY c.variable"
         ).fetchall()
-        assert dict(counts) == {"param_165": 744, "param_167": 744}
+        assert dict(counts) == {"10_metre_u_wind_component": 744, "2_metre_temperature": 744}
         revisions_before = db.execute("SELECT COUNT(*) FROM revisions").fetchone()[0]
 
     monkeypatch.setattr(
@@ -205,7 +228,7 @@ def test_fill_interior_hours_and_extend_time_axis(
         assert dataset.sizes["time"] == 48
         assert dataset.time.values[0] == np.datetime64("2000-01-01T00:00:00")
         assert dataset.time.values[-1] == np.datetime64("2000-01-02T23:00:00")
-        assert np.isfinite(dataset["param_167"].values).all()
+        assert np.isfinite(dataset["2_metre_temperature"].values).all()
     assert output == archive / "2000" / "01" / "era5.zarr"
 
 
@@ -226,7 +249,7 @@ def test_overlapping_ingest_preserves_old_values_and_other_month(
     original = {**request, "time": ["00:00", "02:00"]}
     batch = cds.download_batch(CREDENTIALS, original, archive / "staging")
     output = pipeline.ingest_batch(batch, archive, spatial_chunks=(2, 2))
-    before = zarr.open_group(output, mode="r")["param_167"][:]
+    before = zarr.open_group(output, mode="r")["2_metre_temperature"][:]
     grib_client.value_offset = 1000.0
     overlap = {**request, "time": ["00:00", "01:00", "02:00", "03:00"]}
     batch = cds.download_batch(CREDENTIALS, overlap, archive / "staging")
@@ -234,7 +257,7 @@ def test_overlapping_ingest_preserves_old_values_and_other_month(
     pipeline.ingest_batch(batch, archive, spatial_chunks=(2, 2))
 
     with open_month(archive, 2000, 1) as dataset:
-        actual = dataset["param_167"].values
+        actual = dataset["2_metre_temperature"].values
         np.testing.assert_array_equal(actual[[0, 2]], before)
         np.testing.assert_array_equal(actual[1], np.arange(12).reshape(3, 4) / 8 + 1169)
         np.testing.assert_array_equal(actual[3], np.arange(12).reshape(3, 4) / 8 + 1171)
@@ -272,7 +295,7 @@ def test_conversion_failure_keeps_old_store_catalog_and_new_grib(
     output = pipeline.pull_batch(
         DAY, DAY, ["2m_temperature"], archive, spatial_chunks=(2, 2)
     )
-    original_values = zarr.open_group(output, mode="r")["param_167"][:]
+    original_values = zarr.open_group(output, mode="r")["2_metre_temperature"][:]
     with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
         current_before = db.execute("SELECT * FROM months").fetchall()
         coverage_before = db.execute("SELECT * FROM coverage ORDER BY valid_time").fetchall()
@@ -287,8 +310,8 @@ def test_conversion_failure_keeps_old_store_catalog_and_new_grib(
     assert caught.value is failure
     assert source.read_bytes() == original_grib
     with open_month(archive, 2000, 1) as dataset:
-        np.testing.assert_array_equal(dataset["param_167"].values, original_values)
-        assert "param_165" not in dataset
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, original_values)
+        assert "10_metre_u_wind_component" not in dataset
     with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
         assert db.execute("SELECT * FROM months").fetchall() == current_before
         assert db.execute("SELECT * FROM coverage ORDER BY valid_time").fetchall() == coverage_before

@@ -5,6 +5,7 @@ from contextlib import ExitStack
 from datetime import UTC, datetime
 import mmap
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from typing import Any
 
@@ -13,8 +14,6 @@ import numpy as np
 from numpy.typing import NDArray
 import zarr
 from zarr.codecs import ZstdCodec
-
-from era5_pull_pipeline.variables import PARAMETER_IDS
 
 GLOBAL_LATITUDES = np.arange(90.0, -90.25, -0.25, dtype=np.float64)
 GLOBAL_LONGITUDES = np.arange(0.0, 360.0, 0.25, dtype=np.float64)
@@ -67,6 +66,7 @@ def _decode_grib(
     variables: dict[str, Any] = {}
     fields: list[dict[str, Any]] = []
     seen: dict[str, set[int]] = {}
+    parameter_names: dict[int, str] = {}
     with grib.open("rb") as stream:
         while (handle := eccodes.codes_grib_new_from_file(stream)) is not None:
             try:
@@ -74,7 +74,6 @@ def _decode_grib(
                 if grid != expected_grid:
                     raise ValueError("GRIB fields must share the full global 0.25 degree grid.")
                 param_id = int(eccodes.codes_get(handle, "paramId"))
-                variable = f"param_{param_id}"
                 attributes = {
                     "paramId": param_id,
                     "name": eccodes.codes_get(handle, "name"),
@@ -86,6 +85,9 @@ def _decode_grib(
                     "step_type": eccodes.codes_get(handle, "stepType"),
                     "step_units": "s",
                 }
+                variable = re.sub(r"[^a-z0-9]+", "_", attributes["name"].lower()).strip("_")
+                if parameter_names.setdefault(param_id, variable) != variable:
+                    raise ValueError(f"Parameter {param_id} has inconsistent descriptive names.")
                 reference_time = int(
                     datetime.strptime(
                         f"{eccodes.codes_get(handle, 'dataDate'):08d}"
@@ -109,6 +111,8 @@ def _decode_grib(
                 if start_step > end_step or reference_time + end_step != valid_time:
                     raise ValueError(f"{variable} has inconsistent forecast interval timestamps.")
                 if variable in variables:
+                    if variables[variable]["paramId"] != param_id:
+                        raise ValueError(f"Different parameters share the array name {variable}.")
                     if attributes != variables[variable]:
                         raise ValueError(f"{variable} has inconsistent variable metadata.")
                     if valid_time in seen[variable]:
@@ -142,9 +146,8 @@ def _decode_grib(
             finally:
                 eccodes.codes_release(handle)
 
-    expected_parameters = {PARAMETER_IDS[name] for name in requested_variables}
-    if {attributes["paramId"] for attributes in variables.values()} != expected_parameters:
-        raise ValueError("Decoded parameter IDs differ from the requested variables.")
+    if len(parameter_names) != len(set(requested_variables)):
+        raise ValueError("Decoded parameter count differs from the requested variable count.")
     expected_times = set(time_indices)
     if not variables or any(coverage != expected_times for coverage in seen.values()):
         raise ValueError("Every decoded parameter must contain all requested UTC hours.")
@@ -206,10 +209,11 @@ def convert_batch(
 ) -> dict[str, Any]:
     """Write a validated monthly replacement, retaining existing fields and GRIB.
 
-    GRIB parameter IDs must match the requested CDS variables. Previous coverage
-    records determine which fields survive unchanged, including all-NaN fields.
-    The caller verifies the source checksum and owns publication, coverage
-    recording, and GRIB cleanup.
+    Descriptive ecCodes names identify arrays; parameter IDs remain in metadata.
+    Validation checks distinct parameter counts and complete requested hours,
+    trusting CDS to select the requested variables. Previous coverage records
+    preserve existing fields, including all-NaN fields. The caller verifies the
+    source checksum and owns publication, coverage recording, and GRIB cleanup.
 
     Args:
         grib: Completed staged GRIB file.
@@ -256,6 +260,7 @@ def convert_batch(
             prior = None
             prior_times = np.array([], dtype=np.int64)
             prior_fields: dict[tuple[str, int], dict[str, Any]] = {}
+            prior_arrays: dict[str, zarr.Array] = {}
             source_provenance = []
             if previous is not None and previous_report is not None:
                 prior = zarr.open_group(previous, mode="r")
@@ -267,13 +272,26 @@ def convert_batch(
                     or not np.array_equal(prior["longitude"][:], GLOBAL_LONGITUDES)
                 ):
                     raise ValueError("The previous month has different coordinates or layout.")
-                for variable in variables.keys() & previous_report["variables"].keys():
-                    if variables[variable] != previous_report["variables"][variable]:
+                parameter_names = {
+                    attributes["paramId"]: variable for variable, attributes in variables.items()
+                }
+                renamed = {}
+                for original, attributes in previous_report["variables"].items():
+                    variable = re.sub(r"[^a-z0-9]+", "_", attributes["name"].lower()).strip("_")
+                    matching = parameter_names.get(attributes["paramId"])
+                    if matching is not None and variables[matching] != attributes:
                         raise ValueError(f"{variable} has different metadata in the previous month.")
-                variables = {**previous_report["variables"], **variables}
+                    if variable in variables and variables[variable]["paramId"] != attributes["paramId"]:
+                        raise ValueError(f"Different parameters share the array name {variable}.")
+                    variables[variable] = attributes
+                    parameter_names[attributes["paramId"]] = variable
+                    renamed[original] = variable
+                    prior_arrays[variable] = prior[original]
                 prior_times = prior["time"][:]
                 prior_fields = {
-                    (field["variable"], field["valid_time"]): field
+                    (renamed[field["variable"]], field["valid_time"]): {
+                        **field, "variable": renamed[field["variable"]],
+                    }
                     for field in previous_report["fields"]
                 }
                 source_provenance = list(prior.attrs.get(
@@ -296,7 +314,7 @@ def convert_batch(
                 tuple[NDArray[np.float64] | zarr.Array, NDArray[np.intp], NDArray[np.intp]]
             ]] = {variable: [] for variable in variables}
             for variable in variables:
-                if prior is not None and variable in previous_report["variables"]:
+                if variable in prior_arrays:
                     prior_rows = np.array([
                         index for index, value in enumerate(prior_times)
                         if (variable, int(value)) in prior_fields
@@ -304,7 +322,7 @@ def convert_batch(
                     destinations = np.array([
                         time_indices[int(prior_times[index])] for index in prior_rows
                     ], dtype=np.intp)
-                    sources[variable].append((prior[variable], prior_rows, destinations))
+                    sources[variable].append((prior_arrays[variable], prior_rows, destinations))
                 if variable in arrays:
                     incoming_rows = np.array([
                         index for index, value in enumerate(incoming_times)
@@ -324,7 +342,7 @@ def convert_batch(
                 "year": year,
                 "month": month,
                 "spatial_chunks": list(spatial_chunks),
-                "variable_identity": "ECMWF GRIB paramId; CDS names retained in provenance",
+                "variable_identity": "Descriptive ecCodes names; paramId attributes retain parameter identity",
             }
             root = zarr.open_group(output, mode="w-", zarr_format=3)
             root.attrs.update(group_attributes)
@@ -466,6 +484,6 @@ def convert_batch(
                     "compared_shards": compared_shards,
                     "numerical_roundtrip": "exact_float64_equal_nan",
                     "metadata_roundtrip": True,
-                    "request_variable_mapping": "exact_parameter_ids",
+                    "request_variable_validation": "distinct_parameter_count_and_complete_hours",
                 },
             }
