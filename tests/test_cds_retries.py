@@ -85,9 +85,7 @@ def test_execution_failure_retry_policy(
     with pytest.raises(requests.HTTPError, match=message) as caught:
         cds.download_batch(
             CREDENTIALS,
-            date(2000, 1, 1),
-            date(2000, 1, 1),
-            ["2m_temperature"],
+            cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
             tmp_path,
         )
 
@@ -153,9 +151,7 @@ def test_interrupted_transfer_exhausts_retries(
     with pytest.raises(requests.exceptions.ChunkedEncodingError) as caught:
         cds.download_batch(
             CREDENTIALS,
-            date(2000, 1, 1),
-            date(2000, 1, 1),
-            ["2m_temperature"],
+            cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
             tmp_path,
         )
 

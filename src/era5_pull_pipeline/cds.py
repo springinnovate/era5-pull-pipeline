@@ -124,34 +124,30 @@ def build_batch_request(
 
 def download_batch(
     credentials: CdsCredentials,
-    start: date,
-    end: date,
-    variables: Sequence[str],
+    request: dict[str, str | list[str] | list[float]],
     staging: Path,
-    max_days: int = DEFAULT_MAX_DAYS,
 ) -> Path:
-    """Stream one batch to disk and publish its completed staging directory.
+    """Stream a selected batch to disk and complete its staging directory.
 
     Args:
         credentials: Connection settings from the local .cdsapirc.
-        start: First UTC date to retrieve, inclusive.
-        end: Last UTC date to retrieve, inclusive.
-        variables: CDS single-level variable names.
+        request: Bounded single-month selection from build_batch_request, or a
+            subset of its variables, days, and hours selected by the planner.
         staging: Parent directory for completed and partial batch directories.
-        max_days: Maximum number of days allowed in this batch.
 
     Returns:
         A new directory containing data.grib and metadata.json.
 
     Raises:
-        ValueError: The batch selection is invalid.
         Exception: File or CDS errors propagate. Unfinished batches retain the
             .partial directory suffix.
     """
-    request = build_batch_request(start, end, variables, max_days)
     identity = json.dumps(
         {"dataset": DATASET, "request": request}, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+    period = f"{request['year'][0]}-{request['month'][0]}"
+    start = f"{period}-{min(request['day'])}"
+    end = f"{period}-{max(request['day'])}"
     staging.mkdir(parents=True, exist_ok=True)
     partial = Path(
         mkdtemp(prefix=f"{start}_{end}_", suffix=".partial", dir=staging)

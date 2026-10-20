@@ -5,6 +5,7 @@ from contextlib import ExitStack
 from datetime import UTC, datetime
 import mmap
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from typing import Any
 
@@ -16,6 +17,7 @@ from zarr.codecs import ZstdCodec
 
 GLOBAL_LATITUDES = np.arange(90.0, -90.25, -0.25, dtype=np.float64)
 GLOBAL_LONGITUDES = np.arange(0.0, 360.0, 0.25, dtype=np.float64)
+MISSING_INTEGER = np.iinfo(np.int64).min
 TIME_ATTRIBUTES = {
     "units": "seconds since 1970-01-01 00:00:00",
     "calendar": "proleptic_gregorian",
@@ -64,6 +66,7 @@ def _decode_grib(
     variables: dict[str, Any] = {}
     fields: list[dict[str, Any]] = []
     seen: dict[str, set[int]] = {}
+    parameter_names: dict[int, str] = {}
     with grib.open("rb") as stream:
         while (handle := eccodes.codes_grib_new_from_file(stream)) is not None:
             try:
@@ -71,7 +74,6 @@ def _decode_grib(
                 if grid != expected_grid:
                     raise ValueError("GRIB fields must share the full global 0.25 degree grid.")
                 param_id = int(eccodes.codes_get(handle, "paramId"))
-                variable = f"param_{param_id}"
                 attributes = {
                     "paramId": param_id,
                     "name": eccodes.codes_get(handle, "name"),
@@ -83,6 +85,9 @@ def _decode_grib(
                     "step_type": eccodes.codes_get(handle, "stepType"),
                     "step_units": "s",
                 }
+                variable = re.sub(r"[^a-z0-9]+", "_", attributes["name"].lower()).strip("_")
+                if parameter_names.setdefault(param_id, variable) != variable:
+                    raise ValueError(f"Parameter {param_id} has inconsistent descriptive names.")
                 reference_time = int(
                     datetime.strptime(
                         f"{eccodes.codes_get(handle, 'dataDate'):08d}"
@@ -106,6 +111,8 @@ def _decode_grib(
                 if start_step > end_step or reference_time + end_step != valid_time:
                     raise ValueError(f"{variable} has inconsistent forecast interval timestamps.")
                 if variable in variables:
+                    if variables[variable]["paramId"] != param_id:
+                        raise ValueError(f"Different parameters share the array name {variable}.")
                     if attributes != variables[variable]:
                         raise ValueError(f"{variable} has inconsistent variable metadata.")
                     if valid_time in seen[variable]:
@@ -139,7 +146,7 @@ def _decode_grib(
             finally:
                 eccodes.codes_release(handle)
 
-    if len(variables) != len(set(requested_variables)):
+    if len(parameter_names) != len(set(requested_variables)):
         raise ValueError("Decoded parameter count differs from the requested variable count.")
     expected_times = set(time_indices)
     if not variables or any(coverage != expected_times for coverage in seen.values()):
@@ -158,24 +165,63 @@ def _decode_grib(
     return arrays, variables, fields, grid_metadata
 
 
+def _merged_shard(
+    sources: list[
+        tuple[NDArray[np.float64] | zarr.Array, NDArray[np.intp], NDArray[np.intp]]
+    ],
+    selection: tuple[slice, slice, slice],
+    time_count: int,
+) -> NDArray[np.float64]:
+    """Assemble one spatial shard from explicitly covered source hours.
+
+    Args:
+        sources: Arrays with source and destination time indices. Their
+            destination indices are disjoint, with existing fields preferred.
+        selection: Full time axis and bounded latitude/longitude slices.
+        time_count: Length of the merged monthly time axis.
+
+    Returns:
+        Float64 values with NaN only where a field or source cell is missing.
+    """
+    _, latitude, longitude = selection
+    merged = np.full(
+        (time_count, latitude.stop - latitude.start, longitude.stop - longitude.start),
+        np.nan,
+        dtype=np.float64,
+    )
+    for source, source_indices, destination_indices in sources:
+        if isinstance(source, zarr.Array):
+            values = source.oindex[source_indices, latitude, longitude]
+        else:
+            values = source[source_indices, latitude, longitude]
+        merged[destination_indices] = values
+    return merged
+
+
 def convert_batch(
     grib: Path,
     metadata: dict[str, Any],
     output: Path,
     spatial_chunks: tuple[int, int] = (32, 32),
+    *,
+    previous: Path | None = None,
+    previous_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Write and reopen one batch as unpublished monthly Zarr, retaining its GRIB.
+    """Write a validated monthly replacement, retaining existing fields and GRIB.
 
-    CDS request names remain in provenance; GRIB parameter IDs identify stored
-    variables. Validation compares parameter counts and hour sets, without
-    guessing a CDS-name-to-parameter association. The caller verifies the source
-    checksum and owns publication, coverage recording, and GRIB cleanup.
+    Descriptive ecCodes names identify arrays; parameter IDs remain in metadata.
+    Validation checks distinct parameter counts and complete requested hours,
+    trusting CDS to select the requested variables. Previous coverage records
+    preserve existing fields, including all-NaN fields. The caller verifies the
+    source checksum and owns publication, coverage recording, and GRIB cleanup.
 
     Args:
         grib: Completed staged GRIB file.
         metadata: Download metadata containing the exact single-month request.
         output: New directory for the unpublished Zarr store.
         spatial_chunks: Latitude and longitude cells per read chunk.
+        previous: Published monthly store to preserve, when extending a month.
+        previous_report: Its catalog report, including explicit field coverage.
 
     Returns:
         A JSON-compatible report with year, month, grid, variables, validated
@@ -187,9 +233,11 @@ def convert_batch(
     """
     if len(spatial_chunks) != 2 or any(size < 1 for size in spatial_chunks):
         raise ValueError("Spatial chunk dimensions must be positive.")
+    if (previous is None) != (previous_report is None):
+        raise ValueError("A previous store and its coverage report must be supplied together.")
     request = metadata["request"]
     year, month = int(request["year"][0]), int(request["month"][0])
-    times = np.array(
+    incoming_times = np.array(
         sorted(
             int(datetime.fromisoformat(
                 f"{year:04d}-{month:02d}-{int(day):02d}T{hour}:00+00:00"
@@ -207,17 +255,94 @@ def convert_batch(
     with TemporaryDirectory(prefix=".decoded-", dir=output.parent) as scratch:
         with ExitStack() as resources:
             arrays, variables, fields, grid = _decode_grib(
-                grib, times, request["variable"], Path(scratch), resources
+                grib, incoming_times, request["variable"], Path(scratch), resources
             )
+            prior = None
+            prior_times = np.array([], dtype=np.int64)
+            prior_fields: dict[tuple[str, int], dict[str, Any]] = {}
+            prior_arrays: dict[str, zarr.Array] = {}
+            source_provenance = []
+            if previous is not None and previous_report is not None:
+                prior = zarr.open_group(previous, mode="r")
+                if (
+                    (previous_report["year"], previous_report["month"]) != (year, month)
+                    or previous_report["grid"] != grid
+                    or previous_report["layout"]["spatial_chunks"] != list(spatial_chunks)
+                    or not np.array_equal(prior["latitude"][:], GLOBAL_LATITUDES)
+                    or not np.array_equal(prior["longitude"][:], GLOBAL_LONGITUDES)
+                ):
+                    raise ValueError("The previous month has different coordinates or layout.")
+                parameter_names = {
+                    attributes["paramId"]: variable for variable, attributes in variables.items()
+                }
+                renamed = {}
+                for original, attributes in previous_report["variables"].items():
+                    variable = re.sub(r"[^a-z0-9]+", "_", attributes["name"].lower()).strip("_")
+                    matching = parameter_names.get(attributes["paramId"])
+                    if matching is not None and variables[matching] != attributes:
+                        raise ValueError(f"{variable} has different metadata in the previous month.")
+                    if variable in variables and variables[variable]["paramId"] != attributes["paramId"]:
+                        raise ValueError(f"Different parameters share the array name {variable}.")
+                    variables[variable] = attributes
+                    parameter_names[attributes["paramId"]] = variable
+                    renamed[original] = variable
+                    prior_arrays[variable] = prior[original]
+                prior_times = prior["time"][:]
+                prior_fields = {
+                    (renamed[field["variable"]], field["valid_time"]): {
+                        **field, "variable": renamed[field["variable"]],
+                    }
+                    for field in previous_report["fields"]
+                }
+                source_provenance = list(prior.attrs.get(
+                    "source_provenance", [prior.attrs["provenance"]]
+                ))
+            incoming_fields = {
+                (field["variable"], field["valid_time"]): field for field in fields
+            }
+            added_fields = incoming_fields.keys() - prior_fields.keys()
+            if added_fields:
+                source_provenance.append(metadata)
+            fields = sorted(
+                {**incoming_fields, **prior_fields}.values(),
+                key=lambda field: (field["variable"], field["valid_time"]),
+            )
+            times = np.union1d(prior_times, incoming_times)
+            time_indices = {int(value): index for index, value in enumerate(times)}
+            shape = (len(times), len(GLOBAL_LATITUDES), len(GLOBAL_LONGITUDES))
+            sources: dict[str, list[
+                tuple[NDArray[np.float64] | zarr.Array, NDArray[np.intp], NDArray[np.intp]]
+            ]] = {variable: [] for variable in variables}
+            for variable in variables:
+                if variable in prior_arrays:
+                    prior_rows = np.array([
+                        index for index, value in enumerate(prior_times)
+                        if (variable, int(value)) in prior_fields
+                    ], dtype=np.intp)
+                    destinations = np.array([
+                        time_indices[int(prior_times[index])] for index in prior_rows
+                    ], dtype=np.intp)
+                    sources[variable].append((prior_arrays[variable], prior_rows, destinations))
+                if variable in arrays:
+                    incoming_rows = np.array([
+                        index for index, value in enumerate(incoming_times)
+                        if (variable, int(value)) in added_fields
+                    ], dtype=np.intp)
+                    if len(incoming_rows):
+                        destinations = np.array([
+                            time_indices[int(incoming_times[index])] for index in incoming_rows
+                        ], dtype=np.intp)
+                        sources[variable].append((arrays[variable], incoming_rows, destinations))
             group_attributes = {
                 "Conventions": "CF-1.12",
                 "source": metadata["dataset"],
                 "provenance": metadata,
+                "source_provenance": source_provenance,
                 "grid": grid,
                 "year": year,
                 "month": month,
                 "spatial_chunks": list(spatial_chunks),
-                "variable_identity": "ECMWF GRIB paramId; CDS names retained in provenance",
+                "variable_identity": "Descriptive ecCodes names; paramId attributes retain parameter identity",
             }
             root = zarr.open_group(output, mode="w-", zarr_format=3)
             root.attrs.update(group_attributes)
@@ -238,14 +363,35 @@ def convert_batch(
                     compressors=[compressor], dimension_names=(name,),
                     attributes=coordinate_attributes[name],
                 )
-            for variable, data in arrays.items():
+            for variable in variables:
                 records = [field for field in fields if field["variable"] == variable]
-                auxiliary_names = []
+                rows = np.array([
+                    time_indices[field["valid_time"]] for field in records
+                ], dtype=np.intp)
+                coverage_name = f"{variable}_coverage"
+                coverage = np.zeros(len(times), dtype=np.bool_)
+                coverage[rows] = True
+                coverage_attributes = {
+                    "long_name": f"{variables[variable]['name']}: field coverage",
+                    "description": "True when this variable and UTC hour have a source field.",
+                }
+                coordinate_values[coverage_name] = coverage
+                expected_attributes[coverage_name] = coverage_attributes
+                root.create_array(
+                    coverage_name, data=coverage, chunks=(month_hours,),
+                    compressors=[compressor], dimension_names=("time",),
+                    attributes=coverage_attributes,
+                )
+                auxiliary_names = [coverage_name]
                 for key in ("reference_time", "interval_start", "interval_end", "start_step", "end_step"):
                     name = f"{variable}_{key}"
                     auxiliary_names.append(name)
-                    auxiliary = np.array([field[key] for field in records], dtype=np.int64)
-                    attributes = {"long_name": f"{variables[variable]['name']}: {key}"}
+                    auxiliary = np.full(len(times), MISSING_INTEGER, dtype=np.int64)
+                    auxiliary[rows] = [field[key] for field in records]
+                    attributes = {
+                        "long_name": f"{variables[variable]['name']}: {key}",
+                        "_FillValue": int(MISSING_INTEGER),
+                    }
                     if key in ("reference_time", "interval_start", "interval_end"):
                         attributes.update(TIME_ATTRIBUTES)
                     else:
@@ -264,19 +410,19 @@ def convert_batch(
                 }
                 expected_attributes[variable] = attributes
                 target = root.create_array(
-                    variable, shape=data.shape, dtype=np.float64, fill_value=np.nan,
+                    variable, shape=shape, dtype=np.float64, fill_value=np.nan,
                     chunks=chunks, shards=shards, compressors=[compressor],
                     dimension_names=("time", "latitude", "longitude"),
                     attributes=attributes,
                 )
-                for latitude in range(0, data.shape[1], shards[1]):
-                    for longitude in range(0, data.shape[2], shards[2]):
+                for latitude in range(0, shape[1], shards[1]):
+                    for longitude in range(0, shape[2], shards[2]):
                         selection = (
                             slice(None),
-                            slice(latitude, latitude + shards[1]),
-                            slice(longitude, longitude + shards[2]),
+                            slice(latitude, min(latitude + shards[1], shape[1])),
+                            slice(longitude, min(longitude + shards[2], shape[2])),
                         )
-                        target[selection] = data[selection]
+                        target[selection] = _merged_shard(sources[variable], selection, len(times))
 
             reopened = zarr.open_group(output, mode="r")
             if dict(reopened.attrs) != group_attributes:
@@ -296,26 +442,28 @@ def convert_batch(
                 ):
                     raise ValueError(f"{name}: coordinate or interval metadata round trip failed.")
             compared_shards = 0
-            for variable, expected in arrays.items():
+            for variable in variables:
                 actual = reopened[variable]
                 if (
                     actual.dtype != np.dtype(np.float64)
-                    or actual.shape != expected.shape
+                    or actual.shape != shape
                     or actual.chunks != chunks
                     or actual.shards != shards
                     or actual.compressors != (compressor,)
                     or actual.metadata.dimension_names != ("time", "latitude", "longitude")
                 ):
                     raise ValueError(f"{variable}: Zarr storage metadata round trip failed.")
-                for latitude in range(0, expected.shape[1], shards[1]):
-                    for longitude in range(0, expected.shape[2], shards[2]):
+                for latitude in range(0, shape[1], shards[1]):
+                    for longitude in range(0, shape[2], shards[2]):
                         selection = (
                             slice(None),
-                            slice(latitude, latitude + shards[1]),
-                            slice(longitude, longitude + shards[2]),
+                            slice(latitude, min(latitude + shards[1], shape[1])),
+                            slice(longitude, min(longitude + shards[2], shape[2])),
                         )
                         if not np.array_equal(
-                            actual[selection], expected[selection], equal_nan=True
+                            actual[selection],
+                            _merged_shard(sources[variable], selection, len(times)),
+                            equal_nan=True,
                         ):
                             raise ValueError(f"{variable}: numerical Zarr round trip failed.")
                         compared_shards += 1
@@ -336,6 +484,6 @@ def convert_batch(
                     "compared_shards": compared_shards,
                     "numerical_roundtrip": "exact_float64_equal_nan",
                     "metadata_roundtrip": True,
-                    "request_variable_mapping": "distinct_parameter_count_only",
+                    "request_variable_validation": "distinct_parameter_count_and_complete_hours",
                 },
             }

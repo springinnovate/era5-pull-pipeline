@@ -6,7 +6,7 @@ from datetime import date
 from pathlib import Path
 import sys
 
-from era5_pull_pipeline.cds import DEFAULT_MAX_DAYS, check_access, download_batch
+from era5_pull_pipeline.cds import DEFAULT_MAX_DAYS, build_batch_request, check_access, download_batch
 from era5_pull_pipeline.credentials import load_credentials
 from era5_pull_pipeline.pipeline import ingest_batch, pull_batch
 
@@ -52,9 +52,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "pull-batch",
         help="Download, validate, and publish one batch to a monthly Zarr archive.",
         description=(
-            "Publish one batch of complete UTC days within one month. An "
-            "identical published request is skipped. A different selection for "
-            "an already published month is rejected."
+            "Fill missing variables and hourly fields within one bounded "
+            "calendar-month interval. Stored fields are preserved and skipped."
         ),
     )
     for selection in (batch, pull):
@@ -103,8 +102,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
             completed = download_batch(
-                credentials, args.start_date, args.end_date, args.variables,
-                args.staging, args.max_days,
+                credentials,
+                build_batch_request(args.start_date, args.end_date, args.variables, args.max_days),
+                args.staging,
             )
             print(f"Saved completed batch to {completed}.")
         elif args.command == "pull-batch":
