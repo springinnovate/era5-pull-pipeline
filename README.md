@@ -104,6 +104,8 @@ Each `YYYY/MM/era5.zarr/` is a [Zarr 3 directory](https://zarr.readthedocs.io/en
 
 Arrays use their GRIB parameter IDs as stable names, such as `param_167` for 2 m temperature and `param_228` for total precipitation. Their attributes retain the descriptive name, short name, and units; the source request retains the original CDS variable names. Time coordinates identify when fields are valid. Per-variable metadata arrays retain forecast reference times and interval boundaries, including precipitation intervals that begin on the preceding day.
 
+Variables can cover different hours within the shared monthly time coordinate. Each variable's matching `param_<id>_coverage` array identifies which hours contain retrieved fields. A false entry means the field is absent; a true entry can still contain spatial missing values. Missing fields have NaN weather values and missing interval metadata. Coverage comes from validated source fields, independently of their numeric values.
+
 Within each monthly dataset, read chunks span the calendar month along time and a tile of grid cells in space. These chunks partition the stored global arrays. The spatial chunk shape is configured when creating the archive; Zarr does not require a particular tile size. Zarr sharding packs multiple independently readable chunks into larger files to control file counts.
 
 Chunks use **lossless Zstandard compression**. Storage does not introduce numerical rounding, quantization, or a reduction in decoded precision. Compression reduces storage and transfer volume, while chunks allow portions of an array to be read independently. See [Zarr's chunking and sharding guidance](https://zarr.readthedocs.io/en/stable/user-guide/performance/).
@@ -113,6 +115,8 @@ The monthly directories form one continuous archive. A reader selects the releva
 ## Repeat runs and source updates
 
 SQLite records coverage by variable and hour on the fixed global grid, together with source dataset and grid metadata. The catalog also retains source request details, retrieval times, GRIB checksums, validation results, and published revisions after temporary downloads are removed.
+
+Requesting an additional variable, a longer interval, or an interior gap downloads only missing variable/hour combinations. Ordinary requests preserve already stored values, including fields whose grid cells are all missing. Completed selections are skipped even when requested in a different combination of variables or dates. Published field provenance continues to identify the retrieval that supplied each field through subsequent monthly replacements.
 
 A single writer updates an archive. It prepares a replacement month in staging and retains the previous version until publication and catalog recording succeed. Readers coordinate with publication so they do not read a mixture of old and new arrays. SQLite transactions record state; they do not make filesystem changes atomic. Interrupted publication is reconciled before the affected month becomes readable again.
 

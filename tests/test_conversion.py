@@ -1,6 +1,7 @@
 """Exercise real ecCodes decoding and Zarr storage on small fixture grids."""
 
 from datetime import UTC, datetime
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -182,6 +183,7 @@ def test_bitmap_missing_values_do_not_remove_field_coverage(
     assert np.array_equal(stored["param_167"][0], expected[0], equal_nan=True)
     assert stored["param_167"][0, 0, 1] == 9999.0
     assert np.isnan(stored["param_228"][0]).all()
+    assert stored["param_228_coverage"][:].tolist() == [True, True]
 
 
 @pytest.mark.parametrize("mutation", ["grid", "time", "duplicate", "missing", "parameter"])
@@ -202,6 +204,7 @@ def test_inconsistent_input_never_produces_validated_output(
         messages.pop()
     else:
         messages[0]["paramId"] = 168
+        messages[2]["paramId"] = 168
     write_grib(grib, messages)
     output = tmp_path / "month.zarr"
     with pytest.raises(ValueError):
@@ -209,6 +212,151 @@ def test_inconsistent_input_never_produces_validated_output(
     assert grib.exists()
     assert not output.exists()
     assert not list(tmp_path.glob(".decoded-*"))
+
+
+def test_add_variable_with_independent_coverage_then_fill_its_gaps(
+    tmp_path: Path,
+    batch: tuple[Path, dict[str, Any], list[dict[str, Any]]],
+) -> None:
+    """Preserve a full temperature month while extending sparse wind coverage."""
+    grib, metadata, _ = batch
+    metadata["request"].update({
+        "month": ["02"],
+        "day": [f"{day:02d}" for day in range(1, 30)],
+        "time": [f"{hour:02d}:00" for hour in range(24)],
+        "variable": ["2m_temperature"],
+    })
+    messages = [
+        {"dataDate": 20000200 + day, "dataTime": hour * 100,
+         "values": np.full(12, 270 + day + hour / 24)}
+        for day in range(1, 30) for hour in range(24)
+    ]
+    expected_temperature = np.stack(write_grib(grib, messages))
+    first = tmp_path / "temperature.zarr"
+    first_report = conversion.convert_batch(grib, metadata, first, (2, 2))
+    for field in first_report["fields"]:
+        field["source_revision_id"] = "temperature-source"
+
+    wind_metadata = deepcopy(metadata)
+    wind_metadata["request"].update({
+        "variable": ["10m_u_component_of_wind"], "day": ["01", "03"],
+    })
+    wind_grib = tmp_path / "wind.grib"
+    wind_values = np.stack(write_grib(wind_grib, [
+        {"paramId": 165, "dataDate": 20000200 + day, "dataTime": hour * 100,
+         "values": np.full(12, day + hour / 24)}
+        for day in (1, 3) for hour in range(24)
+    ]))
+    second = tmp_path / "sparse-wind.zarr"
+    second_report = conversion.convert_batch(
+        wind_grib, wind_metadata, second, (2, 2),
+        previous=first, previous_report=first_report,
+    )
+    stored = zarr.open_group(second, mode="r")
+    assert np.array_equal(stored["param_167"][:], expected_temperature)
+    assert stored["param_167_coverage"][:].all()
+    wind_rows = np.r_[0:24, 48:72]
+    assert np.array_equal(stored["param_165"].oindex[wind_rows, :, :], wind_values)
+    assert np.flatnonzero(stored["param_165_coverage"][:]).tolist() == wind_rows.tolist()
+    assert np.isnan(stored["param_165"][24:48]).all()
+    assert (stored["param_165_reference_time"][24:48] == conversion.MISSING_INTEGER).all()
+    assert [field for field in second_report["fields"] if field["variable"] == "param_167"] == first_report["fields"]
+    with xr.open_zarr(second, consolidated=False, chunks=None) as dataset:
+        assert dataset["param_165_coverage"].dtype == np.dtype(np.bool_)
+        assert not dataset["param_165_coverage"].values[24]
+        assert np.isnat(dataset["param_165_reference_time"].values[24])
+        assert np.isnan(dataset["param_165_start_step"].values[24])
+
+    fill_metadata = deepcopy(wind_metadata)
+    fill_metadata["request"]["day"] = ["02", "04"]
+    fill_grib = tmp_path / "fill.grib"
+    filled_values = np.stack(write_grib(fill_grib, [
+        {"paramId": 165, "dataDate": 20000200 + day, "dataTime": hour * 100,
+         "values": np.full(12, day + hour / 24)}
+        for day in (2, 4) for hour in range(24)
+    ]))
+    third = tmp_path / "filled-wind.zarr"
+    report = conversion.convert_batch(
+        fill_grib, fill_metadata, third, (2, 2),
+        previous=second, previous_report=second_report,
+    )
+    merged = zarr.open_group(third, mode="r")
+    assert np.array_equal(merged["param_167"][:], expected_temperature)
+    assert np.array_equal(merged["param_165"].oindex[wind_rows, :, :], wind_values)
+    assert np.array_equal(merged["param_165"].oindex[np.r_[24:48, 72:96], :, :], filled_values)
+    assert merged["param_165_coverage"][:96].all()
+    assert not merged["param_165_coverage"][96:].any()
+    assert report["validation"]["field_count"] == 29 * 24 + 4 * 24
+    assert merged.attrs["source_provenance"] == [metadata, wind_metadata, fill_metadata]
+    assert np.array_equal(zarr.open_group(first, mode="r")["param_167"][:], expected_temperature)
+
+
+def test_union_times_preserves_overlaps_and_all_nan_source_fields(
+    tmp_path: Path,
+    batch: tuple[Path, dict[str, Any], list[dict[str, Any]]],
+) -> None:
+    """Fill an interior gap and extend the end without refreshing stored fields."""
+    grib, metadata, _ = batch
+    metadata["request"].update({
+        "variable": ["2m_temperature"], "time": ["00:00", "02:00"],
+    })
+    original = write_grib(grib, [
+        {"dataTime": 0, "values": np.full(12, np.nan)},
+        {"dataTime": 200, "values": np.full(12, 282.0)},
+    ])
+    previous = tmp_path / "previous.zarr"
+    previous_report = conversion.convert_batch(grib, metadata, previous, (1, 1))
+    for field in previous_report["fields"]:
+        field["source_revision_id"] = "original-source"
+    incoming_metadata = deepcopy(metadata)
+    incoming_metadata["request"]["time"] = [f"{hour:02d}:00" for hour in range(4)]
+    incoming = tmp_path / "incoming.grib"
+    expected = write_grib(incoming, [
+        {"dataTime": 0, "values": np.full(12, 999.0)},
+        {"dataTime": 100, "values": np.full(12, 281.0)},
+        {"dataTime": 100, "startStep": 1, "endStep": 1, "values": np.full(12, 999.0)},
+        {"dataTime": 300, "values": np.full(12, 283.0)},
+    ])
+    output = tmp_path / "merged.zarr"
+    report = conversion.convert_batch(
+        incoming, incoming_metadata, output, (1, 1),
+        previous=previous, previous_report=previous_report,
+    )
+    stored = zarr.open_group(output, mode="r")
+    assert np.array_equal(
+        stored["param_167"][:], np.stack([original[0], expected[1], original[1], expected[3]]),
+        equal_nan=True,
+    )
+    assert stored["param_167_coverage"][:].tolist() == [True] * 4
+    assert report["fields"][0] == previous_report["fields"][0]
+    assert report["fields"][2] == previous_report["fields"][1]
+    assert "source_revision_id" not in report["fields"][1]
+    assert stored["param_167_start_step"][:].tolist() == [0] * 4
+    assert stored.attrs["provenance"] == incoming_metadata
+    assert grib.exists() and incoming.exists()
+    assert not list(tmp_path.glob(".decoded-*"))
+
+
+def test_incompatible_previous_metadata_keeps_published_store(
+    tmp_path: Path,
+    batch: tuple[Path, dict[str, Any], list[dict[str, Any]]],
+) -> None:
+    """Reject a unit conflict before creating the replacement store."""
+    grib, metadata, messages = batch
+    write_grib(grib, messages)
+    previous = tmp_path / "previous.zarr"
+    previous_report = conversion.convert_batch(grib, metadata, previous, (2, 2))
+    original = zarr.open_group(previous, mode="r")["param_167"][:]
+    previous_report["variables"]["param_167"]["units"] = "degC"
+    output = tmp_path / "merged.zarr"
+    with pytest.raises(ValueError, match="different metadata"):
+        conversion.convert_batch(
+            grib, metadata, output, (2, 2),
+            previous=previous, previous_report=previous_report,
+        )
+    assert not output.exists()
+    assert np.array_equal(zarr.open_group(previous, mode="r")["param_167"][:], original)
+    assert grib.exists()
 
 
 def test_truncated_grib_is_not_published(

@@ -122,9 +122,9 @@ def test_completed_download_has_request_and_integrity_metadata(
     staging = tmp_path / "staging"
     completed = cds.download_batch(
         CREDENTIALS,
-        date(2000, 1, 1),
-        date(2000, 1, 2),
-        ["total_precipitation", "2m_temperature"],
+        cds.build_batch_request(
+            date(2000, 1, 1), date(2000, 1, 2), ["total_precipitation", "2m_temperature"]
+        ),
         staging,
     )
 
@@ -168,16 +168,17 @@ def test_repeat_selection_has_new_directory_and_same_request_identity(
     """Keep separate retrievals while identifying equivalent variable selections."""
     first = cds.download_batch(
         CREDENTIALS,
-        date(2000, 1, 1),
-        date(2000, 1, 1),
-        ["total_precipitation", "2m_temperature"],
+        cds.build_batch_request(
+            date(2000, 1, 1), date(2000, 1, 1), ["total_precipitation", "2m_temperature"]
+        ),
         tmp_path,
     )
     second = cds.download_batch(
         CREDENTIALS,
-        date(2000, 1, 1),
-        date(2000, 1, 1),
-        ["2m_temperature", "total_precipitation", "2m_temperature"],
+        cds.build_batch_request(
+            date(2000, 1, 1), date(2000, 1, 1),
+            ["2m_temperature", "total_precipitation", "2m_temperature"],
+        ),
         tmp_path,
     )
 
@@ -207,7 +208,9 @@ def test_interrupted_transfer_remains_partial(
 
     with pytest.raises(type(error)) as caught:
         cds.download_batch(
-            CREDENTIALS, date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"], tmp_path
+            CREDENTIALS,
+            cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
+            tmp_path,
         )
 
     assert caught.value is error
@@ -218,23 +221,17 @@ def test_interrupted_transfer_remains_partial(
     assert not (partials[0] / "metadata.json").exists()
 
 
-def test_invalid_selection_stops_before_download(
+def test_download_preserves_selected_days_and_hours(
     tmp_path: Path, client_factory: Mock
 ) -> None:
-    """Reject invalid requests before creating staging or constructing a client."""
-    staging = tmp_path / "staging"
-
-    with pytest.raises(ValueError):
-        cds.download_batch(
-            CREDENTIALS,
-            date(2000, 1, 2),
-            date(2000, 1, 1),
-            ["2m_temperature"],
-            staging,
-        )
-
-    client_factory.assert_not_called()
-    assert not staging.exists()
+    """Do not expand a planner selection back to complete days or intervals."""
+    request = cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 3), ["2m_temperature"])
+    request["day"] = ["01", "03"]
+    request["time"] = ["02:00", "16:00"]
+    completed = cds.download_batch(CREDENTIALS, request, tmp_path / "staging")
+    client_factory.return_value.retrieve.assert_called_once_with(cds.DATASET, request)
+    metadata = json.loads((completed / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["request"] == request
 
 
 def test_failed_metadata_write_keeps_directory_partial(
@@ -253,7 +250,9 @@ def test_failed_metadata_write_keeps_directory_partial(
 
     with pytest.raises(OSError) as caught:
         cds.download_batch(
-            CREDENTIALS, date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"], tmp_path
+            CREDENTIALS,
+            cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"]),
+            tmp_path,
         )
 
     assert caught.value is failure

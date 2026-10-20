@@ -10,13 +10,14 @@ from typing import Any
 
 from era5_pull_pipeline.catalog import (
     archive_session,
-    existing_month,
+    current_month,
     prepare_revision,
     publish_revision,
 )
 from era5_pull_pipeline.cds import DATASET, DEFAULT_MAX_DAYS, build_batch_request, download_batch
 from era5_pull_pipeline.conversion import convert_batch
 from era5_pull_pipeline.credentials import load_credentials
+from era5_pull_pipeline.planning import missing_requests
 
 
 def pull_batch(
@@ -27,7 +28,7 @@ def pull_batch(
     spatial_chunks: tuple[int, int] = (32, 32),
     max_days: int = DEFAULT_MAX_DAYS,
 ) -> Path:
-    """Download and publish one batch, skipping an identical published request.
+    """Fill missing variables and hours within one bounded monthly interval.
 
     Args:
         start: First UTC date, inclusive.
@@ -41,25 +42,21 @@ def pull_batch(
         The published YYYY/MM/era5.zarr directory.
 
     Raises:
-        ValueError: The selection is invalid or the month contains a different
-            selection. Adding to an existing month is a separate operation.
+        ValueError: The selection or its archive metadata is inconsistent.
         Exception: Credential, service, conversion, and publication errors
             propagate. Unpublished GRIB files remain available for ingestion.
     """
     request = build_batch_request(start, end, variables, max_days)
-    identity = json.dumps(
-        {"dataset": DATASET, "request": request}, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    request_sha256 = hashlib.sha256(identity).hexdigest()
     with archive_session(archive) as db:
-        existing = existing_month(db, archive, start.year, start.month, request_sha256)
-        if existing is not None:
-            return existing
-        batch = download_batch(
-            load_credentials(), start, end, variables, archive / "staging", max_days
-        )
-        metadata = json.loads((batch / "metadata.json").read_text(encoding="utf-8"))
-        return _publish_batch(db, archive, batch, metadata, spatial_chunks)
+        selections = missing_requests(db, request)
+        if not selections:
+            return current_month(db, archive, start.year, start.month)[0]
+        credentials = load_credentials()
+        for selection in selections:
+            batch = download_batch(credentials, selection, archive / "staging")
+            metadata = json.loads((batch / "metadata.json").read_text(encoding="utf-8"))
+            published = _publish_batch(db, archive, batch, metadata, spatial_chunks)
+        return published
 
 
 def ingest_batch(
@@ -79,8 +76,8 @@ def ingest_batch(
         batch also succeeds after its GRIB has been removed.
 
     Raises:
-        ValueError: The download is incomplete, its checksum or selection is
-            inconsistent, or the month already contains a different selection.
+        ValueError: The download is incomplete, its checksum is inconsistent,
+            or its grid, layout, or variable metadata conflicts with the archive.
         Exception: File, conversion, and publication errors propagate.
     """
     if batch.suffix == ".partial":
@@ -122,14 +119,18 @@ def _publish_batch(
     if metadata["dataset"] != DATASET or hashlib.sha256(identity).hexdigest() != metadata["request_sha256"]:
         raise ValueError("The staged source request does not match its recorded identity.")
     year, month = int(request["year"][0]), int(request["month"][0])
-    existing = existing_month(db, archive, year, month, metadata["request_sha256"])
-    if existing is not None:
-        return existing
+    previous = current_month(db, archive, year, month)
+    if not missing_requests(db, request):
+        return previous[0]
     grib = batch / "data.grib"
     with grib.open("rb") as stream:
         checksum = hashlib.file_digest(stream, "sha256").hexdigest()
     if grib.stat().st_size != metadata["size_bytes"] or checksum != metadata["sha256"]:
         raise ValueError("The staged GRIB does not match its recorded size and SHA-256 checksum.")
     revision, staged = prepare_revision(db, archive, batch, metadata)
-    report = convert_batch(grib, metadata, staged, spatial_chunks)
+    report = convert_batch(
+        grib, metadata, staged, spatial_chunks,
+        previous=previous[0] if previous else None,
+        previous_report=previous[1] if previous else None,
+    )
     return publish_revision(db, archive, revision, report)

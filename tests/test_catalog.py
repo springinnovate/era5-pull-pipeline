@@ -1,12 +1,13 @@
 """Exercise publication recovery and locking with real SQLite and Zarr stores."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 from typing import Any
+from uuid import uuid4
 from unittest.mock import Mock
 
 import numpy as np
@@ -19,31 +20,43 @@ from era5_pull_pipeline import catalog
 
 
 def _stage(
-    db: sqlite3.Connection, archive: Path, month: int = 1
+    db: sqlite3.Connection,
+    archive: Path,
+    month: int = 1,
+    variable: str = "param_167",
+    hours: tuple[int, ...] = (0,),
+    year: int = 2000,
 ) -> tuple[str, Path, Path, dict[str, Any]]:
-    """Build a small validated-store stand-in for catalog boundary tests.
+    """Build a small merged-store stand-in for catalog boundary tests.
 
     Args:
         db: Open writer catalog.
         archive: Archive receiving the store.
         month: Calendar month for the fixture.
+        variable: Variable to add.
+        hours: Hours since the beginning of the month.
+        year: Calendar year for the fixture.
 
     Returns:
         Revision identifier, staged store, source batch, and converter report.
     """
-    batch = archive.parent / f"batch-{month}"
-    batch.mkdir(exist_ok=True)
+    previous = catalog.current_month(db, archive, year, month)
+    batch = archive.parent / f"batch-{uuid4().hex}"
+    batch.mkdir()
     (batch / "data.grib").write_bytes(b"source kept until publication")
     metadata = {
         "dataset": "reanalysis-era5-single-levels",
-        "request": {"year": ["2000"], "month": [f"{month:02d}"]},
-        "request_sha256": f"request-{month}",
+        "request": {"year": [str(year)], "month": [f"{month:02d}"]},
+        "request_sha256": f"request-{year}-{month}-{variable}-{hours}",
         "sha256": "source-checksum",
     }
     revision, stage = catalog.prepare_revision(db, archive, batch, metadata)
-    timestamp = int(datetime(2000, month, 1, tzinfo=UTC).timestamp())
+    timestamps = [
+        int((datetime(year, month, 1, tzinfo=UTC) + timedelta(hours=hour)).timestamp())
+        for hour in hours
+    ]
     report = {
-        "year": 2000,
+        "year": year,
         "month": month,
         "grid": {"latitude_size": 2, "longitude_size": 2},
         "layout": {
@@ -52,25 +65,38 @@ def _stage(
             "shard_spatial_multiple": 2,
         },
         "variables": {
-            "param_167": {"paramId": 167, "units": "K", "step_type": "instant"}
+            variable: {
+                "paramId": int(variable.removeprefix("param_")),
+                "units": "K" if variable == "param_167" else "m s**-1",
+                "step_type": "instant",
+            }
         },
         "fields": [{
-            "variable": "param_167", "valid_time": timestamp,
+            "variable": variable, "valid_time": timestamp,
             "reference_time": timestamp, "interval_start": timestamp,
             "interval_end": timestamp, "start_step": 0, "end_step": 0,
             "step_units": "s", "step_type": "instant",
-        }],
-        "validation": {"fields": 1, "roundtrip": True},
+        } for timestamp in timestamps],
+        "validation": {"fields": len(hours), "roundtrip": True},
     }
     dataset = xr.Dataset(
-        {"param_167": (("time", "latitude", "longitude"), np.full((1, 2, 2), 280.0))},
+        {variable: (
+            ("time", "latitude", "longitude"),
+            np.full((len(hours), 2, 2), 280.0 if variable == "param_167" else 3.0),
+        )},
         coords={
-            "time": np.array([f"2000-{month:02d}-01"], dtype="datetime64[ns]"),
+            "time": np.array(timestamps, dtype="datetime64[s]"),
             "latitude": [90.0, 89.75],
             "longitude": [0.0, 0.25],
         },
-        attrs={"provenance": metadata},
     )
+    if previous is not None:
+        with xr.open_zarr(previous[0], consolidated=False, chunks=None) as old:
+            dataset = dataset.combine_first(old.load())
+        report["variables"] = {**previous[1]["variables"], **report["variables"]}
+        report["fields"] = previous[1]["fields"] + report["fields"]
+        report["validation"]["fields"] = len(report["fields"])
+    dataset.attrs = {"provenance": metadata}
     dataset.to_zarr(stage, zarr_format=3, consolidated=False)
     return revision, stage, batch, report
 
@@ -92,13 +118,70 @@ def test_publication_records_coverage_then_removes_source(tmp_path: Path) -> Non
         assert json.loads(row["provenance_json"])["sha256"] == "source-checksum"
         assert json.loads(row["report_json"]) == report
         field = dict(db.execute("SELECT * FROM coverage").fetchone())
-        assert field == {"revision_id": revision, **report["fields"][0]}
+        assert field == {
+            "revision_id": revision, "source_revision_id": revision, **report["fields"][0]
+        }
         assert db.execute("PRAGMA synchronous").fetchone()[0] == 2
-        assert catalog.existing_month(db, archive, 2000, 1, "request-1") == final
-        with pytest.raises(ValueError, match="different request"):
-            catalog.existing_month(db, archive, 2000, 1, "another-request")
+        current = catalog.current_month(db, archive, 2000, 1)
+        assert current[0] == final
+        assert current[1]["revision_id"] == revision
+        assert current[1]["fields"][0]["source_revision_id"] == revision
+        assert catalog.missing_fields(
+            db, 2000, 1, ["param_167"], [report["fields"][0]["valid_time"]]
+        ) == {}
         with catalog.open_month(archive, 2000, 1) as dataset:
             np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+
+
+def test_replacement_keeps_history_and_field_origins(tmp_path: Path) -> None:
+    """Move the current pointer while preserving old provenance and values."""
+    archive = tmp_path / "archive"
+    with catalog.archive_session(archive) as db:
+        first, _, _, report = _stage(db, archive)
+        final = catalog.publish_revision(db, archive, first, report)
+        other, _, _, other_report = _stage(db, archive, month=2)
+        catalog.publish_revision(db, archive, other, other_report)
+        second, stage, batch, report = _stage(db, archive, variable="param_165")
+        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == first
+        catalog.publish_revision(db, archive, second, report)
+        assert not stage.exists()
+        assert not (batch / "data.grib").exists()
+        assert db.execute("SELECT COUNT(*) FROM revisions WHERE status = 'published'").fetchone()[0] == 3
+        assert db.execute("SELECT parent_revision_id FROM revisions WHERE id = ?", (second,)).fetchone()[0] == first
+        assert db.execute("SELECT backup_path FROM revisions WHERE id = ?", (second,)).fetchone()[0] is None
+        assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (first,)).fetchone()[0] == 1
+        current = catalog.current_month(db, archive, 2000, 1)
+        assert current[0] == final
+        assert current[1]["revision_id"] == second
+        assert {field["variable"]: field["source_revision_id"] for field in current[1]["fields"]} == {
+            "param_167": first, "param_165": second
+        }
+        assert catalog.current_month(db, archive, 2000, 2)[1]["revision_id"] == other
+    with catalog.open_month(archive, 2000, 1) as dataset:
+        np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+        np.testing.assert_array_equal(dataset["param_165"].values, 3.0)
+
+
+def test_missing_fields_uses_independent_coverage_and_negative_timestamps(tmp_path: Path) -> None:
+    """Find interior gaps and extensions independently for each variable."""
+    archive = tmp_path / "archive"
+    with catalog.archive_session(archive) as db:
+        revision, _, _, report = _stage(db, archive, hours=(0, 2), year=1950)
+        catalog.publish_revision(db, archive, revision, report)
+        revision, _, _, report = _stage(
+            db, archive, variable="param_165", hours=(0,), year=1950
+        )
+        catalog.publish_revision(db, archive, revision, report)
+        start = int(datetime(1950, 1, 1, tzinfo=UTC).timestamp())
+        hours = [start + 3600 * hour for hour in range(4)]
+        assert catalog.missing_fields(db, 1950, 1, ["param_167", "param_165"], hours) == {
+            "param_167": [hours[1], hours[3]],
+            "param_165": hours[1:],
+        }
+        assert catalog.missing_fields(db, 1950, 2, ["param_167"], hours) == {
+            "param_167": hours
+        }
+        assert catalog.missing_fields(db, 1950, 1, ["param_167", "param_165"], hours[:1]) == {}
 
 
 def test_preparing_revision_is_never_readable(tmp_path: Path) -> None:
@@ -109,7 +192,7 @@ def test_preparing_revision_is_never_readable(tmp_path: Path) -> None:
     with catalog.archive_session(archive) as db:
         assert db.execute("SELECT status FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == "preparing"
         assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
-        assert catalog.existing_month(db, archive, 2000, 1, "request-1") is None
+        assert catalog.current_month(db, archive, 2000, 1) is None
     with pytest.raises(FileNotFoundError, match="No published"):
         with catalog.open_month(archive, 2000, 1):
             pytest.fail("Preparing data must not be exposed.")
@@ -117,104 +200,238 @@ def test_preparing_revision_is_never_readable(tmp_path: Path) -> None:
     assert (batch / "data.grib").exists()
 
 
-def test_ready_revision_recovers_after_rename_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failure_at", [1, 2])
+def test_rename_failure_restores_old_month(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_at: int
 ) -> None:
-    """Retry a ready publication whose filesystem rename did not complete."""
+    """Keep the previous month readable after either publication rename fails."""
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
-        revision, stage, batch, report = _stage(db, archive)
+        first, _, _, report = _stage(db, archive)
+        catalog.publish_revision(db, archive, first, report)
+        second, stage, batch, report = _stage(db, archive, variable="param_165")
+        rename = Path.rename
+        calls = 0
+
+        def fail_once(source: Path, destination: Path) -> Path:
+            """Fail one rename while allowing the recovery moves."""
+            nonlocal calls
+            calls += 1
+            if calls == failure_at:
+                raise OSError("rename failed")
+            return rename(source, destination)
+
         with monkeypatch.context() as patch:
-            patch.setattr(Path, "rename", Mock(side_effect=OSError("rename failed")))
+            patch.setattr(Path, "rename", fail_once)
             with pytest.raises(OSError, match="rename failed"):
-                catalog.publish_revision(db, archive, revision, report)
+                catalog.publish_revision(db, archive, second, report)
         assert stage.exists()
         assert (batch / "data.grib").exists()
-        assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == "ready"
-    with catalog.archive_session(archive) as db:
-        assert catalog.existing_month(db, archive, 2000, 1, "request-1").is_dir()
-        assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 1
+        assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "preparing"
+        assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 0
+        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == first
+        with catalog.open_month(archive, 2000, 1) as dataset:
+            assert set(dataset.data_vars) == {"param_167"}
+            np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+        catalog.publish_revision(db, archive, second, report)
+        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == second
     assert not (batch / "data.grib").exists()
 
 
-def test_ready_revision_recovers_after_catalog_failure(tmp_path: Path) -> None:
-    """Recover a renamed store when the coverage transaction was rolled back."""
+def test_catalog_failure_restores_old_month(tmp_path: Path) -> None:
+    """Roll back renamed stores when the catalog transaction cannot commit."""
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
-        revision, stage, batch, report = _stage(db, archive)
+        first, _, _, report = _stage(db, archive)
+        catalog.publish_revision(db, archive, first, report)
+        second, stage, batch, report = _stage(db, archive, variable="param_165")
         db.execute(
-            """CREATE TRIGGER fail_coverage BEFORE INSERT ON coverage
+            """CREATE TRIGGER fail_month BEFORE UPDATE ON months
                BEGIN SELECT RAISE(ABORT, 'catalog failure'); END"""
         )
         db.commit()
         with pytest.raises(sqlite3.IntegrityError, match="catalog failure"):
-            catalog.publish_revision(db, archive, revision, report)
-        assert not stage.exists()
-        assert (archive / "2000" / "01" / "era5.zarr").is_dir()
+            catalog.publish_revision(db, archive, second, report)
+        assert stage.exists()
         assert (batch / "data.grib").exists()
-        assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == "ready"
-        db.execute("DROP TRIGGER fail_coverage")
+        assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 0
+        assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "preparing"
+        with catalog.open_month(archive, 2000, 1) as dataset:
+            assert set(dataset.data_vars) == {"param_167"}
+        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == first
+        db.execute("DROP TRIGGER fail_month")
         db.commit()
-    # A reader also reconciles a ready store before exposing its arrays.
-    with catalog.open_month(archive, 2000, 1) as dataset:
-        np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
-    with catalog.archive_session(archive) as db:
-        assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 1
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == "published"
+        catalog.publish_revision(db, archive, second, report)
     assert not (batch / "data.grib").exists()
 
 
-def test_cleanup_failure_does_not_hide_published_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("completed_renames", [0, 1, 2])
+def test_interrupted_replacement_rolls_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completed_renames: int
 ) -> None:
-    """Warn about retained GRIBs and retry cleanup without blocking readers."""
+    """Recover before, between, and after the two filesystem rename boundaries."""
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
-        revision, _, batch, report = _stage(db, archive)
+        first, _, _, report = _stage(db, archive)
+        final = catalog.publish_revision(db, archive, first, report)
+        second, stage, batch, report = _stage(db, archive, variable="param_165")
+        rename = Path.rename
+        calls = 0
 
-        def deny_unlink(path: Path, missing_ok: bool = False) -> None:
-            """Simulate a source file temporarily held by another process."""
-            raise PermissionError("source is open")
+        def interrupt(source: Path, destination: Path) -> Path:
+            """Exit after the selected durable journal boundary."""
+            nonlocal calls
+            if completed_renames == 0:
+                raise SystemExit("interrupted")
+            result = rename(source, destination)
+            calls += 1
+            if calls == completed_renames:
+                raise SystemExit("interrupted")
+            return result
 
         with monkeypatch.context() as patch:
-            patch.setattr(Path, "unlink", deny_unlink)
-            with pytest.warns(RuntimeWarning, match="cleanup remains pending"):
-                catalog.publish_revision(db, archive, revision, report)
-            assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 1
-            assert db.execute("SELECT grib_removed FROM revisions").fetchone()[0] == 0
+            patch.setattr(Path, "rename", interrupt)
+            with pytest.raises(SystemExit, match="interrupted"):
+                catalog.publish_revision(db, archive, second, report)
+        assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "ready"
+        assert db.execute("SELECT current_revision_id FROM months").fetchone()[0] == first
+        assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 0
+        assert (batch / "data.grib").exists()
+        assert stage.exists() == (completed_renames < 2)
+        assert final.exists() == (completed_renames != 1)
+    with catalog.open_month(archive, 2000, 1) as dataset:
+        np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+        np.testing.assert_array_equal(dataset["param_165"].values, 3.0)
+    with catalog.archive_session(archive) as db:
+        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == second
+        assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 2
+        assert db.execute("SELECT backup_path FROM revisions WHERE id = ?", (second,)).fetchone()[0] is None
+    assert not (batch / "data.grib").exists()
+
+
+def test_failed_restoration_remains_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retain the ready journal if restoring the previous directory also fails."""
+    archive = tmp_path / "archive"
+    with catalog.archive_session(archive) as db:
+        first, _, _, report = _stage(db, archive)
+        catalog.publish_revision(db, archive, first, report)
+        second, stage, batch, report = _stage(db, archive, variable="param_165")
+        rename = Path.rename
+        calls = 0
+
+        def fail_moves(source: Path, destination: Path) -> Path:
+            """Fail the new-store move and the immediate old-store restoration."""
+            nonlocal calls
+            calls += 1
+            if calls in (2, 3):
+                raise OSError("filesystem unavailable")
+            return rename(source, destination)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "rename", fail_moves)
+            with pytest.raises(OSError, match="filesystem unavailable"):
+                catalog.publish_revision(db, archive, second, report)
+        assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "ready"
+        backup = archive / db.execute("SELECT backup_path FROM revisions WHERE id = ?", (second,)).fetchone()[0]
+        assert backup.is_dir()
+        assert stage.is_dir()
+        assert (batch / "data.grib").exists()
+    with catalog.open_month(archive, 2000, 1) as dataset:
+        assert set(dataset.data_vars) == {"param_167", "param_165"}
+    assert not (batch / "data.grib").exists()
+
+
+def test_cleanup_failures_do_not_hide_published_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retry retained backups and GRIBs without hiding a committed replacement."""
+    archive = tmp_path / "archive"
+    with catalog.archive_session(archive) as db:
+        first, _, _, report = _stage(db, archive)
+        catalog.publish_revision(db, archive, first, report)
+        second, _, batch, report = _stage(db, archive, variable="param_165")
+        with monkeypatch.context() as patch:
+            patch.setattr(catalog.shutil, "rmtree", Mock(side_effect=PermissionError("backup is open")))
+            patch.setattr(Path, "unlink", Mock(side_effect=PermissionError("source is open")))
+            with pytest.warns(RuntimeWarning, match="cleanup remains pending") as warnings:
+                catalog.publish_revision(db, archive, second, report)
+            assert len(warnings) == 2
+            row = db.execute("SELECT * FROM revisions WHERE id = ?", (second,)).fetchone()
+            backup = archive / row["backup_path"]
+            assert row["grib_removed"] == 0
+            assert backup.is_dir()
+            assert (batch / "data.grib").exists()
             with pytest.warns(RuntimeWarning, match="cleanup remains pending"):
                 with catalog.open_month(archive, 2000, 1) as dataset:
-                    np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
-        assert (batch / "data.grib").exists()
+                    np.testing.assert_array_equal(dataset["param_165"].values, 3.0)
     with catalog.archive_session(archive) as db:
-        assert db.execute("SELECT grib_removed FROM revisions").fetchone()[0] == 1
+        row = db.execute("SELECT * FROM revisions WHERE id = ?", (second,)).fetchone()
+        assert row["grib_removed"] == 1
+        assert row["backup_path"] is None
+    assert not backup.exists()
     assert not (batch / "data.grib").exists()
 
 
 def test_recovery_rejects_unrelated_final_store(tmp_path: Path) -> None:
-    """Never claim an existing final directory from a different source request."""
+    """Never claim a final directory whose revision marker is unrelated."""
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
         revision, stage, batch, report = _stage(db, archive)
         final = archive / "2000" / "01" / "era5.zarr"
         final.parent.mkdir(parents=True)
         stage.rename(final)
-        zarr.open_group(final, mode="r+").attrs["provenance"] = {
-            "request_sha256": "unrelated"
-        }
+        zarr.open_group(final, mode="r+").attrs["revision_id"] = "unrelated"
         with db:
             db.execute(
                 "UPDATE revisions SET status = 'ready', report_json = ? WHERE id = ?",
                 (json.dumps(report), revision),
             )
-    with pytest.raises(ValueError, match="different request"):
+    with pytest.raises(ValueError, match="different revision"):
         with catalog.archive_session(archive):
             pytest.fail("An unrelated store must not be published.")
     with sqlite3.connect(archive / "catalog.sqlite") as db:
         assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
     assert (batch / "data.grib").exists()
+
+
+@pytest.mark.parametrize("reader_first", [False, True])
+def test_legacy_catalog_migrates_and_remains_extendable(
+    tmp_path: Path, reader_first: bool
+) -> None:
+    """Migrate the original SQLite schema and unmarked Zarr from either API."""
+    archive = tmp_path / "archive"
+    with catalog.archive_session(archive) as db:
+        first, _, _, report = _stage(db, archive)
+        final = catalog.publish_revision(db, archive, first, report)
+    # Recreate the exact schema and store attributes used before replacements.
+    with sqlite3.connect(archive / "catalog.sqlite") as db:
+        db.executescript("""
+            DROP TABLE months;
+            DROP INDEX ready_month;
+            ALTER TABLE revisions DROP COLUMN parent_revision_id;
+            ALTER TABLE revisions DROP COLUMN backup_path;
+            ALTER TABLE coverage DROP COLUMN source_revision_id;
+            CREATE UNIQUE INDEX published_month ON revisions (year, month)
+                WHERE status IN ('ready', 'published');
+            PRAGMA user_version = 0;
+        """)
+    del zarr.open_group(final, mode="r+").attrs["revision_id"]
+    if reader_first:
+        with catalog.open_month(archive, 2000, 1) as dataset:
+            np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+    with catalog.archive_session(archive) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+        current = catalog.current_month(db, archive, 2000, 1)
+        assert current[1]["revision_id"] == first
+        assert current[1]["fields"][0]["source_revision_id"] == first
+        assert "revision_id" not in zarr.open_group(final, mode="r").attrs
+        second, _, _, report = _stage(db, archive, variable="param_165")
+        catalog.publish_revision(db, archive, second, report)
+    with catalog.open_month(archive, 2000, 1) as dataset:
+        np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
+        np.testing.assert_array_equal(dataset["param_165"].values, 3.0)
 
 
 def test_layout_change_is_rejected_before_ready(tmp_path: Path) -> None:
@@ -235,7 +452,7 @@ def test_layout_change_is_rejected_before_ready(tmp_path: Path) -> None:
 
 
 def test_reader_lock_allows_conversion_and_blocks_publication(tmp_path: Path) -> None:
-    """Separate writer ownership from the lock held throughout lazy reading."""
+    """Allow staged replacement while a reader holds the unchanged old month."""
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
         revision, _, _, report = _stage(db, archive)
@@ -244,13 +461,16 @@ def test_reader_lock_allows_conversion_and_blocks_publication(tmp_path: Path) ->
             with catalog.archive_session(archive):
                 pytest.fail("A second writer must not acquire the archive.")
         with catalog.open_month(archive, 2000, 1) as dataset:
-            revision, stage, _, report = _stage(db, archive, month=2)
+            revision, stage, _, report = _stage(db, archive, variable="param_165")
             assert stage.is_dir()
+            assert set(dataset.data_vars) == {"param_167"}
             np.testing.assert_array_equal(dataset["param_167"].values, 280.0)
             with pytest.raises(portalocker.exceptions.LockException):
                 with portalocker.Lock(archive / ".publication.lock", "a", timeout=0):
                     pytest.fail("The reader must retain the publication lock.")
-        assert catalog.publish_revision(db, archive, revision, report).is_dir()
+        catalog.publish_revision(db, archive, revision, report)
+    with catalog.open_month(archive, 2000, 1) as dataset:
+        assert set(dataset.data_vars) == {"param_167", "param_165"}
 
 
 def test_writer_lock_is_released_when_process_exits(tmp_path: Path) -> None:

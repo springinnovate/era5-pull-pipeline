@@ -96,8 +96,11 @@ def test_download_batch_command(
     credentials, *selection = download.call_args.args
     assert credentials.key == "test-token"
     assert selection == [
-        date(2000, 1, 1), date(2000, 1, 2),
-        ["2m_temperature", "total_precipitation"], Path("staging"), 2,
+        cli.build_batch_request(
+            date(2000, 1, 1), date(2000, 1, 2),
+            ["2m_temperature", "total_precipitation"], 2,
+        ),
+        Path("staging"),
     ]
     assert f"Saved completed batch to {completed}" in capsys.readouterr().out
 
