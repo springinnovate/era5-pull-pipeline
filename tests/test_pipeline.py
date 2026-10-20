@@ -3,6 +3,7 @@
 from contextlib import closing
 from datetime import date
 from itertools import product
+import json
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -29,6 +30,7 @@ def grib_client(monkeypatch: pytest.MonkeyPatch) -> Mock:
     monkeypatch.setattr(conversion, "GLOBAL_LONGITUDES", np.array([0.0, 0.25, 0.5, 0.75]))
     factory = Mock()
     factory.value_offset = 0.0
+    factory.omitted_fields = set()
 
     def retrieve(dataset: str, request: dict[str, Any]) -> Mock:
         """Return a provider response for precisely the submitted selection."""
@@ -43,6 +45,8 @@ def grib_client(monkeypatch: pytest.MonkeyPatch) -> Mock:
                 for variable, day, time in product(
                     request["variable"], request["day"], request["time"]
                 ):
+                    if (variable, day, time) in factory.omitted_fields:
+                        continue
                     parameter = {
                         "2m_temperature": 167,
                         "10m_u_component_of_wind": 165,
@@ -545,3 +549,217 @@ def test_range_adopts_completed_download_after_interrupted_catalog_update(
     grib_client.return_value.retrieve.assert_called_once()
     with catalog.archive_session(archive) as db:
         assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == 0
+
+
+def test_refresh_replaces_selected_days_and_variable_across_months(
+    tmp_path: Path, grib_client: Mock, availability: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replace a partial month and preserve other hours, variables, and months."""
+    archive = tmp_path / "archive"
+    start, end = date(1999, 12, 31), date(2000, 1, 2)
+    variables = ["2m_temperature", "10m_u_component_of_wind"]
+    pipeline.pull_range(start, end, variables, archive, (2, 2), 1)
+    pipeline.pull_range(date(2000, 2, 1), date(2000, 2, 1), variables, archive, (2, 2))
+    with open_month(archive, 2000, 1) as data:
+        january_before = data.load().copy(deep=True)
+    with catalog.archive_session(archive) as db:
+        original = {row["month"]: row["current_revision_id"] for row in db.execute("SELECT * FROM months")}
+    grib_client.value_offset = 100.0
+    grib_client.reset_mock()
+    summary = pipeline.pull_range(start, DAY, ["2m_temperature"], archive, (2, 2), 1, refresh=True)
+    assert summary == {"completed": 48, "skipped": 0, "unavailable": 0, "failed": 0, "pending": 0}
+    submitted = [call.args[1] for call in grib_client.return_value.retrieve.call_args_list]
+    assert len(submitted) == 2
+    assert all(request["variable"] == ["2m_temperature"] for request in submitted)
+    with open_month(archive, 2000, 1) as data:
+        expected = january_before["2_metre_temperature"].values.copy()
+        expected[:24] += 100
+        np.testing.assert_array_equal(data["2_metre_temperature"].values, expected)
+        np.testing.assert_array_equal(
+            data["10_metre_u_wind_component"].values,
+            january_before["10_metre_u_wind_component"].values,
+        )
+    with catalog.archive_session(archive) as db:
+        for year, month in [(1999, 12), (2000, 1)]:
+            report = catalog.current_month(db, archive, year, month)[1]
+            assert report["revision_id"] != original[month]
+            for field in report["fields"]:
+                selected = field["variable"] == "2_metre_temperature" and (
+                    month == 12 or field["valid_time"] < 946771200
+                )
+                assert field["source_revision_id"] == (
+                    report["revision_id"] if selected else original[month]
+                )
+        assert catalog.current_month(db, archive, 2000, 2)[1]["revision_id"] == original[2]
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM revisions WHERE grib_removed = 0").fetchone()[0] == 0
+    assert not list((archive / "staging").rglob("data.grib"))
+    monkeypatch.setattr(pipeline, "load_availability", Mock(side_effect=AssertionError("availability")))
+    monkeypatch.setattr(pipeline, "load_credentials", Mock(side_effect=AssertionError("credentials")))
+    grib_client.side_effect = AssertionError("download")
+    assert pipeline.pull_range(start, end, variables, archive, (2, 2))["skipped"] == 144
+
+
+def test_repeated_refresh_records_new_retrieval_for_the_same_selection(
+    tmp_path: Path, grib_client: Mock, availability: Mock,
+) -> None:
+    """Identical request hashes still identify distinct source publications."""
+    archive = tmp_path / "archive"
+    revisions = []
+    source_hashes = []
+    request_ids = []
+    for refresh, offset in [(False, 0.0), (True, 100.0), (True, 200.0)]:
+        grib_client.value_offset = offset
+        pipeline.pull_range(DAY, DAY, ["2m_temperature"], archive, (2, 2), refresh=refresh)
+        with catalog.archive_session(archive) as db:
+            report = catalog.current_month(db, archive, 2000, 1)[1]
+            revisions.append(report["revision_id"])
+            assert {field["source_revision_id"] for field in report["fields"]} == {revisions[-1]}
+            source_hashes.append(report["fields"][0]["source_request_sha256"])
+            provenance = json.loads(db.execute(
+                "SELECT provenance_json FROM revisions WHERE id = ?", (revisions[-1],),
+            ).fetchone()[0])
+            request_ids.append(provenance["sources"][0]["cds_request_id"])
+        with open_month(archive, 2000, 1) as data:
+            assert data["2_metre_temperature"].values[0, 0, 0] == 168 + offset
+    assert len(set(revisions)) == len(set(request_ids)) == 3
+    assert len(set(source_hashes)) == 1
+    assert grib_client.return_value.retrieve.call_count == 3
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "missing_hour", "missing_variable", "download"])
+def test_failed_refresh_keeps_published_values_and_unpublished_sources(
+    tmp_path: Path, grib_client: Mock, availability: Mock, failure: str,
+) -> None:
+    """Incomplete external responses never replace a valid published month."""
+    archive = tmp_path / "archive"
+    variables = ["2m_temperature", "10m_u_component_of_wind"]
+    pipeline.pull_range(DAY, DAY, variables, archive, (2, 2))
+    with open_month(archive, 2000, 1) as data:
+        before = data.load().copy(deep=True)
+    with catalog.archive_session(archive) as db:
+        revision = catalog.current_month(db, archive, 2000, 1)[1]["revision_id"]
+    grib_client.value_offset = 100.0
+    if failure == "unavailable":
+        availability.return_value[0]["time"] = ["00:00"]
+        error, message = ValueError, "unavailable from CDS"
+    elif failure == "missing_hour":
+        grib_client.omitted_fields = {("2m_temperature", "01", "23:00")}
+        error, message = ValueError, "all requested UTC hours"
+    elif failure == "missing_variable":
+        grib_client.omitted_fields = {("2m_temperature", "01", f"{hour:02d}:00") for hour in range(24)}
+        error, message = ValueError, "parameter count"
+    else:
+        grib_client.return_value.retrieve.side_effect = OSError("transfer failed")
+        error, message = OSError, "transfer failed"
+    with pytest.raises(error, match=message):
+        pipeline.pull_range(DAY, DAY, variables, archive, (2, 2), refresh=True)
+    with open_month(archive, 2000, 1) as data:
+        assert data.identical(before)
+    with catalog.archive_session(archive) as db:
+        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == revision
+        assert db.execute("SELECT COUNT(*) FROM revisions").fetchone()[0] == 1
+    if failure.startswith("missing"):
+        assert len(list((archive / "staging").rglob("data.grib"))) == 1
+    if failure == "unavailable":
+        assert grib_client.return_value.retrieve.call_count == 1
+
+
+def test_refresh_resumes_its_conversions_without_reusing_catch_up_batches(
+    tmp_path: Path, grib_client: Mock, availability: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume the refresh's downloaded data while preserving ordinary staging."""
+    archive = tmp_path / "archive"
+    pipeline.pull_range(DAY, DAY, ["2m_temperature"], archive, (2, 2))
+    assemble = pipeline.assemble_month
+    monkeypatch.setattr(pipeline, "assemble_month", Mock(side_effect=KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.pull_range(DAY, DAY, ["10m_u_component_of_wind"], archive, (2, 2))
+    grib_client.value_offset = 100.0
+    variables = ["2m_temperature", "10m_u_component_of_wind"]
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.pull_range(DAY, DAY, variables, archive, (2, 2), refresh=True)
+    assert grib_client.return_value.retrieve.call_count == 3
+    with catalog.archive_session(archive) as db:
+        assert db.execute("SELECT refresh FROM staged_batches ORDER BY rowid").fetchall()[0][0] == 0
+        assert db.execute("SELECT COUNT(*) FROM staged_batches WHERE refresh = 1").fetchone()[0] == 1
+    with open_month(archive, 2000, 1) as data:
+        assert data["2_metre_temperature"].values[0, 0, 0] == 168
+        assert "10_metre_u_wind_component" not in data
+    monkeypatch.setattr(pipeline, "assemble_month", assemble)
+    monkeypatch.setattr(staging, "convert_batch", Mock(side_effect=AssertionError("decode")))
+    monkeypatch.setattr(pipeline, "load_credentials", Mock(side_effect=AssertionError("credentials")))
+    grib_client.side_effect = AssertionError("download")
+    assert pipeline.pull_range(DAY, DAY, variables, archive, (2, 2), refresh=True)["completed"] == 48
+    with open_month(archive, 2000, 1) as data:
+        assert data["2_metre_temperature"].values[0, 0, 0] == 268
+        assert data["10_metre_u_wind_component"].values[0, 0, 0] == 266
+    with catalog.archive_session(archive) as db:
+        assert db.execute("SELECT COUNT(*) FROM staged_batches WHERE refresh = 1").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM staged_batches WHERE refresh = 0").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("interrupt_after", [1, 2])
+def test_refresh_recovers_interrupted_replacement_publication(
+    tmp_path: Path, grib_client: Mock, availability: Mock,
+    monkeypatch: pytest.MonkeyPatch, interrupt_after: int,
+) -> None:
+    """Recover either monthly rename before making the new fields readable."""
+    archive = tmp_path / "archive"
+    pipeline.pull_range(DAY, DAY, ["2m_temperature"], archive, (2, 2))
+    grib_client.value_offset = 100.0
+    rename = catalog._rename_store
+    moves = 0
+
+    def interrupted(source: Path, destination: Path) -> None:
+        """Stop after the chosen filesystem move, before catalog publication."""
+        nonlocal moves
+        rename(source, destination)
+        moves += 1
+        if moves == interrupt_after:
+            raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(catalog, "_rename_store", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            pipeline.pull_range(DAY, DAY, ["2m_temperature"], archive, (2, 2), refresh=True)
+    with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
+        assert db.execute("SELECT COUNT(*) FROM revisions WHERE status = 'ready'").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 24
+    assert len(list((archive / "staging").rglob("data.grib"))) == 1
+    with open_month(archive, 2000, 1) as data:
+        assert data["2_metre_temperature"].values[0, 0, 0] == 268
+    with catalog.archive_session(archive) as db:
+        assert db.execute("SELECT COUNT(*) FROM revisions WHERE status = 'published'").fetchone()[0] == 2
+        report = catalog.current_month(db, archive, 2000, 1)[1]
+        assert {field["source_revision_id"] for field in report["fields"]} == {report["revision_id"]}
+    assert not list((archive / "staging").rglob("data.grib"))
+
+
+def test_refresh_after_cleanup_failure_downloads_a_new_source(
+    tmp_path: Path, grib_client: Mock, availability: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pending file cleanup cannot turn a new refresh into a reused retrieval."""
+    archive = tmp_path / "archive"
+    pipeline.pull_range(DAY, DAY, ["2m_temperature"], archive, (2, 2))
+    unlink = Path.unlink
+
+    def keep_grib(path: Path, *args: Any, **kwargs: Any) -> None:
+        """Simulate an open source file that cannot yet be deleted."""
+        if path.name == "data.grib":
+            raise PermissionError("source file is open")
+        unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", keep_grib)
+        for offset in [100.0, 200.0]:
+            grib_client.value_offset = offset
+            with pytest.warns(RuntimeWarning, match="cleanup remains pending"):
+                pipeline.pull_range(DAY, DAY, ["2m_temperature"], archive, (2, 2), refresh=True)
+    assert grib_client.return_value.retrieve.call_count == 3
+    with open_month(archive, 2000, 1) as data:
+        assert data["2_metre_temperature"].values[0, 0, 0] == 368
+    assert not list((archive / "staging").rglob("data.grib"))

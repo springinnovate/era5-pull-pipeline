@@ -1,4 +1,4 @@
-"""Select available missing ERA5 hours in bounded single-month requests."""
+"""Select available ERA5 hours in bounded single-month requests."""
 
 from collections import defaultdict
 from collections.abc import Sequence
@@ -86,8 +86,10 @@ def month_requests(
     variables: Sequence[str],
     max_days: int = cds.DEFAULT_MAX_DAYS,
     availability: list[dict[str, list[str]]] | None = None,
+    *,
+    refresh: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """Plan available missing hours for one month and count omitted fields.
+    """Plan available hours for one month and count omitted fields.
 
     Args:
         db: Catalog connection protected by the archive writer lock.
@@ -97,10 +99,12 @@ def month_requests(
         max_days: Maximum calendar span of each download batch.
         availability: Provider constraint cubes, or None for offline planning
             without an availability filter.
+        refresh: Select every requested hour, including previously stored hours.
 
     Returns:
         Download requests, the number of already stored variable/hour pairs,
-        and the number of missing pairs unavailable from the provider.
+        and the number of selected pairs unavailable from the provider. Refresh
+        requests do not skip stored pairs.
 
     Raises:
         ValueError: Dates, day limit, or variable selection are invalid, or a
@@ -123,7 +127,10 @@ def month_requests(
     request["day"] = [f"{day:02d}" for day in range(start.day, end.day + 1)]
     first_hour = int(datetime(start.year, start.month, start.day, tzinfo=UTC).timestamp())
     times = [first_hour + hour * 3600 for hour in range(((end - start).days + 1) * 24)]
-    missing = missing_fields(db, start.year, start.month, names, times)
+    missing = (
+        {name: times for name in names}
+        if refresh else missing_fields(db, start.year, start.month, names, times)
+    )
     missing_count = sum(len(hours) for hours in missing.values())
     skipped = len(names) * len(times) - missing_count
     unavailable = 0

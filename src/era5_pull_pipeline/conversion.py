@@ -177,7 +177,7 @@ def _merged_shard(
 
     Args:
         sources: Arrays with source and destination time indices. Their
-            destination indices are disjoint, with existing fields preferred.
+            destination indices are disjoint after field precedence is applied.
         selection: Full time axis and bounded latitude/longitude slices.
         time_count: Length of the merged monthly time axis.
 
@@ -271,12 +271,13 @@ def assemble_month(
     *,
     previous: Path | None = None,
     previous_report: dict[str, Any] | None = None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Assemble completed batch checkpoints into one validated monthly replacement.
 
     The caller supplies completed checkpoints and their recorded reports. This
     function reads those stores by spatial shard without decoding GRIB again.
-    Previously published fields take precedence over incoming data.
+    Previously published fields take precedence unless refresh is requested.
 
     Args:
         checkpoints: Checkpoint Zarr paths and their validated conversion reports.
@@ -286,6 +287,7 @@ def assemble_month(
         spatial_chunks: Latitude and longitude cells per read chunk.
         previous: Published monthly store to preserve, when present.
         previous_report: Its catalog report, including exact field coverage.
+        refresh: Replace previously published fields covered by the checkpoints.
 
     Returns:
         A JSON-compatible report of all retained and newly assembled fields.
@@ -303,7 +305,7 @@ def assemble_month(
         ))
     return _write_month(
         incoming, metadata, output, spatial_chunks,
-        previous=previous, previous_report=previous_report,
+        previous=previous, previous_report=previous_report, refresh=refresh,
     )
 
 
@@ -315,6 +317,7 @@ def _write_month(
     *,
     previous: Path | None,
     previous_report: dict[str, Any] | None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Merge source coverage, write each spatial shard, and validate reopened data.
 
@@ -323,8 +326,9 @@ def _write_month(
         metadata: Source or monthly publication provenance.
         output: New directory for the unpublished store.
         spatial_chunks: Latitude and longitude cells per read chunk.
-        previous: Published store whose fields take precedence.
+        previous: Published store whose unselected fields are preserved.
         previous_report: Its catalog report with field metadata and source origins.
+        refresh: Prefer incoming coverage over matching previously stored fields.
 
     Returns:
         A JSON-compatible report with exact numerical and metadata validation.
@@ -351,7 +355,7 @@ def _write_month(
             or not np.array_equal(prior["longitude"][:], GLOBAL_LONGITUDES)
         ):
             raise ValueError("The previous month has different coordinates or layout.")
-        all_sources.insert(0, (
+        all_sources.insert(len(incoming) if refresh else 0, (
             {variable: prior[variable] for variable in previous_report["variables"]},
             previous_report,
         ))
@@ -363,7 +367,7 @@ def _write_month(
     incoming_fields: set[tuple[str, int]] = set()
     pending_sources = []
     for source_index, (arrays, report) in enumerate(all_sources):
-        is_previous = previous is not None and source_index == 0
+        is_previous = previous is not None and source_index == (len(incoming) if refresh else 0)
         if (report["year"], report["month"], report["grid"]) != (year, month, grid):
             raise ValueError("Monthly sources must share the same calendar month and grid.")
         source_times = np.array(sorted({field["valid_time"] for field in report["fields"]}), dtype=np.int64)

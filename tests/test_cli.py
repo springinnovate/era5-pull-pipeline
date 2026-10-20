@@ -127,18 +127,23 @@ def test_archive_commands_do_not_load_credentials_before_catalog_lookup(
     assert capsys.readouterr().out.count(f"Published data available at {published}") == 2
 
 
+@pytest.mark.parametrize("refresh", [False, True])
 def test_range_command_accepts_month_boundaries_and_batch_size(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, refresh: bool,
 ) -> None:
     """Expose resumable range processing with separate batching and storage inputs."""
     pull = Mock()
     monkeypatch.setattr(cli, "pull_range", pull)
-    assert cli.main([
+    args = [
         "pull", "--start-date", "1999-12-31", "--end-date", "2000-01-02",
         "--variables", "2m_temperature", "total_precipitation", "--batch-days", "1",
         "--archive", "downloads/manual-archive-13", "--spatial-chunks", "16", "32",
-    ]) == 0
+    ]
+    if refresh:
+        args.append("--refresh")
+    assert cli.main(args) == 0
     pull.assert_called_once_with(
         date(1999, 12, 31), date(2000, 1, 2), ["2m_temperature", "total_precipitation"],
         Path("downloads/manual-archive-13"), (16, 32), 1,
+        refresh=refresh,
     )

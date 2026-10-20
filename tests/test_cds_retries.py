@@ -1,6 +1,7 @@
 """Exercise the installed CDS client's retries through offline HTTP responses."""
 
 import json
+import logging
 from collections.abc import Iterator
 from datetime import date
 from http import HTTPStatus
@@ -101,7 +102,8 @@ def test_execution_failure_retry_policy(
 
 
 def test_interrupted_transfer_exhausts_retries(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Retry a real streaming download with backoff and preserve its interruption."""
     failure = requests.exceptions.ChunkedEncodingError("Connection interrupted")
@@ -155,6 +157,7 @@ def test_interrupted_transfer_exhausts_retries(
 
     monkeypatch.setattr(requests.Session, "request", request)
     monkeypatch.setattr(multiurl.retry.time, "sleep", sleeps.append)
+    caplog.set_level(logging.DEBUG)
     with pytest.raises(requests.exceptions.ChunkedEncodingError) as caught:
         cds.download_batch(
             CREDENTIALS,
@@ -180,3 +183,8 @@ def test_interrupted_transfer_exhausts_retries(
     assert ranges == [None, "bytes=4-", "bytes=8-", None]
     assert completed == partial.with_suffix("")
     assert (completed / "data.grib").read_bytes() == b"fresh-source"
+    captured = capsys.readouterr()
+    assert "Request ID is offline-job" in captured.err
+    assert "status has been updated to successful" in captured.err
+    assert "B/s" in captured.err
+    assert CREDENTIALS.key not in caplog.text + captured.out + captured.err

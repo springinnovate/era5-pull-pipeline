@@ -61,9 +61,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "pull",
         help="Fill a date range using resumable batches and monthly publication.",
         description=(
-            "Download missing global fields across an inclusive UTC date range. "
-            "Reuse verified staged work, publish each month once, and exit. "
-            "Unavailable hours remain missing for the next run."
+            "Download missing global fields across an inclusive UTC date range, "
+            "or replace selected fields with --refresh. Reuse completed staged "
+            "work, publish each month once, and exit. Refresh requires all "
+            "selected fields in each month to be available."
         ),
     )
     for selection in (batch, pull, date_range):
@@ -80,6 +81,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     date_range.add_argument(
         "--batch-days", type=int, default=DEFAULT_MAX_DAYS,
         help=f"Maximum days per download batch (default: {DEFAULT_MAX_DAYS}); not a byte or RAM limit.",
+    )
+    date_range.add_argument(
+        "--refresh", action="store_true",
+        help="Download the selected dates and variables again, replacing their stored fields.",
     )
     batch.add_argument(
         "--staging",
@@ -126,6 +131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pull_range(
                 args.start_date, args.end_date, args.variables, args.archive,
                 tuple(args.spatial_chunks), args.batch_days,
+                refresh=args.refresh,
             )
         elif args.command == "pull-batch":
             print(

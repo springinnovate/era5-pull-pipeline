@@ -497,6 +497,90 @@ def test_assemble_checkpoints_preserves_old_fields_and_tracks_new_sources(
     assert grib.exists() and all(source.exists() for source in source_gribs)
 
 
+@pytest.mark.parametrize("refresh", [False, True])
+def test_refresh_replaces_selected_fields_and_preserves_other_coverage(
+    tmp_path: Path,
+    batch: tuple[Path, dict[str, Any], list[dict[str, Any]]],
+    refresh: bool,
+) -> None:
+    """Replace selected values and intervals only when refresh is requested."""
+    grib, metadata, messages = batch
+    metadata["request"]["variable"].append("10m_u_component_of_wind")
+    messages.extend([
+        {"paramId": 165, "dataTime": 0, "values": np.full(12, 2.0)},
+        {"paramId": 165, "dataTime": 100, "values": np.full(12, 3.0)},
+    ])
+    original = write_grib(grib, messages)
+    previous = tmp_path / "previous.zarr"
+    previous_report = conversion.convert_batch(grib, metadata, previous, (2, 2))
+    for field in previous_report["fields"]:
+        field["source_revision_id"] = "published-source"
+
+    selections = [
+        ("2m_temperature", "01:00", {
+            "dataTime": 100, "values": np.full(12, np.nan),
+        }),
+        ("total_precipitation", "00:00", {
+            "paramId": 228, "dataDate": 19991231, "dataTime": 2300,
+            "stepType": "accum", "startStep": 0, "endStep": 1,
+            "values": np.full(12, 0.01),
+        }),
+    ]
+    checkpoints = []
+    sources = []
+    expected = []
+    for index, (variable, hour, message) in enumerate(selections):
+        source = deepcopy(metadata)
+        source["request"].update({"variable": [variable], "time": [hour]})
+        source["request_sha256"] = str(index + 1) * 64
+        source_grib = tmp_path / f"refresh-{index}.grib"
+        expected.extend(write_grib(source_grib, [message]))
+        checkpoint = tmp_path / f"checkpoint-{index}.zarr"
+        report = conversion.convert_batch(source_grib, source, checkpoint, (2, 2))
+        checkpoints.append((checkpoint, report))
+        sources.append(source)
+    manifest = {
+        "dataset": metadata["dataset"], "request_sha256": "f" * 64,
+        "sources": sources,
+    }
+    output = tmp_path / "replacement.zarr"
+    report = conversion.assemble_month(
+        checkpoints, manifest, output, (2, 2),
+        previous=previous, previous_report=previous_report, refresh=refresh,
+    )
+    stored = zarr.open_group(output, mode="r")
+    assert np.array_equal(
+        stored["2_metre_temperature"][:],
+        np.stack([original[0], expected[0] if refresh else original[2]]),
+        equal_nan=True,
+    )
+    assert np.array_equal(
+        stored["total_precipitation"][:],
+        np.stack([expected[1] if refresh else original[1], original[3]]),
+    )
+    assert np.array_equal(stored["10_metre_u_wind_component"][:], np.stack(original[4:]))
+    assert stored["2_metre_temperature_coverage"][:].tolist() == [True, True]
+    assert stored["total_precipitation_start_step"][:].tolist() == [
+        0 if refresh else 5 * 3600, 6 * 3600,
+    ]
+    midnight = int(datetime(2000, 1, 1, tzinfo=UTC).timestamp())
+    assert stored["total_precipitation_reference_time"][0] == midnight - (1 if refresh else 6) * 3600
+    replacements = {
+        (field["variable"], field["valid_time"]): field
+        for _, source_report in checkpoints for field in source_report["fields"]
+    }
+    fields = {(field["variable"], field["valid_time"]): field for field in report["fields"]}
+    for field in previous_report["fields"]:
+        identity = field["variable"], field["valid_time"]
+        assert fields[identity] == (
+            replacements[identity] if refresh and identity in replacements else field
+        )
+    assert stored.attrs["source_provenance"] == [metadata, *sources]
+    unchanged = zarr.open_group(previous, mode="r")
+    assert np.array_equal(unchanged["2_metre_temperature"][:], np.stack([original[0], original[2]]))
+    assert np.array_equal(unchanged["total_precipitation"][:], np.stack([original[1], original[3]]))
+
+
 @pytest.mark.parametrize("conflict", ["overlap", "month"])
 def test_assembly_rejects_conflicting_checkpoint_selections(
     tmp_path: Path,

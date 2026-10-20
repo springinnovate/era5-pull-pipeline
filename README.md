@@ -24,6 +24,7 @@ Each run accepts:
 | Output directory | The archive to create or extend. |
 | Download batch size | How many days to request at a time. |
 | Spatial chunk shape | How many grid cells along latitude and longitude to store in each chunk. |
+| Refresh | Retrieve the selected fields again and replace their stored values. |
 
 ## Credentials
 
@@ -64,6 +65,8 @@ From the directory containing `.cdsapirc`, run:
 
 This retrieves three complete UTC days on the global grid, in one-day batches, and publishes `1999/12/era5.zarr` and `2000/01/era5.zarr` beneath the archive directory. `--batch-days` defaults to 7. Requests stop at month boundaries and are subdivided further to respect CDS field limits. It limits calendar days per batch; compressed GRIB sizes vary by variable and data values.
 
+CDS prints the request ID and status changes, such as `accepted`, `running`, and `successful`. Once the file transfer begins, a progress bar shows downloaded bytes, transfer rate, and an estimated remaining transfer time. While a request stays queued, its status can remain unchanged; the transfer estimate does not include queue time. These messages also appear when resuming a saved CDS job.
+
 Repeat the same command to verify coverage: a completed range prints `completed=0, skipped=144` and makes no CDS calls. Counts are **variable-hours**: two variables over three 24-hour days total 144. `completed` counts fields published in this invocation; `skipped` counts already stored fields; `unavailable` counts requested hours absent from CDS's availability snapshot. `failed` identifies a failed batch or monthly publication, and `pending` counts remaining unattempted or staged fields. A failure prints the summary and original error. Hours marked unavailable are requested again on a subsequent run.
 
 To add wind for the same dates, run the command with `--variables 10m_u_component_of_wind 10m_v_component_of_wind`. Existing temperature and precipitation remain in the monthly stores. Use `--spatial-chunks LAT LON` when creating an archive to change the default `32 32` tile shape; subsequent writes must use the archive's existing shape.
@@ -71,6 +74,20 @@ To add wind for the same dates, run the command with `--variables 10m_u_componen
 Press Ctrl+C to stop. Run the same command to resume: the pipeline uses SQLite's staged batch records to recover submitted CDS jobs and reuse completed downloads and conversions. An interrupted transfer restarts from the beginning; an interrupted conversion is rebuilt from its retained GRIB. Completed artifacts are immutable and reused directly. CDS requests run serially with bounded retries and backoff for transient service failures.
 
 If CDS reports that a saved job has failed or expired, remove that job's `.partial` directory under `staging/batches/` and rerun to submit it again. Its `request.json` identifies the selection and CDS job ID. Completed batches remain reusable.
+
+## Refresh stored data
+
+Add `--refresh` to retrieve the selected dates and variables again, including fields already in the archive:
+
+```powershell
+.\.venv\Scripts\python.exe -m era5_pull_pipeline pull --start-date 2000-01-01 --end-date 2000-01-01 --variables 2m_temperature --archive downloads/manual-archive-13 --batch-days 1 --refresh
+```
+
+This replaces all 24 temperature fields for January 1 and prints `completed=24, skipped=0`. Other dates, variables, and months retain their data and source information. Gaps within the selection are filled. Each successful refresh records a new retrieval and publication, even if CDS returns identical values. Running without `--refresh` continues to skip stored fields.
+
+Each month's selected fields must all be available from CDS. If availability is incomplete, a download fails, or a response lacks required fields, that month remains unchanged. Absent fields and array fill slots cannot replace stored fields; missing grid cells explicitly encoded in a returned GRIB retain their source meaning.
+
+An interrupted refresh reuses its own staged downloads and conversions, separately from ordinary catch-up work. Publication commits one month at a time. Months already published remain committed if a later month fails; rerunning with `--refresh` selects the entire requested range again, including those completed months. To continue only the unfinished interval, adjust the dates accordingly.
 
 ## Tests
 
@@ -91,10 +108,10 @@ The archive retains source units, grid coordinates, UTC timestamps, decoded nume
 
 ## Pipeline steps
 
-1. **Find missing coverage.** Compare the requested dates and variables with the archive's SQLite catalog. Already stored variable/hour combinations are skipped; gaps and newly requested variables are included. Match missing fields against CDS's availability constraints, including partially available days.
+1. **Select coverage.** Compare the requested dates and variables with the archive's SQLite catalog. Ordinary runs skip stored variable/hour combinations and include gaps and newly requested variables. `--refresh` includes every selected field. Match the selection against CDS's availability constraints, including partially available days.
 2. **Load credentials when needed.** Authenticate with CDS using the local `.cdsapirc` file when a download is required. A completed repeat needs no credentials or service calls.
 3. **Download GRIB batches.** Split the requested time interval according to the download batch size, stopping at calendar-month boundaries. Every downloaded field covers the full global grid. Batch size is independent of the Zarr storage layout.
-4. **Assemble the month.** Decode the GRIB fields into arrays with dimensions `(time, latitude, longitude)` and save validated, compressed batch checkpoints. Assemble all selected batches for the month in staging, preserving existing variables and hours. Publish each affected month once per invocation.
+4. **Assemble the month.** Decode the GRIB fields into arrays with dimensions `(time, latitude, longitude)` and save validated, compressed batch checkpoints. Assemble all selected batches for the month in staging, preserving existing fields unless selected for refresh. Publish each affected month once per invocation.
 5. **Validate and publish.** Check the variables, global grid, timestamps, interval metadata, numerical values, and readability of the compressed output. Publish the validated monthly dataset and record its coverage and revision in SQLite.
 6. **Remove temporary sources.** Delete the corresponding GRIB files and conversion checkpoints only after publication and the catalog update succeed. The monthly Zarr datasets are the retained data archive.
 

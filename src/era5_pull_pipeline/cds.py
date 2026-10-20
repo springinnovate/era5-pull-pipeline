@@ -22,10 +22,10 @@ RETRY_ATTEMPTS = 3
 RETRY_BACKOFF = (2, 30, 2)
 CLIENT_OPTIONS = {
     "verify": True,
-    "quiet": True,
+    "quiet": False,
     # CDS debug messages include credentials.
     "debug": False,
-    "progress": False,
+    "progress": True,
     "timeout": 30,
     "retry_max": 2,
     "sleep_max": 2,
