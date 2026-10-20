@@ -42,7 +42,7 @@ From the directory containing `.cdsapirc`, run:
 .\.venv\Scripts\python.exe -m era5_pull_pipeline check-access
 ```
 
-The check downloads one full global field of 2 m temperature for **2000-01-01 at 00:00 UTC** to `downloads/era5-access-check.grib`. Success prints `CDS access verified` and the saved path. This checks dataset access and GRIB framing; it leaves the probe file separate from the monthly archive.
+The check downloads one full global field of 2 m temperature for **2000-01-01 at 00:00 UTC** to `downloads/era5-access-check.grib` and decodes it with xarray's cfgrib reader. Success prints `CDS access verified` and the saved path. The probe file stays separate from the monthly archive.
 
 CDS may queue the request. Press Ctrl+C to stop waiting locally. Errors identify credential, dataset-access, connection, or file problems without displaying the token.
 

@@ -10,6 +10,7 @@ import warnings
 
 import cdsapi
 import requests
+import xarray as xr
 
 from era5_pull_pipeline.credentials import CdsCredentials
 
@@ -155,27 +156,19 @@ def _retrieve_probe(credentials: CdsCredentials, target: Path) -> None:
 
 
 def _validate_probe_grib(path: Path) -> int:
-    """Check the single GRIB message's framing without decoding its array.
+    """Open and decode the downloaded GRIB with cfgrib.
 
     Args:
         path: Completed temporary download.
 
     Returns:
-        The size of the framed GRIB message in bytes.
-
-    Raises:
-        AccessCheckError: The response is empty, truncated, or not one GRIB message.
+        The size of the downloaded GRIB in bytes.
     """
-    size = path.stat().st_size
-    with path.open("rb") as stream:
-        header = stream.read(16)
-        if size < 20 or header[:4] != b"GRIB" or header[7] not in (1, 2):
-            raise AccessCheckError("CDS returned an empty or invalid GRIB. Retry the access check.")
-        length = int.from_bytes(header[4:7] if header[7] == 1 else header[8:16], "big")
-        stream.seek(-4, 2)
-        if length != size or stream.read(4) != b"7777":
-            raise AccessCheckError("CDS returned an incomplete GRIB. Retry the access check.")
-    return size
+    with xr.open_dataset(
+        path, engine="cfgrib", backend_kwargs={"indexpath": "", "errors": "raise"}
+    ) as dataset:
+        dataset.load()
+    return path.stat().st_size
 
 
 def check_access(credentials: CdsCredentials, output: Path) -> int:
