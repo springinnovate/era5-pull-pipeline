@@ -243,6 +243,8 @@ def test_failed_metadata_write_keeps_directory_partial(
 
     def fail_write(path: Path, data: str, encoding: str) -> int:
         """Simulate a metadata write that fails after writing some JSON."""
+        if path.name != "metadata.json":
+            return original_write(path, data, encoding=encoding)
         original_write(path, data[:10], encoding=encoding)
         raise failure
 
@@ -262,3 +264,60 @@ def test_failed_metadata_write_keeps_directory_partial(
     assert (partials[0] / "data.grib").read_bytes() == PAYLOAD
     with pytest.raises(json.JSONDecodeError):
         json.loads((partials[0] / "metadata.json").read_text(encoding="utf-8"))
+
+
+def test_resume_reuses_recorded_remote_job(
+    tmp_path: Path, client_factory: Mock
+) -> None:
+    """Reuse an interrupted job without another submission, restarting its bytes."""
+    request = cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"])
+    remote = client_factory.return_value.retrieve.return_value
+
+    def interrupt(target: str) -> None:
+        Path(target).write_bytes(b"partial bytes")
+        raise KeyboardInterrupt
+
+    remote.download.side_effect = interrupt
+    with pytest.raises(KeyboardInterrupt):
+        cds.download_batch(CREDENTIALS, request, tmp_path, resume=True)
+    (partial,) = tmp_path.iterdir()
+    journal_text = (partial / "request.json").read_text(encoding="utf-8")
+    journal = json.loads(journal_text)
+    assert journal["request"] == request
+    assert journal["cds_request_id"] == "cds-test-request"
+    assert TOKEN not in journal_text
+
+    resumed = client_factory.return_value.client.get_remote.return_value
+    resumed.request_id = remote.request_id
+    resumed.download.side_effect = lambda target: Path(target).write_bytes(PAYLOAD)
+    completed = cds.download_batch(CREDENTIALS, request, tmp_path, resume=True)
+
+    assert completed == partial.with_suffix("")
+    assert (completed / "data.grib").read_bytes() == PAYLOAD
+    client_factory.return_value.retrieve.assert_called_once_with(cds.DATASET, request)
+    client_factory.return_value.client.get_remote.assert_called_once_with("cds-test-request")
+    metadata = json.loads((completed / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["started_at"] == journal["started_at"]
+    assert metadata["sha256"] == hashlib.sha256(PAYLOAD).hexdigest()
+
+
+def test_resume_after_submission_failure_and_different_selection(
+    tmp_path: Path, client_factory: Mock
+) -> None:
+    """Retry an unsubmitted selection while leaving another partial job alone."""
+    request = cds.build_batch_request(date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"])
+    client_factory.return_value.retrieve.side_effect = requests.ConnectionError("submit failed")
+    with pytest.raises(requests.ConnectionError):
+        cds.download_batch(CREDENTIALS, request, tmp_path, resume=True)
+    (partial,) = tmp_path.iterdir()
+    journal = json.loads((partial / "request.json").read_text(encoding="utf-8"))
+    assert "cds_request_id" not in journal
+    client_factory.return_value.retrieve.side_effect = None
+    other = {**request, "variable": ["total_precipitation"]}
+    different = cds.download_batch(CREDENTIALS, other, tmp_path, resume=True)
+    assert partial.exists()
+    assert different != partial.with_suffix("")
+    completed = cds.download_batch(CREDENTIALS, request, tmp_path, resume=True)
+    assert completed == partial.with_suffix("")
+    assert (completed / "data.grib").read_bytes() == PAYLOAD
+    client_factory.return_value.client.get_remote.assert_not_called()
