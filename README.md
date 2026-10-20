@@ -15,7 +15,14 @@ Each run accepts:
 | Download batch size | How many days to request at a time. |
 | Spatial chunk shape | How many grid cells along latitude and longitude to store in each chunk. |
 
-Access uses a Copernicus Climate Data Store (CDS) account, API credentials, and acceptance of the dataset's licence. Credentials remain outside the archive.
+## Credentials
+
+Access uses a Copernicus Climate Data Store (CDS) account, a personal access token, and acceptance of the dataset's licence. Place a `.cdsapirc` file in the directory from which you run the pipeline:
+
+```yaml
+url: https://cds.climate.copernicus.eu/api
+key: YOUR_PERSONAL_ACCESS_TOKEN
+```
 
 ## Data
 
@@ -25,11 +32,12 @@ The archive retains source units, grid coordinates, UTC timestamps, decoded nume
 
 ## Pipeline steps
 
-1. **Find missing coverage.** Compare the requested dates and variables with the archive's SQLite catalog. Already stored variable/hour combinations are skipped; gaps and newly requested variables are included.
-2. **Download GRIB batches.** Split requests according to the download batch size, stopping at calendar-month boundaries. Batch size is independent of the Zarr storage layout.
-3. **Assemble the month.** Decode the GRIB fields into arrays with dimensions `(time, latitude, longitude)`. Combine batches in a staging area for the relevant month. For an existing month, merge new or refreshed values with its published contents, preserving all other variables and hours. During a historical backfill, assemble all requested batches for a month before publishing it.
-4. **Validate and publish.** Check the variables, grid, timestamps, interval metadata, numerical values, and readability of the compressed output. Publish the validated monthly dataset and record its coverage and revision in SQLite.
-5. **Remove the GRIB downloads.** Delete the corresponding temporary GRIB files only after publication and the catalog update succeed. The Zarr datasets are the retained data archive.
+1. **Load credentials.** Authenticate with CDS using the local `.cdsapirc` file.
+2. **Find missing coverage.** Compare the requested dates and variables with the archive's SQLite catalog. Already stored variable/hour combinations are skipped; gaps and newly requested variables are included.
+3. **Download GRIB batches.** Split requests according to the download batch size, stopping at calendar-month boundaries. Batch size is independent of the Zarr storage layout.
+4. **Assemble the month.** Decode the GRIB fields into arrays with dimensions `(time, latitude, longitude)`. Combine batches in a staging area for the relevant month. For an existing month, merge new or refreshed values with its published contents, preserving all other variables and hours. During a historical backfill, assemble all requested batches for a month before publishing it.
+5. **Validate and publish.** Check the variables, grid, timestamps, interval metadata, numerical values, and readability of the compressed output. Publish the validated monthly dataset and record its coverage and revision in SQLite.
+6. **Remove the GRIB downloads.** Delete the corresponding temporary GRIB files only after publication and the catalog update succeed. The Zarr datasets are the retained data archive.
 
 The staging area holds downloaded GRIB files alongside the monthly Zarr data until publication succeeds, so temporary disk space includes both. The latest month can contain only part of a month. Dates that are not yet available from CDS remain missing, so a subsequent run can retrieve them. The catalog distinguishes partial coverage from a complete requested interval.
 
