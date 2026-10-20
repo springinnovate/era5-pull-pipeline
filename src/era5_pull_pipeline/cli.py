@@ -1,4 +1,4 @@
-"""Download global ERA5 batches or check CDS access."""
+"""Download and archive global ERA5 batches or check CDS access."""
 
 import argparse
 from collections.abc import Sequence
@@ -8,6 +8,7 @@ import sys
 
 from era5_pull_pipeline.cds import DEFAULT_MAX_DAYS, check_access, download_batch
 from era5_pull_pipeline.credentials import load_credentials
+from era5_pull_pipeline.pipeline import ingest_batch, pull_batch
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -47,30 +48,55 @@ def main(argv: Sequence[str] | None = None) -> int:
             "inclusive and must stay within one calendar month and --max-days."
         ),
     )
-    batch.add_argument("--start-date", type=date.fromisoformat, required=True, metavar="YYYY-MM-DD")
-    batch.add_argument("--end-date", type=date.fromisoformat, required=True, metavar="YYYY-MM-DD")
-    batch.add_argument("--variables", nargs="+", required=True, metavar="NAME", help="CDS variable names.")
-    batch.add_argument(
-        "--max-days",
-        type=int,
-        default=DEFAULT_MAX_DAYS,
-        help=f"Maximum days in this request (default: {DEFAULT_MAX_DAYS}); not a byte or RAM limit.",
+    pull = commands.add_parser(
+        "pull-batch",
+        help="Download, validate, and publish one batch to a monthly Zarr archive.",
+        description=(
+            "Publish one batch of complete UTC days within one month. An "
+            "identical published request is skipped. A different selection for "
+            "an already published month is rejected."
+        ),
     )
+    for selection in (batch, pull):
+        selection.add_argument("--start-date", type=date.fromisoformat, required=True, metavar="YYYY-MM-DD")
+        selection.add_argument("--end-date", type=date.fromisoformat, required=True, metavar="YYYY-MM-DD")
+        selection.add_argument("--variables", nargs="+", required=True, metavar="NAME", help="CDS variable names.")
+        selection.add_argument(
+            "--max-days",
+            type=int,
+            default=DEFAULT_MAX_DAYS,
+            help=f"Maximum days in this request (default: {DEFAULT_MAX_DAYS}); not a byte or RAM limit.",
+        )
     batch.add_argument(
         "--staging",
         type=Path,
         default=Path("downloads/staging"),
         help="Batch staging directory (default: downloads/staging).",
     )
+    ingest = commands.add_parser(
+        "ingest-batch",
+        help="Publish an existing completed download without contacting CDS.",
+    )
+    ingest.add_argument("--batch", type=Path, required=True, help="Completed download directory.")
+    for storage in (pull, ingest):
+        storage.add_argument(
+            "--archive", type=Path, default=Path("archive"),
+            help="Archive directory (default: archive).",
+        )
+        storage.add_argument(
+            "--spatial-chunks", nargs=2, type=int, default=(32, 32),
+            metavar=("LAT", "LON"), help="Grid cells per spatial read chunk (default: 32 32).",
+        )
     args = parser.parse_args(argv)
     try:
-        credentials = load_credentials()
         if args.command == "check-access":
+            credentials = load_credentials()
             print("Requesting one global ERA5 field. CDS may queue the request; Ctrl+C stops waiting.", flush=True)
             size = check_access(credentials, args.output)
             print(f"CDS access verified: global 2m_temperature at 2000-01-01 00:00 UTC ({size} bytes).")
             print(f"Saved GRIB to {args.output}.")
-        else:
+        elif args.command == "download-batch":
+            credentials = load_credentials()
             print(
                 f"Requesting global ERA5 data for {args.start_date} through {args.end_date}. "
                 "CDS may queue the request; Ctrl+C stops waiting.",
@@ -81,7 +107,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.staging, args.max_days,
             )
             print(f"Saved completed batch to {completed}.")
+        elif args.command == "pull-batch":
+            print(
+                f"Checking archive coverage for {args.start_date} through {args.end_date}. "
+                "If a download is needed, CDS may queue it; Ctrl+C stops waiting.",
+                flush=True,
+            )
+            published = pull_batch(
+                args.start_date, args.end_date, args.variables, args.archive,
+                tuple(args.spatial_chunks), args.max_days,
+            )
+            print(f"Published data available at {published}.")
+        else:
+            print(f"Ingesting completed batch {args.batch}.", flush=True)
+            published = ingest_batch(args.batch, args.archive, tuple(args.spatial_chunks))
+            print(f"Published data available at {published}.")
     except KeyboardInterrupt:
-        print("Download interrupted. No successful download was reported.", file=sys.stderr)
+        print("Operation interrupted. Run it again to recover any pending publication.", file=sys.stderr)
         return 130
     return 0

@@ -11,9 +11,13 @@ requires-python = ">=3.11"
 dependencies = [
     "cdsapi>=0.7.7,<0.8",
     "cfgrib>=0.9.15.1,<0.10",
+    "eccodes>=2.40,<3",
+    "numpy>=1.26",
+    "portalocker>=3,<4",
     "PyYAML>=6,<7",
     "requests>=2.31,<3",
-    "xarray>=2024.1",
+    "xarray>=2025.3.1",
+    "zarr>=3.1,<4",
 ]
 
 [project.optional-dependencies]

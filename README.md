@@ -80,7 +80,7 @@ The archive retains source units, grid coordinates, UTC timestamps, decoded nume
 5. **Validate and publish.** Check the variables, global grid, timestamps, interval metadata, numerical values, and readability of the compressed output. Publish the validated monthly dataset and record its coverage and revision in SQLite.
 6. **Remove the GRIB downloads.** Delete the corresponding temporary GRIB files only after publication and the catalog update succeed. The Zarr datasets are the retained data archive.
 
-The staging area holds downloaded GRIB files alongside the monthly Zarr data until publication succeeds, so temporary disk space includes both. The latest month can contain only part of a month. Dates that are not yet available from CDS remain missing, so a subsequent run can retrieve them. The catalog distinguishes partial coverage from a complete requested interval.
+The staging area holds downloaded GRIB files alongside the monthly Zarr data until publication succeeds. Conversion also uses temporary disk-backed, decoded arrays, so available disk space must accommodate all three. It processes one global field at a time and writes spatial shards without loading a whole month into RAM. The latest month can contain only part of a month. Dates that are not yet available from CDS remain missing, so a subsequent run can retrieve them. The catalog distinguishes partial coverage from a complete requested interval.
 
 ## Archive layout
 
@@ -102,6 +102,8 @@ archive/
 
 Each `YYYY/MM/era5.zarr/` is a [Zarr 3 directory](https://zarr.readthedocs.io/en/stable/user-guide/arrays/#persistent-arrays), containing metadata and compressed array data. Each variable has its own array, with shared time, latitude, and longitude coordinates, and can be read independently.
 
+Arrays use their GRIB parameter IDs as stable names, such as `param_167` for 2 m temperature and `param_228` for total precipitation. Their attributes retain the descriptive name, short name, and units; the source request retains the original CDS variable names. Time coordinates identify when fields are valid. Per-variable metadata arrays retain forecast reference times and interval boundaries, including precipitation intervals that begin on the preceding day.
+
 Within each monthly dataset, read chunks span the calendar month along time and a tile of grid cells in space. These chunks partition the stored global arrays. The spatial chunk shape is configured when creating the archive; Zarr does not require a particular tile size. Zarr sharding packs multiple independently readable chunks into larger files to control file counts.
 
 Chunks use **lossless Zstandard compression**. Storage does not introduce numerical rounding, quantization, or a reduction in decoded precision. Compression reduces storage and transfer volume, while chunks allow portions of an array to be read independently. See [Zarr's chunking and sharding guidance](https://zarr.readthedocs.io/en/stable/user-guide/performance/).
@@ -113,5 +115,7 @@ The monthly directories form one continuous archive. A reader selects the releva
 SQLite records coverage by variable and hour on the fixed global grid, together with source dataset and grid metadata. The catalog also retains source request details, retrieval times, GRIB checksums, validation results, and published revisions after temporary downloads are removed.
 
 A single writer updates an archive. It prepares a replacement month in staging and retains the previous version until publication and catalog recording succeed. Readers coordinate with publication so they do not read a mixture of old and new arrays. SQLite transactions record state; they do not make filesystem changes atomic. Interrupted publication is reconciled before the affected month becomes readable again.
+
+Python readers use `era5_pull_pipeline.catalog.open_month` as a context manager and finish reading before leaving it. The context holds the publication lock while its xarray dataset is open; opening Zarr directly bypasses that coordination. Downloads and conversion can proceed while a reader is active. Restarting an archive command recovers a validated publication interrupted between its filesystem rename and catalog commit, and retries any pending GRIB cleanup. Unvalidated staging data remain outside published coverage.
 
 Adding hours to a partial month or refreshing a selected historical interval produces a replacement version of the affected monthly dataset. This trades rewriting that month for a simple publication and recovery process; the rest of the archive remains untouched. Ordinary catch-up runs fill missing coverage. A deliberate refresh replaces already stored values when ERA5 changes them.
