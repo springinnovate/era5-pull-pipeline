@@ -35,9 +35,9 @@ layout.
 
 ## Data integrity and resource use
 
-- Validate user inputs, external data, persisted state, and publication at the
-  boundary that owns them. Trust established internal contracts below that
-  boundary. Use explicit errors for invalid external data, not `assert`.
+- Add validation only for concrete workflow or archive-integrity requirements.
+  Trust configuration and established internal contracts; let library operations
+  reject invalid inputs instead of anticipating every possible failure.
 - Preserve source units, grid coordinates, UTC timestamps, interval semantics,
   and decoded numerical precision. Lossless compression does not justify a
   lossy conversion of numeric types.
@@ -50,8 +50,9 @@ layout.
 - Track completion by variable, hour, and source selection. Record completion
   only after validated data are durably published. Remove corresponding GRIB
   downloads only after publication and catalog recording succeed.
-- Validate incoming and replacement data. Avoid rescanning or rehashing the
-  entire archive on every run without a demonstrated integrity requirement.
+- Use mature libraries to decode data formats instead of implementing custom
+  format checks. Check the archive invariants needed for publication; avoid
+  rescanning or rehashing the entire archive without a demonstrated requirement.
 - Process large date ranges through bounded batches. Control per-batch memory,
   temporary storage, concurrency, and retries; respect CDS request limits.
   Use retries with backoff and preserve recoverable progress on interruption.
@@ -60,6 +61,12 @@ layout.
 
 ## Python and documentation
 
+- Prefer straightforward code. Avoid thin passthrough helpers, speculative
+  abstractions, and checks that duplicate library behavior. Extract a function
+  when it gives substantial logic a clear responsibility or enables real reuse.
+- Let unexpected errors propagate with their original traceback. Do not catch
+  and translate exceptions speculatively; handle them only for a concrete
+  recovery action or to keep credentials out of output.
 - Give new or materially changed functions, methods, and contracts complete type
   annotations and concise Google-style docstrings. Explain purpose first, then
   `Args`, `Returns`, and `Raises` where applicable.
