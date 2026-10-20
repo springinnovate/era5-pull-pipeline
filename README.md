@@ -54,38 +54,6 @@ Repeat the same command to check access again; it replaces the probe file. Use `
 
 The installed `era5-pull check-access` command provides the same check. Use `--help` to see its options.
 
-## Download one batch
-
-Select an inclusive UTC date range and one or more CDS variable names:
-
-```powershell
-.\.venv\Scripts\python.exe -m era5_pull_pipeline download-batch `
-  --start-date 2000-01-01 `
-  --end-date 2000-01-01 `
-  --variables 2m_temperature total_precipitation `
-  --max-days 1 `
-  --staging downloads/staging
-```
-
-This requests all 24 hourly fields for both variables on the entire global 0.25° grid. The request explicitly selects that grid; CDS regrids variables supplied on a different grid, such as ocean-wave fields. Dates must stay within one calendar month. `--max-days` defaults to **7** and rejects longer selections; it does not split the interval. For a week, set the end date to `2000-01-07` and `--max-days 7`. Use the variable names shown by the [ERA5 dataset's API request form](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download).
-
-The day limit controls the request interval, not compressed file size or RAM. Downloads stream to disk, and the SHA-256 checksum is calculated without loading the whole file into memory. Requests exceeding the published [CDS limit](https://confluence.ecmwf.int/spaces/CKB/pages/174856258/Climate%2BData%2BStore%2BCDS%2Bdocumentation) of 120,000 fields are rejected locally; CDS can apply additional limits. Select fewer days or variables if CDS rejects the request size.
-
-Each run creates a new batch directory under `--staging` (default `downloads/staging`):
-
-```text
-downloads/staging/
-  2000-01-01_2000-01-01_<unique-id>/
-    data.grib
-    metadata.json
-```
-
-`metadata.json` records the exact request, its SHA-256 identity, the CDS job ID, UTC retrieval timestamps, byte count, and the GRIB's SHA-256 checksum. Variable ordering and duplicates do not change the request identity. Repeating the command creates a separate retrieval with the same identity.
-
-While a batch is unfinished, its directory ends in `.partial`. That suffix is removed only after the transfer, checksum, and metadata write succeed. Failed or interrupted directories retain the suffix and are not completed inputs. Completed batches remain staged for ingestion; they do not represent published archive coverage. This command creates no Zarr or SQLite files.
-
-The CDS client makes up to two attempts per retryable HTTP operation or file transfer, with a two-second delay between attempts. Failures propagate with the CDS client's original exceptions. Queue waiting can take longer than these retry delays; Ctrl+C stops waiting locally.
-
 ## Tests
 
 Install the optional test dependencies and run the automated tests from the repository directory:
