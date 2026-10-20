@@ -15,6 +15,15 @@ from era5_pull_pipeline.credentials import CdsCredentials
 
 DATASET = "reanalysis-era5-single-levels"
 DATASET_URL = f"https://cds.climate.copernicus.eu/datasets/{DATASET}"
+CLIENT_OPTIONS = {
+    "verify": True,
+    "quiet": True,
+    "debug": False,
+    "progress": False,
+    "timeout": 30,
+    "retry_max": 2,
+    "sleep_max": 2,
+}
 
 
 class AccessCheckError(Exception):
@@ -133,13 +142,7 @@ def _retrieve_probe(credentials: CdsCredentials, target: Path) -> None:
             client = cdsapi.Client(
                 url=credentials.url,
                 key=credentials.key,
-                verify=True,
-                quiet=True,
-                debug=False,
-                progress=False,
-                timeout=30,
-                retry_max=2,
-                sleep_max=2,
+                **CLIENT_OPTIONS,
                 session=session,
                 info_callback=_discard_diagnostic,
                 warning_callback=_discard_diagnostic,
