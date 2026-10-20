@@ -2,6 +2,17 @@
 
 A Python pipeline that runs from the command line, downloads full global ERA5 rasters, and maintains a compressed Zarr archive. Each invocation processes a requested date range and set of variables, fills missing coverage, and exits. The same archive grows from 1950 through the latest available data as subsequent runs add new hours.
 
+## Installation
+
+Use Python 3.11 or newer. From the repository directory, create a virtual environment and install the package:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+These commands use PowerShell on Windows. On macOS or Linux, use `.venv/bin/python` in place of `.\.venv\Scripts\python.exe`.
+
 ## Inputs
 
 Each run accepts:
@@ -16,12 +27,43 @@ Each run accepts:
 
 ## Credentials
 
-Access uses a Copernicus Climate Data Store (CDS) account, a personal access token, and acceptance of the dataset's licence. Place a `.cdsapirc` file in the directory from which you run the pipeline:
+Access uses a Copernicus Climate Data Store (CDS) account, a personal access token from your [CDS profile](https://cds.climate.copernicus.eu/profile), and acceptance of the [ERA5 dataset's licence](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download). Place a `.cdsapirc` file in the directory from which you run the pipeline:
 
 ```yaml
 url: https://cds.climate.copernicus.eu/api
 key: YOUR_PERSONAL_ACCESS_TOKEN
 ```
+
+## Check access
+
+From the directory containing `.cdsapirc`, run:
+
+```powershell
+.\.venv\Scripts\python.exe -m era5_pull_pipeline check-access
+```
+
+The check downloads one full global field of 2 m temperature for **2000-01-01 at 00:00 UTC** to `downloads/era5-access-check.grib` and decodes it with xarray's cfgrib reader. Success prints `CDS access verified` and the saved path. The probe file stays separate from the monthly archive.
+
+CDS may queue the request. Press Ctrl+C to stop waiting locally. Connection settings are passed directly to CDS; file, service, and decoding failures show their original errors.
+
+Repeat the same command to check access again; it replaces the probe file. Use `--output` to choose a different location:
+
+```powershell
+.\.venv\Scripts\python.exe -m era5_pull_pipeline check-access --output downloads/check-2.grib
+```
+
+The installed `era5-pull check-access` command provides the same check. Use `--help` to see its options.
+
+## Tests
+
+Install the optional test dependencies and run the automated tests from the repository directory:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
+.\.venv\Scripts\python.exe -m pytest -q --basetemp .pytest_cache/manual-check
+```
+
+The tests use local fixtures and simulated service responses. They do not need credentials or contact CDS; `check-access` is the explicit live test.
 
 ## Data
 

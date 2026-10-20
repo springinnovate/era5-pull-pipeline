@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "era5-pull-pipeline"
+version = "0.1.0"
+description = "Command-line tools for a global ERA5 archive"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cdsapi>=0.7.7,<0.8",
+    "cfgrib>=0.9.15.1,<0.10",
+    "PyYAML>=6,<7",
+    "requests>=2.31,<3",
+    "xarray>=2024.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+era5-pull = "era5_pull_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
