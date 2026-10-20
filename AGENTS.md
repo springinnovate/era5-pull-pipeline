@@ -32,12 +32,23 @@ layout.
 - Justify new dependencies and abstractions with a concrete need. Reuse existing
   behavior when its inputs, errors, lifecycle, and performance semantics match.
   Similar names or large files alone do not justify consolidation or extraction.
+- During initial development, use the current schema and file formats. Do not
+  add schema versions, migrations, legacy adapters, or deprecated fields unless
+  the task explicitly requires supporting an existing deployed format. Earlier
+  development archives and test fixtures are not a compatibility requirement.
+- Keep progress in its owning component. Use the catalog's recorded paths and
+  completion state instead of reconstructing that state with directory scans or
+  maintaining a second set of checkpoint manifests.
 
 ## Data integrity and resource use
 
 - Add validation only for concrete workflow or archive-integrity requirements.
   Trust configuration and established internal contracts; let library operations
   reject invalid inputs instead of anticipating every possible failure.
+- Trust completed artifacts and metadata produced by this pipeline. Do not
+  repeatedly hash or revalidate immutable data, or add recovery for hypothetical
+  tampering or spontaneous changes. Validate external input and incomplete work
+  at their actual boundaries; explain the concrete failure a new check prevents.
 - Preserve source units, grid coordinates, UTC timestamps, interval semantics,
   and decoded numerical precision. Lossless compression does not justify a
   lossy conversion of numeric types.
@@ -90,6 +101,10 @@ layout.
   retention until successful publication.
 - Do not change tests merely to accept accidental coupling or lost guarantees.
   Do not add tests that only repeat implementation details.
+- Test observable workflow behavior and real failure boundaries. Do not invent
+  mutations of immutable internal data, invalid internal variables, or legacy
+  formats solely to justify defensive code. Remove tests for deliberately
+  removed compatibility behavior rather than preserving that behavior for tests.
 - Require evidence for debt and performance claims. Measure before and after
   changes to download, conversion, or archive-access performance.
 - Run relevant checks during development and all applicable required checks
