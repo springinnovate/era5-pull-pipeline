@@ -318,12 +318,11 @@ def test_multiple_sources_preserve_exact_coverage_and_origins(tmp_path: Path) ->
 def test_multiple_source_cleanup_resumes_after_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Keep published data readable and retry unfinished source cleanup."""
+    """Published revisions own pending cleanup without leaving reusable batches."""
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
         revision, _, batches, report, _ = _stage_multiple(db, archive)
-        recorded = [dict(row) for row in db.execute("SELECT * FROM staged_batches ORDER BY id")]
-        assert len(recorded) == len(batches)
+        assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == len(batches)
         remove = Path.unlink if failure == "grib" else catalog.shutil.rmtree
         failed_path = batches[1] / ("data.grib" if failure == "grib" else "converted.zarr")
 
@@ -340,9 +339,12 @@ def test_multiple_source_cleanup_resumes_after_failure(
                 patch.setattr(catalog.shutil, "rmtree", fail_second_source)
             with pytest.warns(RuntimeWarning, match="cleanup remains pending"):
                 catalog.publish_revision(db, archive, revision, report)
-            assert db.execute("SELECT grib_removed FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == 0
+            published = db.execute("SELECT * FROM revisions WHERE id = ?", (revision,)).fetchone()
+            assert published["status"] == "published"
+            assert published["grib_removed"] == 0
+            assert json.loads(published["batch_paths_json"]) == [str(batch.resolve()) for batch in batches]
             assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == revision
-            assert [dict(row) for row in db.execute("SELECT * FROM staged_batches ORDER BY id")] == recorded
+            assert db.execute("SELECT COUNT(*) FROM staged_batches").fetchone()[0] == 0
             assert not (batches[0] / "data.grib").exists()
             if failure == "converted_store":
                 assert all(not (batch / "data.grib").exists() for batch in batches)

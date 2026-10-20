@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS staged_batches (
     id TEXT PRIMARY KEY,
     year INTEGER NOT NULL,
     month INTEGER NOT NULL,
+    refresh INTEGER NOT NULL DEFAULT 0,
     request_json TEXT NOT NULL,
     batch_path TEXT UNIQUE NOT NULL,
     metadata_json TEXT,
@@ -186,6 +187,12 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                    SET current_revision_id = excluded.current_revision_id""",
                 (revision["year"], revision["month"], revision["id"]),
             )
+            # The published revision now owns cleanup, so these downloads must
+            # not be reused as unfinished work by another refresh.
+            db.executemany(
+                "DELETE FROM staged_batches WHERE batch_path = ?",
+                [(path,) for path in json.loads(revision["batch_paths_json"])],
+            )
 
     for revision in db.execute(
         "SELECT id, backup_path FROM revisions WHERE status = 'published' AND backup_path IS NOT NULL"
@@ -234,10 +241,6 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
             )
         else:
             with db:
-                db.executemany(
-                    "DELETE FROM staged_batches WHERE batch_path = ?",
-                    [(str(batch.resolve()),) for batch in batches],
-                )
                 db.execute(
                     "UPDATE revisions SET grib_removed = 1 WHERE id = ?", (revision["id"],)
                 )

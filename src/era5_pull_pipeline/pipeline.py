@@ -1,4 +1,4 @@
-"""Fill missing global ERA5 coverage through bounded batches and monthly publication."""
+"""Pull global ERA5 coverage through bounded batches and monthly publication."""
 
 from calendar import monthrange
 from collections.abc import Sequence
@@ -30,8 +30,10 @@ def pull_range(
     archive: Path,
     spatial_chunks: tuple[int, int] = (32, 32),
     batch_days: int = DEFAULT_MAX_DAYS,
+    *,
+    refresh: bool = False,
 ) -> dict[str, int]:
-    """Fill an inclusive date range, resuming batches and publishing each month once.
+    """Fill or refresh a date range, resuming batches and publishing each month once.
 
     Counts describe variable/hour pairs: completed fields were published by this
     run, skipped fields were already stored, unavailable fields were absent from
@@ -46,12 +48,15 @@ def pull_range(
         archive: Archive directory containing monthly stores and catalog.sqlite.
         spatial_chunks: Latitude and longitude cells per read chunk.
         batch_days: Maximum calendar days per batch, also subject to CDS limits.
+        refresh: Retrieve all selected fields and replace stored overlaps. Each
+            month's full selection must be available before its refresh starts.
 
     Returns:
         Counts for completed, skipped, unavailable, failed, and pending fields.
 
     Raises:
-        ValueError: The selection or staged/archive integrity is inconsistent.
+        ValueError: The selection or staged/archive integrity is inconsistent,
+            or selected refresh fields are unavailable from CDS.
         Exception: Source, conversion, and publication errors propagate after
             reporting progress. Unpublished downloads and checkpoints remain.
     """
@@ -77,7 +82,9 @@ def pull_range(
                 last = min(end, date(cursor.year, cursor.month, monthrange(cursor.year, cursor.month)[1]))
                 label = f"{cursor.year:04d}-{cursor.month:02d}"
                 activity = f"planning {label}"
-                requests, skipped, _ = month_requests(db, cursor, last, variables, batch_days)
+                requests, skipped, _ = month_requests(
+                    db, cursor, last, variables, batch_days, refresh=refresh,
+                )
                 summary["skipped"] += skipped
                 summary["pending"] -= skipped
                 if requests:
@@ -85,13 +92,19 @@ def pull_range(
                         print("Reading CDS field availability.", flush=True)
                         availability = load_availability()
                     requests, _, unavailable = month_requests(
-                        db, cursor, last, variables, batch_days, availability
+                        db, cursor, last, variables, batch_days, availability, refresh=refresh,
                     )
                     summary["unavailable"] += unavailable
                     summary["pending"] -= unavailable
+                    if refresh and unavailable:
+                        raise ValueError(
+                            f"Cannot refresh {label}: {unavailable} selected variable-hours "
+                            "are unavailable from CDS. This month is unchanged; "
+                            "select an available interval or retry later."
+                        )
                 else:
                     unavailable = 0
-                work = prepare_batches(db, archive, requests)
+                work = prepare_batches(db, archive, requests, refresh=refresh)
                 print(
                     f"{label}: {len(work)} batches; {skipped} stored and "
                     f"{unavailable} unavailable variable-hours.", flush=True,
@@ -150,6 +163,7 @@ def pull_range(
                         checkpoints, metadata, staged, spatial_chunks,
                         previous=previous[0] if previous else None,
                         previous_report=previous[1] if previous else None,
+                        refresh=refresh,
                     )
                     published = publish_revision(db, archive, revision, report)
                     summary["completed"] += month_fields

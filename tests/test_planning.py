@@ -94,21 +94,24 @@ def _fields(requests: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
 
 
 @pytest.mark.parametrize("year", [1950, 2000])
+@pytest.mark.parametrize("refresh", [False, True])
 def test_month_plan_splits_day_windows_and_counts_stored_hours(
-    catalog: sqlite3.Connection, year: int
+    catalog: sqlite3.Connection, year: int, refresh: bool,
 ) -> None:
-    """Split a whole month while excluding actual published request coverage."""
+    """Split a whole month and include stored coverage only for a refresh."""
     stored = cds.build_batch_request(date(year, 2, 1), date(year, 2, 2), ["2m_temperature"])
     catalog.execute("INSERT INTO revisions VALUES (?, 2, 'published', ?)", (year, json.dumps({"request": stored})))
     last_day = 29 if year == 2000 else 28
     requests, skipped, unavailable = planning.month_requests(
-        catalog, date(year, 2, 1), date(year, 2, last_day), ["2m_temperature"], max_days=7
+        catalog, date(year, 2, 1), date(year, 2, last_day), ["2m_temperature"],
+        max_days=7, refresh=refresh,
     )
     fields = _fields(requests)
-    assert len(fields) == len(set(fields)) == (last_day - 2) * 24
-    assert skipped == 48
+    first_day = 1 if refresh else 3
+    assert len(fields) == len(set(fields)) == (last_day - first_day + 1) * 24
+    assert skipped == (0 if refresh else 48)
     assert unavailable == 0
-    assert {day for _, day, _ in fields} == {f"{day:02d}" for day in range(3, last_day + 1)}
+    assert {day for _, day, _ in fields} == {f"{day:02d}" for day in range(first_day, last_day + 1)}
     assert all(max(map(int, request["day"])) - min(map(int, request["day"])) < 7 for request in requests)
     assert all(request["grid"] == [0.25, 0.25] and "area" not in request for request in requests)
 
@@ -137,8 +140,29 @@ def test_availability_intersects_cubes_without_cross_products(
     assert unavailable == 144 - 27
 
 
-def test_stored_hours_are_not_counted_as_unavailable(catalog: sqlite3.Connection) -> None:
-    """Already published fields remain completed even when availability changes."""
+def test_refresh_selects_only_requested_dates_and_variables(catalog: sqlite3.Connection) -> None:
+    """Refreshing a subset does not redownload the rest of a published month."""
+    stored = cds.build_batch_request(
+        date(2000, 1, 1), date(2000, 1, 3), ["2m_temperature", "total_precipitation"],
+    )
+    catalog.execute(
+        "INSERT INTO revisions VALUES (2000, 1, 'published', ?)",
+        (json.dumps({"request": stored}),),
+    )
+    requests, skipped, unavailable = planning.month_requests(
+        catalog, date(2000, 1, 2), date(2000, 1, 2), ["2m_temperature"], refresh=True,
+    )
+    assert _fields(requests) == [
+        ("2m_temperature", "02", f"{hour:02d}:00") for hour in range(24)
+    ]
+    assert (skipped, unavailable) == (0, 0)
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_provider_availability_for_stored_hours(
+    catalog: sqlite3.Connection, refresh: bool,
+) -> None:
+    """Refresh needs provider availability even for already published fields."""
     request = cds.build_batch_request(date(1950, 1, 1), date(1950, 1, 1), ["2m_temperature"])
     catalog.execute("INSERT INTO revisions VALUES (1950, 1, 'published', ?)", (json.dumps({"request": request}),))
     availability = [{
@@ -147,9 +171,10 @@ def test_stored_hours_are_not_counted_as_unavailable(catalog: sqlite3.Connection
     }]
     requests, skipped, unavailable = planning.month_requests(
         catalog, date(1950, 1, 1), date(1950, 1, 2), ["2m_temperature"], availability=availability,
+        refresh=refresh,
     )
     assert _fields(requests) == [("2m_temperature", "02", "00:00")]
-    assert (skipped, unavailable) == (24, 23)
+    assert (skipped, unavailable) == ((0, 47) if refresh else (24, 23))
     assert planning.month_requests(catalog, date(1950, 1, 1), date(1950, 1, 1), ["2m_temperature"]) == ([], 24, 0)
 
 
@@ -167,14 +192,16 @@ def test_unknown_provider_variable_is_not_treated_as_unavailable(catalog: sqlite
 
 
 @pytest.mark.parametrize("field_limit", [48, 120_000])
+@pytest.mark.parametrize("refresh", [False, True])
 def test_month_plan_splits_fields_before_batch_validation(
-    catalog: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, field_limit: int
+    catalog: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, field_limit: int,
+    refresh: bool,
 ) -> None:
     """Partition oversized variable selections instead of rejecting the month."""
     monkeypatch.setattr(cds, "MAX_REQUEST_FIELDS", field_limit)
     names = [f"provider_variable_{index}" for index in range(field_limit // 24 + 1)]
     requests, skipped, unavailable = planning.month_requests(
-        catalog, date(2000, 1, 1), date(2000, 1, 2), names, max_days=2,
+        catalog, date(2000, 1, 1), date(2000, 1, 2), names, max_days=2, refresh=refresh,
     )
     actual = _fields(requests)
     assert len(actual) == len(set(actual)) == len(names) * 48

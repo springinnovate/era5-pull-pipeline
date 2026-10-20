@@ -14,14 +14,16 @@ from era5_pull_pipeline.planning import subtract_requests
 
 
 def prepare_batches(
-    db: sqlite3.Connection, archive: Path, requests: Sequence[dict[str, Any]]
+    db: sqlite3.Connection, archive: Path, requests: Sequence[dict[str, Any]],
+    *, refresh: bool = False,
 ) -> list[sqlite3.Row]:
     """Reuse cataloged selections and register new batch paths before downloading.
 
     Args:
         db: Catalog connection protected by the archive writer lock.
         archive: Archive owning the staged batches.
-        requests: Available missing selections for one calendar month.
+        requests: Available selections for one calendar month.
+        refresh: Reuse only refresh batches, keeping catch-up work separate.
 
     Returns:
         Catalog rows covering the selection exactly once. Existing requests can
@@ -43,8 +45,8 @@ def prepare_batches(
     batches = []
     selected = []
     for batch in db.execute(
-        "SELECT * FROM staged_batches WHERE year = ? AND month = ? ORDER BY rowid",
-        (year, month),
+        "SELECT * FROM staged_batches WHERE year = ? AND month = ? AND refresh = ? ORDER BY rowid",
+        (year, month, refresh),
     ):
         request = json.loads(batch["request_json"])
         fields = {
@@ -62,8 +64,9 @@ def prepare_batches(
             identifier = uuid4().hex
             path = archive / "staging" / "batches" / f"{year:04d}-{month:02d}" / identifier
             db.execute(
-                "INSERT INTO staged_batches (id, year, month, request_json, batch_path) VALUES (?, ?, ?, ?, ?)",
-                (identifier, year, month, json.dumps(request), str(path.resolve())),
+                "INSERT INTO staged_batches (id, year, month, refresh, request_json, batch_path) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (identifier, year, month, refresh, json.dumps(request), str(path.resolve())),
             )
             batches.append(db.execute(
                 "SELECT * FROM staged_batches WHERE id = ?", (identifier,)
