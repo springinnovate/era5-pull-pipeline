@@ -59,7 +59,7 @@ The installed `era5-pull check-access` command provides the same check. Use `--h
 Run the automated tests from the repository directory:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -q --basetemp .pytest_cache/manual-check
 ```
 
 The tests use local fixtures and simulated service responses. They do not need credentials or contact CDS; `check-access` is the explicit live test.
