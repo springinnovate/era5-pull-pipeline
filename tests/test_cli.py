@@ -6,23 +6,22 @@ from unittest.mock import Mock
 import pytest
 
 from era5_pull_pipeline import cli
-from era5_pull_pipeline.cds import AccessCheckError
 
 
-def test_missing_credentials_are_actionable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_missing_credentials_raise_before_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Report missing local credentials without attempting a request."""
+    """Let the missing-file error identify the local configuration path."""
     monkeypatch.chdir(tmp_path)
     check = Mock()
     monkeypatch.setattr(cli, "check_access", check)
-    assert cli.main(["check-access"]) == 1
+    with pytest.raises(FileNotFoundError, match=".cdsapirc"):
+        cli.main(["check-access"])
     check.assert_not_called()
-    assert "Create .cdsapirc" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("outcome", [32, AccessCheckError("CDS denied access."), KeyboardInterrupt()])
-def test_cli_reports_success_failure_and_interruption(
+@pytest.mark.parametrize("outcome", [32, KeyboardInterrupt()])
+def test_cli_reports_success_and_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -45,8 +44,24 @@ def test_cli_reports_success_failure_and_interruption(
         assert "CDS access verified" in output.out
         assert "Saved GRIB to probe.grib" in output.out
     else:
-        assert code == (130 if isinstance(outcome, KeyboardInterrupt) else 1)
+        assert code == 130
         assert "CDS access verified" not in output.out
+
+
+def test_service_errors_retain_original_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Keep service failures available for diagnosis without reporting success."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".cdsapirc").write_text(
+        "url: https://example.test/api\nkey: test-token\n", encoding="utf-8"
+    )
+    failure = RuntimeError("CDS job failed with provider details")
+    monkeypatch.setattr(cli, "check_access", Mock(side_effect=failure))
+    with pytest.raises(RuntimeError) as caught:
+        cli.main(["check-access"])
+    assert caught.value is failure
+    assert "CDS access verified" not in capsys.readouterr().out
 
 
 def test_cli_rejects_geographic_selection() -> None:

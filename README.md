@@ -8,10 +8,10 @@ Use Python 3.11 or newer. From the repository directory, create a virtual enviro
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[test]"
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-These commands use PowerShell on Windows. On macOS or Linux, use `.venv/bin/python` in place of `.\.venv\Scripts\python.exe`. The `test` extra includes the offline test suite's dependencies.
+These commands use PowerShell on Windows. On macOS or Linux, use `.venv/bin/python` in place of `.\.venv\Scripts\python.exe`.
 
 ## Inputs
 
@@ -44,9 +44,9 @@ From the directory containing `.cdsapirc`, run:
 
 The check downloads one full global field of 2 m temperature for **2000-01-01 at 00:00 UTC** to `downloads/era5-access-check.grib` and decodes it with xarray's cfgrib reader. Success prints `CDS access verified` and the saved path. The probe file stays separate from the monthly archive.
 
-CDS may queue the request. Press Ctrl+C to stop waiting locally. Errors identify credential, dataset-access, connection, or file problems without displaying the token.
+CDS may queue the request. Press Ctrl+C to stop waiting locally. Connection settings are passed directly to CDS; file, service, and decoding failures show their original errors.
 
-Choose a new path with `--output` when repeating a check; existing files are preserved:
+Repeat the same command to check access again; it replaces the probe file. Use `--output` to choose a different location:
 
 ```powershell
 .\.venv\Scripts\python.exe -m era5_pull_pipeline check-access --output downloads/check-2.grib
@@ -56,9 +56,10 @@ The installed `era5-pull check-access` command provides the same check. Use `--h
 
 ## Tests
 
-Run the automated tests from the repository directory:
+Install the optional test dependencies and run the automated tests from the repository directory:
 
 ```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
 .\.venv\Scripts\python.exe -m pytest -q --basetemp .pytest_cache/manual-check
 ```
 

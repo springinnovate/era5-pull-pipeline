@@ -7,10 +7,7 @@ import traceback
 import pytest
 import yaml
 
-from era5_pull_pipeline.credentials import (
-    CredentialError,
-    load_credentials,
-)
+from era5_pull_pipeline.credentials import load_credentials
 
 
 def test_load_quoted_yaml_with_comments(tmp_path: Path) -> None:
@@ -89,7 +86,7 @@ def test_yaml_errors_do_not_disclose_content(tmp_path: Path) -> None:
         "url: https://example.test/api\nkey: [secret-test-token\n", encoding="utf-8"
     )
 
-    with pytest.raises(CredentialError, match="Cannot parse") as caught:
+    with pytest.raises(ValueError, match="Cannot parse") as caught:
         load_credentials(path)
 
     assert "secret-test-token" not in "".join(

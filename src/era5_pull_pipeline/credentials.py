@@ -6,10 +6,6 @@ from pathlib import Path
 import yaml
 
 
-class CredentialError(ValueError):
-    """Report malformed credential YAML without exposing its contents."""
-
-
 @dataclass(frozen=True)
 class CdsCredentials:
     """Hold connection details without displaying the access token.
@@ -36,7 +32,7 @@ def load_credentials(path: Path | None = None) -> CdsCredentials:
     Raises:
         OSError: If the file cannot be read.
         UnicodeDecodeError: If the file is not UTF-8 text.
-        CredentialError: If the file contains malformed YAML.
+        ValueError: If the file contains malformed YAML.
         KeyError: If a required field is missing.
         TypeError: If the YAML is not a mapping.
     """
@@ -46,5 +42,5 @@ def load_credentials(path: Path | None = None) -> CdsCredentials:
         config = yaml.safe_load(contents)
     except yaml.YAMLError:
         # Parser errors include source lines, which can contain the access token.
-        raise CredentialError("Cannot parse .cdsapirc as YAML.") from None
+        raise ValueError("Cannot parse .cdsapirc as YAML.") from None
     return CdsCredentials(url=config["url"], key=config["key"])

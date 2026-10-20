@@ -5,19 +5,22 @@ from collections.abc import Sequence
 from pathlib import Path
 import sys
 
-from era5_pull_pipeline.cds import AccessCheckError, check_access
-from era5_pull_pipeline.credentials import CredentialError, load_credentials
+from era5_pull_pipeline.cds import check_access
+from era5_pull_pipeline.credentials import load_credentials
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the requested command and report a credential-free result.
+    """Run the requested command.
 
     Args:
         argv: Command-line arguments, or None to use the process arguments.
 
     Returns:
-        Zero on success, one on failure, or 130 on interruption. Argument
-        parsing exits with status two when arguments are invalid.
+        Zero on success or 130 on interruption.
+        Argument parsing exits with status two when arguments are invalid.
+
+    Raises:
+        Exception: File, configuration, CDS, or decoding errors propagate.
     """
     parser = argparse.ArgumentParser(prog="era5-pull", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -33,16 +36,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--output",
         type=Path,
         default=Path("downloads/era5-access-check.grib"),
-        help="New GRIB path (default: downloads/era5-access-check.grib).",
+        help="GRIB path, overwritten on each check (default: downloads/era5-access-check.grib).",
     )
     args = parser.parse_args(argv)
     try:
         credentials = load_credentials()
         print("Requesting one global ERA5 field. CDS may queue the request; Ctrl+C stops waiting.", flush=True)
         size = check_access(credentials, args.output)
-    except (CredentialError, AccessCheckError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
     except KeyboardInterrupt:
         print("Access check interrupted. No successful download was reported.", file=sys.stderr)
         return 130
