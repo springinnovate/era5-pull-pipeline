@@ -72,7 +72,7 @@ def _stage_month(
         }],
     }
     revision, stage = catalog.prepare_revision(
-        db, archive, [], metadata, year=start.year, month=start.month,
+        db, archive, metadata, year=start.year, month=start.month,
     )
     group = zarr.open_group(stage, mode="w", zarr_format=3)
     group.attrs["provenance"] = metadata
@@ -118,6 +118,7 @@ def test_shared_forecast_source_survives_until_both_months_publish(tmp_path: Pat
         repeated = catalog.register_sources(db, archive, [source], start.date(), end.date())[0]
         assert repeated["id"] == row["id"]
         assert repeated["downloaded_at"] is None
+        assert repeated["removed_at"] is None
 
 
 def test_publishing_middle_selection_retains_both_unpublished_sides(tmp_path: Path) -> None:

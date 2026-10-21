@@ -23,7 +23,7 @@ layout.
 
 ## Ownership and dependencies
 
-- Keep orchestration, credentials, CDS requests, GRIB conversion, Zarr storage,
+- Keep orchestration, NCAR inventory and downloads, NetCDF conversion, Zarr storage,
   and catalog state as clear responsibilities. Use functions and modules where
   sufficient; this list does not require a service or framework for each one.
 - Orchestration coordinates the workflow. Storage and catalog publication use
@@ -59,13 +59,13 @@ layout.
   interrupted publication recoverable. SQLite transactions do not make changes
   to Zarr files atomic.
 - Track completion by variable, hour, and source selection. Record completion
-  only after validated data are durably published. Remove corresponding GRIB
+  only after validated data are durably published. Remove corresponding NetCDF
   downloads only after publication and catalog recording succeed.
 - Use mature libraries to decode data formats instead of implementing custom
   format checks. Check the archive invariants needed for publication; avoid
   rescanning or rehashing the entire archive without a demonstrated requirement.
-- Process large date ranges through bounded batches. Control per-batch memory,
-  temporary storage, concurrency, and retries; respect CDS request limits.
+- Process large date ranges one month at a time. Bound concurrent NCAR file
+  transfers, retained source bytes, conversion memory, and temporary storage.
   Use retries with backoff and preserve recoverable progress on interruption.
 - Keep credentials out of Git, logs, and archive metadata. Use placeholders in
   examples and check staged files for accidental credential inclusion.
@@ -107,7 +107,7 @@ layout.
 
 - Test changed behavior in its owning component and interactions at real
   boundaries. Cover relevant failure cases: interrupted downloads, missing
-  coverage, repeat runs, monthly replacement, publication failure, and GRIB
+  coverage, repeat runs, monthly replacement, publication failure, and NetCDF
   retention until successful publication.
 - Do not change tests merely to accept accidental coupling or lost guarantees.
   Do not add tests that only repeat implementation details.
