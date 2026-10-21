@@ -142,7 +142,7 @@ def test_temperature_precipitation_roundtrip_and_layout(
     assert report["variables"]["2_metre_temperature"]["name"] == "2 metre temperature"
     assert report["variables"]["total_precipitation"]["units"] == "m"
     assert report["variables"]["total_precipitation"]["paramId"] == 228
-    assert report["validation"]["request_variable_validation"] == "distinct_parameter_count_and_complete_hours"
+    assert report["validation"]["request_variable_validation"] == "decoded_source_coverage"
     midnight = int(datetime(2000, 1, 1, tzinfo=UTC).timestamp())
     rain = next(field for field in report["fields"] if field["variable"] == "total_precipitation")
     assert rain == {

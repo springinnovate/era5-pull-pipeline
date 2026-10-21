@@ -158,7 +158,9 @@ def pull_range(
                         "sources": sources,
                     }
                     previous = current_month(db, archive, cursor.year, cursor.month)
-                    revision, staged = prepare_revision(db, archive, batches, metadata)
+                    revision, staged = prepare_revision(
+                        db, archive, batches, metadata, year=cursor.year, month=cursor.month,
+                    )
                     report = assemble_month(
                         checkpoints, metadata, staged, spatial_chunks,
                         previous=previous[0] if previous else None,
@@ -277,7 +279,7 @@ def _publish_batch(
     if not missing_requests(db, request):
         return previous[0]
     grib = batch / "data.grib"
-    revision, staged = prepare_revision(db, archive, [batch], metadata)
+    revision, staged = prepare_revision(db, archive, [batch], metadata, year=year, month=month)
     report = convert_batch(
         grib, metadata, staged, spatial_chunks,
         previous=previous[0] if previous else None,
