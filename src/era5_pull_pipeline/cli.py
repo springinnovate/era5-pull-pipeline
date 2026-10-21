@@ -1,4 +1,4 @@
-"""Download and archive global ERA5 date ranges or check CDS access."""
+"""Download global ERA5 source files and maintain a monthly archive."""
 
 import argparse
 from collections.abc import Sequence
@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from era5_pull_pipeline.cds import DEFAULT_MAX_DAYS, build_batch_request, check_access, download_batch
 from era5_pull_pipeline.credentials import load_credentials
+from era5_pull_pipeline.ncar_download import download_ncar
 from era5_pull_pipeline.pipeline import ingest_batch, pull_batch, pull_range
 
 
@@ -27,6 +28,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(prog="era5-pull", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    ncar = commands.add_parser(
+        "download-ncar",
+        help="Download NCAR's public NetCDF source files without credentials.",
+        description=(
+            "Download whole global NetCDF files covering an inclusive UTC date range. "
+            "NCAR packages analysis by variable-month and forecasts in roughly half-month files. "
+            "Retain sources in staging and record the selection in SQLite; this command does not create Zarr."
+        ),
+    )
+    ncar.add_argument("--start-date", type=date.fromisoformat, required=True, metavar="YYYY-MM-DD")
+    ncar.add_argument("--end-date", type=date.fromisoformat, required=True, metavar="YYYY-MM-DD")
+    ncar.add_argument(
+        "--variables", nargs="+", required=True, metavar="NAME",
+        help="NCAR short names from its inventory, for example: 2t 2d 10u 10v sp ssrd strd mtpr.",
+    )
+    ncar.add_argument("--archive", type=Path, default=Path("archive"), help="Catalog and source staging directory.")
+    ncar.add_argument(
+        "--dry-run", action="store_true",
+        help="List selected source files and byte sizes without downloading or creating local state.",
+    )
     access = commands.add_parser(
         "check-access",
         help="Retrieve one global ERA5 field using the working directory's .cdsapirc.",
@@ -108,7 +129,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     args = parser.parse_args(argv)
     try:
-        if args.command == "check-access":
+        if args.command == "download-ncar":
+            download_ncar(
+                args.start_date, args.end_date, args.variables, args.archive, dry_run=args.dry_run,
+            )
+        elif args.command == "check-access":
             credentials = load_credentials()
             print("Requesting one global ERA5 field. CDS may queue the request; Ctrl+C stops waiting.", flush=True)
             size = check_access(credentials, args.output)
@@ -149,6 +174,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             published = ingest_batch(args.batch, args.archive, tuple(args.spatial_chunks))
             print(f"Published data available at {published}.")
     except KeyboardInterrupt:
-        print("Operation interrupted. Run it again to recover any pending publication.", file=sys.stderr)
+        print("Operation interrupted. Run the same command again to resume unfinished work.", file=sys.stderr)
         return 130
     return 0

@@ -26,13 +26,55 @@ Each run accepts:
 | Spatial chunk shape | How many grid cells along latitude and longitude to store in each chunk. |
 | Refresh | Retrieve the selected fields again and replace their stored values. |
 
-## Credentials
+## CDS credentials
 
 Access uses a Copernicus Climate Data Store (CDS) account, a personal access token from your [CDS profile](https://cds.climate.copernicus.eu/profile), and acceptance of the [ERA5 dataset's licence](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download). Place a `.cdsapirc` file in the directory from which you run the pipeline:
 
 ```yaml
 url: https://cds.climate.copernicus.eu/api
 key: YOUR_PERSONAL_ACCESS_TOKEN
+```
+
+## Download NCAR source files
+
+`download-ncar` retrieves full global hourly ERA5 NetCDF files from [NCAR's public archive](https://registry.opendata.aws/nsf-ncar-era5/). It needs no CDS token or AWS account. NCAR updates monthly with roughly a 3–4 month delay; availability differs by variable.
+
+Preview the files and total download size for a date range:
+
+```powershell
+python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 2000-01-31 --variables 2t --archive downloads/manual-ncar-23 --dry-run
+```
+
+The preview reads NCAR's inventory and creates no local files. Remove `--dry-run` to download:
+
+```powershell
+python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 2000-01-31 --variables 2t --archive downloads/manual-ncar-23
+```
+
+Run these commands with the Python environment where you installed the package. The January 2000 temperature selection downloads one file of **1,131,152,166 bytes** (about 1.05 GiB). NCAR packages analysis fields as one variable per month and radiation/precipitation fields in roughly half-month files. Selecting a single day still downloads the whole source file. The date range records which hours are selected for ingestion; downloading extra hours does not mark them as published coverage.
+
+Use NCAR's short variable names, which are read directly from its file inventory:
+
+| Name | Variable |
+| --- | --- |
+| `2t` | 2 metre temperature |
+| `2d` | 2 metre dewpoint temperature |
+| `10u`, `10v` | 10 metre wind components |
+| `sp` | Surface pressure |
+| `ssrd`, `strd` | Downward surface solar and thermal radiation |
+| `ssr`, `str` | Net surface solar and thermal radiation |
+| `mtpr` | Mean total precipitation rate |
+
+For example, preview temperature, radiation, and precipitation together with `--variables 2t ssrd mtpr`. Forecast source files can span calendar months, so the selection includes the preceding month's file when it supplies requested valid hours. `mtpr` is the average rate over the preceding hour in kg/m²/s; multiplying by 3,600 gives that hour's water-equivalent precipitation in mm. Source values and units remain in the downloaded NetCDF files.
+
+Downloads run one file at a time and show byte progress, transfer rate, elapsed time, and a transfer-time estimate. Press Ctrl+C to stop, then run the same command to resume at the saved byte position. The downloader makes up to three attempts for transient transfer failures, with backoff. Each request is tied to the discovered source identity so a partial file cannot be combined with a different source revision. Completed downloads are reused without reopening or revalidating them; each invocation still reads NCAR's inventory.
+
+The command retains NetCDF files under `staging/ncar/<source-id>/` inside the chosen archive. SQLite records their paths, source identities, selected hours, and download completion. These staged files can be incomplete until the catalog records completion. The command downloads sources only; it creates no Zarr stores. The `pull` commands below use CDS and GRIB.
+
+Repeat the download command to see `Reusing completed source`. Inspect the recorded file sizes and completion state with:
+
+```powershell
+python -c "import sqlite3; db=sqlite3.connect('downloads/manual-ncar-23/catalog.sqlite'); print(*db.execute('SELECT variable, size, downloaded_at, path FROM source_files'), sep='\n'); db.close()"
 ```
 
 ## Check access
@@ -104,7 +146,7 @@ Install the optional test dependencies and run the automated tests from the repo
 .\.venv\Scripts\python.exe -m pytest -q --basetemp .pytest_cache/manual-check
 ```
 
-The tests use local fixtures and simulated service responses. They do not need credentials or contact CDS. `check-access` and `pull` contact the live service when a download is needed.
+The tests use local fixtures and simulated service responses, including a local HTTP server for interrupted transfers. They need no credentials or external network access. `download-ncar` reads NCAR's live inventory; `check-access` and `pull` contact CDS when a download is needed.
 
 ## Data
 

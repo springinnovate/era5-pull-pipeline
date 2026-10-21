@@ -9,6 +9,39 @@ import pytest
 from era5_pull_pipeline import cli
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_ncar_command_without_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool,
+) -> None:
+    """Expose anonymous source selection and inventory preview from the CLI."""
+    monkeypatch.chdir(tmp_path)
+    download = Mock(return_value=[])
+    monkeypatch.setattr(cli, "download_ncar", download)
+    args = [
+        "download-ncar", "--start-date", "1950-01-01", "--end-date", "1950-01-31",
+        "--variables", "2t", "ssrd", "mtpr", "--archive", "ncar-archive",
+    ]
+    if dry_run:
+        args.append("--dry-run")
+    assert cli.main(args) == 0
+    download.assert_called_once_with(
+        date(1950, 1, 1), date(1950, 1, 31), ["2t", "ssrd", "mtpr"],
+        Path("ncar-archive"), dry_run=dry_run,
+    )
+
+
+def test_ncar_interruption_explains_resume(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep a stopped download resumable through the same user command."""
+    monkeypatch.setattr(cli, "download_ncar", Mock(side_effect=KeyboardInterrupt))
+    assert cli.main([
+        "download-ncar", "--start-date", "2000-01-01", "--end-date", "2000-01-01",
+        "--variables", "2t",
+    ]) == 130
+    assert "Run the same command again" in capsys.readouterr().err
+
+
 def test_missing_credentials_raise_before_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

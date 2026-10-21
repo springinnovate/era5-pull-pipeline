@@ -2,7 +2,7 @@
 
 from collections.abc import Iterator, Sequence
 from contextlib import closing, contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 import json
 import os
 from pathlib import Path
@@ -16,10 +16,32 @@ import portalocker
 import xarray as xr
 import zarr
 
+from era5_pull_pipeline.ncar import SourceFile
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS source_files (
+    id TEXT PRIMARY KEY,
+    object_key TEXT NOT NULL,
+    variable TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    etag TEXT NOT NULL,
+    last_modified TEXT NOT NULL,
+    valid_start TEXT NOT NULL,
+    valid_end TEXT NOT NULL,
+    path TEXT UNIQUE NOT NULL,
+    created_at TEXT NOT NULL,
+    downloaded_at TEXT,
+    UNIQUE (object_key, etag)
+);
+CREATE TABLE IF NOT EXISTS source_selections (
+    source_id TEXT NOT NULL REFERENCES source_files(id),
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    PRIMARY KEY (source_id, start_time, end_time)
 );
 CREATE TABLE IF NOT EXISTS staged_batches (
     id TEXT PRIMARY KEY,
@@ -272,6 +294,73 @@ def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
                 db.executescript(SCHEMA)
                 _recover_publications(db, archive)
             yield db
+
+
+def register_sources(
+    db: sqlite3.Connection,
+    archive: Path,
+    sources: Sequence[SourceFile],
+    start: date,
+    end: date,
+) -> list[sqlite3.Row]:
+    """Register source files and selected hours before starting downloads.
+
+    The object key and ETag identify a source revision. Repeated selections
+    reuse its recorded path and completion state without inspecting the file.
+    Selected hours remain separate from the additional hours packaged by NCAR.
+
+    Args:
+        db: Catalog connection protected by the archive writer lock.
+        archive: Archive owning the staged source files.
+        sources: Discovered source files overlapping the requested dates.
+        start: First selected UTC date, inclusive.
+        end: Last selected UTC date, inclusive.
+
+    Returns:
+        Source catalog rows in discovery order, including download completion.
+
+    Raises:
+        sqlite3.Error: Reading or recording source files fails.
+    """
+    selected_start = datetime.combine(start, time.min, tzinfo=UTC)
+    selected_end = datetime.combine(end, time(23), tzinfo=UTC)
+    rows = []
+    with db:
+        for source in sources:
+            row = db.execute(
+                "SELECT * FROM source_files WHERE object_key = ? AND etag = ?",
+                (source.key, source.etag),
+            ).fetchone()
+            if row is None:
+                identifier = uuid4().hex
+                path = archive / "staging" / "ncar" / identifier / Path(source.key).name
+                db.execute(
+                    """INSERT INTO source_files
+                       (id, object_key, variable, size, etag, last_modified,
+                        valid_start, valid_end, path, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        identifier, source.key, source.variable, source.size,
+                        source.etag, source.last_modified,
+                        source.valid_start.astimezone(UTC).isoformat(),
+                        source.valid_end.astimezone(UTC).isoformat(),
+                        str(path.absolute()), datetime.now(UTC).isoformat(),
+                    ),
+                )
+                row = db.execute(
+                    "SELECT * FROM source_files WHERE id = ?", (identifier,)
+                ).fetchone()
+            db.execute(
+                """INSERT OR IGNORE INTO source_selections
+                   (source_id, start_time, end_time) VALUES (?, ?, ?)""",
+                (
+                    row["id"],
+                    max(selected_start, source.valid_start).astimezone(UTC).isoformat(),
+                    min(selected_end, source.valid_end).astimezone(UTC).isoformat(),
+                ),
+            )
+            rows.append(row)
+    return rows
 
 
 def current_month(
