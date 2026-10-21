@@ -1,4 +1,4 @@
-"""Decode GRIB batches and assemble validated, unpublished monthly Zarr stores."""
+"""Decode GRIB batches and assemble validated monthly Zarr stores from source arrays."""
 
 from calendar import monthrange
 from collections.abc import Sequence
@@ -168,11 +168,11 @@ def _decode_grib(
 
 def _merged_shard(
     sources: list[
-        tuple[NDArray[np.float64] | zarr.Array, NDArray[np.intp], NDArray[np.intp]]
+        tuple[NDArray[Any] | zarr.Array, NDArray[np.intp], NDArray[np.intp]]
     ],
     selection: tuple[slice, slice, slice],
     time_count: int,
-) -> NDArray[np.float64]:
+) -> NDArray[Any]:
     """Assemble one spatial shard from explicitly covered source hours.
 
     Args:
@@ -182,13 +182,13 @@ def _merged_shard(
         time_count: Length of the merged monthly time axis.
 
     Returns:
-        Float64 values with NaN only where a field or source cell is missing.
+        Source-precision values with NaN where a field or source cell is missing.
     """
     _, latitude, longitude = selection
     merged = np.full(
         (time_count, latitude.stop - latitude.start, longitude.stop - longitude.start),
         np.nan,
-        dtype=np.float64,
+        dtype=np.result_type(*(source.dtype for source, _, _ in sources)),
     )
     for source, source_indices, destination_indices in sources:
         if isinstance(source, zarr.Array):
@@ -257,7 +257,7 @@ def convert_batch(
                     for field in fields
                 ],
             }
-            return _write_month(
+            return write_monthly_zarr(
                 [(arrays, report)], metadata, output, spatial_chunks,
                 previous=previous, previous_report=previous_report,
             )
@@ -303,14 +303,14 @@ def assemble_month(
             {variable: group[variable] for variable in report["variables"]},
             report,
         ))
-    return _write_month(
+    return write_monthly_zarr(
         incoming, metadata, output, spatial_chunks,
         previous=previous, previous_report=previous_report, refresh=refresh,
     )
 
 
-def _write_month(
-    incoming: Sequence[tuple[dict[str, NDArray[np.float64] | zarr.Array], dict[str, Any]]],
+def write_monthly_zarr(
+    incoming: Sequence[tuple[dict[str, NDArray[Any] | zarr.Array], dict[str, Any]]],
     metadata: dict[str, Any],
     output: Path,
     spatial_chunks: tuple[int, int],
@@ -319,7 +319,11 @@ def _write_month(
     previous_report: dict[str, Any] | None,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Merge source coverage, write each spatial shard, and validate reopened data.
+    """Write and validate a monthly Zarr store from source arrays.
+
+    Combine incoming arrays with the existing store for the same month, keeping
+    existing values unless refresh is requested. Write one spatial shard at a
+    time, then reopen the store to compare its values and metadata with the inputs.
 
     Args:
         incoming: Source arrays and validated reports for one calendar month.
@@ -362,7 +366,6 @@ def _write_month(
         source_provenance = list(prior.attrs["source_provenance"])
     source_provenance.extend(metadata.get("sources", [metadata]))
     variables: dict[str, Any] = {}
-    parameter_names: dict[int, str] = {}
     merged_fields: dict[tuple[str, int], dict[str, Any]] = {}
     incoming_fields: set[tuple[str, int]] = set()
     pending_sources = []
@@ -372,13 +375,9 @@ def _write_month(
             raise ValueError("Monthly sources must share the same calendar month and grid.")
         source_times = np.array(sorted({field["valid_time"] for field in report["fields"]}), dtype=np.int64)
         for variable, attributes in report["variables"].items():
-            matching = parameter_names.get(attributes["paramId"])
-            if matching is not None and variables[matching] != attributes:
+            if variable in variables and variables[variable] != attributes:
                 raise ValueError(f"{variable} has different metadata between monthly sources.")
-            if variable in variables and variables[variable]["paramId"] != attributes["paramId"]:
-                raise ValueError(f"Different parameters share the array name {variable}.")
             variables[variable] = attributes
-            parameter_names[attributes["paramId"]] = variable
         selected = {variable: set() for variable in arrays}
         for field in report["fields"]:
             variable = field["variable"]
@@ -401,7 +400,7 @@ def _write_month(
     time_indices = {int(value): index for index, value in enumerate(times)}
     shape = (len(times), len(GLOBAL_LATITUDES), len(GLOBAL_LONGITUDES))
     sources: dict[str, list[
-        tuple[NDArray[np.float64] | zarr.Array, NDArray[np.intp], NDArray[np.intp]]
+        tuple[NDArray[Any] | zarr.Array, NDArray[np.intp], NDArray[np.intp]]
     ]] = {variable: [] for variable in variables}
     for variable, array, rows, selected_times in pending_sources:
         destinations = np.array([time_indices[int(value)] for value in selected_times], dtype=np.intp)
@@ -420,7 +419,7 @@ def _write_month(
         "year": year,
         "month": month,
         "spatial_chunks": list(spatial_chunks),
-        "variable_identity": "Descriptive ecCodes names; paramId attributes retain parameter identity",
+        "variable_identity": "Source descriptive names; original identifiers are retained in metadata",
     }
     root = zarr.open_group(output, mode="w-", zarr_format=3)
     root.attrs.update(group_attributes)
@@ -441,7 +440,12 @@ def _write_month(
             compressors=[compressor], dimension_names=(name,),
             attributes=coordinate_attributes[name],
         )
+    dtypes = {
+        variable: np.result_type(*(source.dtype for source, _, _ in inputs))
+        for variable, inputs in sources.items()
+    }
     for variable in variables:
+        print(f"Writing {variable}: {len(times)} UTC hours.", flush=True)
         records = [field for field in fields if field["variable"] == variable]
         rows = np.array([
             time_indices[field["valid_time"]] for field in records
@@ -488,7 +492,7 @@ def _write_month(
         }
         expected_attributes[variable] = attributes
         target = root.create_array(
-            variable, shape=shape, dtype=np.float64, fill_value=np.nan,
+            variable, shape=shape, dtype=dtypes[variable], fill_value=np.nan,
             chunks=chunks, shards=shards, compressors=[compressor],
             dimension_names=("time", "latitude", "longitude"),
             attributes=attributes,
@@ -521,9 +525,10 @@ def _write_month(
             raise ValueError(f"{name}: coordinate or interval metadata round trip failed.")
     compared_shards = 0
     for variable in variables:
+        print(f"Validating {variable}: exact numerical round trip.", flush=True)
         actual = reopened[variable]
         if (
-            actual.dtype != np.dtype(np.float64)
+            actual.dtype != dtypes[variable]
             or actual.shape != shape
             or actual.chunks != chunks
             or actual.shards != shards
@@ -560,8 +565,8 @@ def _write_month(
             "field_count": len(fields),
             "variable_count": len(variables),
             "compared_shards": compared_shards,
-            "numerical_roundtrip": "exact_float64_equal_nan",
+            "numerical_roundtrip": "exact_source_dtype_equal_nan",
             "metadata_roundtrip": True,
-            "request_variable_validation": "distinct_parameter_count_and_complete_hours",
+            "request_variable_validation": "decoded_source_coverage",
         },
     }

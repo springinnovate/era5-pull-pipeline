@@ -10,6 +10,7 @@ from uuid import uuid4
 from era5_pull_pipeline.cds import DEFAULT_MAX_DAYS, build_batch_request, check_access, download_batch
 from era5_pull_pipeline.credentials import load_credentials
 from era5_pull_pipeline.ncar_download import download_ncar
+from era5_pull_pipeline.ncar_ingest import ingest_ncar
 from era5_pull_pipeline.pipeline import ingest_batch, pull_batch, pull_range
 
 
@@ -48,6 +49,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--dry-run", action="store_true",
         help="List selected source files and byte sizes without downloading or creating local state.",
     )
+    ncar_ingest = commands.add_parser(
+        "ingest-ncar", help="Publish one month of recorded NCAR downloads as Zarr.",
+        description="Ingest selected UTC hours from local NetCDF files; no network access is needed.",
+    )
+    ncar_ingest.add_argument("--year", type=int, required=True)
+    ncar_ingest.add_argument("--month", type=int, required=True)
+    ncar_ingest.add_argument("--refresh", action="store_true", help="Replace selected stored fields.")
     access = commands.add_parser(
         "check-access",
         help="Retrieve one global ERA5 field using the working directory's .cdsapirc.",
@@ -118,7 +126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Publish an existing completed download without contacting CDS.",
     )
     ingest.add_argument("--batch", type=Path, required=True, help="Completed download directory.")
-    for storage in (pull, ingest, date_range):
+    for storage in (pull, ingest, date_range, ncar_ingest):
         storage.add_argument(
             "--archive", type=Path, default=Path("archive"),
             help="Archive directory (default: archive).",
@@ -133,6 +141,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             download_ncar(
                 args.start_date, args.end_date, args.variables, args.archive, dry_run=args.dry_run,
             )
+        elif args.command == "ingest-ncar":
+            published = ingest_ncar(
+                args.archive, args.year, args.month, tuple(args.spatial_chunks), refresh=args.refresh,
+            )
+            print(f"Published data available at {published}.")
         elif args.command == "check-access":
             credentials = load_credentials()
             print("Requesting one global ERA5 field. CDS may queue the request; Ctrl+C stops waiting.", flush=True)

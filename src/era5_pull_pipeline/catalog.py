@@ -2,7 +2,7 @@
 
 from collections.abc import Iterator, Sequence
 from contextlib import closing, contextmanager
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 import json
 import os
 from pathlib import Path
@@ -90,6 +90,16 @@ CREATE TABLE IF NOT EXISTS coverage (
     source_revision_id TEXT NOT NULL REFERENCES revisions(id),
     source_request_sha256 TEXT NOT NULL,
     PRIMARY KEY (revision_id, variable, valid_time)
+);
+CREATE TABLE IF NOT EXISTS field_sources (
+    revision_id TEXT NOT NULL,
+    variable TEXT NOT NULL,
+    valid_time INTEGER NOT NULL,
+    source_file_id TEXT NOT NULL REFERENCES source_files(id),
+    source_variable TEXT NOT NULL,
+    PRIMARY KEY (revision_id, variable, valid_time),
+    FOREIGN KEY (revision_id, variable, valid_time)
+        REFERENCES coverage(revision_id, variable, valid_time)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ready_month
     ON revisions (year, month) WHERE status = 'ready';
@@ -199,6 +209,19 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                     }.items()
                 ],
             )
+            db.executemany(
+                """INSERT INTO field_sources
+                   (revision_id, variable, valid_time, source_file_id, source_variable)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (
+                        revision["id"], field["variable"], field["valid_time"],
+                        field["source_file_id"], field["source_variable"],
+                    )
+                    for field in report["fields"] if "source_file_id" in field
+                ],
+            )
+            remove_published_source_hours(db, provenance.get("source_selections", []))
             db.execute(
                 "UPDATE revisions SET status = 'published', published_at = ? WHERE id = ?",
                 (datetime.now(UTC).isoformat(), revision["id"]),
@@ -267,6 +290,90 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                     "UPDATE revisions SET grib_removed = 1 WHERE id = ?", (revision["id"],)
                 )
 
+    delete_ingested_netcdf_files(db)
+
+
+def remove_published_source_hours(
+    db: sqlite3.Connection, selections: Sequence[dict[str, str]]
+) -> None:
+    """Remove published hours from pending NCAR selections in the catalog.
+
+    The caller commits this update in the same transaction as publication.
+    Hours outside the published intervals remain pending.
+
+    Args:
+        db: Catalog connection inside the caller's publication transaction.
+        selections: Published inclusive intervals with source_id, start_time,
+            and end_time as UTC ISO timestamps.
+
+    Raises:
+        sqlite3.Error: Updating the pending selections fails.
+    """
+    for selection in selections:
+        start = datetime.fromisoformat(selection["start_time"])
+        end = datetime.fromisoformat(selection["end_time"])
+        pending = db.execute(
+            """SELECT start_time, end_time FROM source_selections
+               WHERE source_id = ? AND start_time <= ? AND end_time >= ?""",
+            (selection["source_id"], end.isoformat(), start.isoformat()),
+        ).fetchall()
+        for interval in pending:
+            first = datetime.fromisoformat(interval["start_time"])
+            last = datetime.fromisoformat(interval["end_time"])
+            db.execute(
+                """DELETE FROM source_selections
+                   WHERE source_id = ? AND start_time = ? AND end_time = ?""",
+                (selection["source_id"], interval["start_time"], interval["end_time"]),
+            )
+            remaining = []
+            if first < start:
+                remaining.append((first, start - timedelta(hours=1)))
+            if last > end:
+                remaining.append((end + timedelta(hours=1), last))
+            db.executemany(
+                """INSERT OR IGNORE INTO source_selections
+                   (source_id, start_time, end_time) VALUES (?, ?, ?)""",
+                [
+                    (selection["source_id"], first.isoformat(), last.isoformat())
+                    for first, last in remaining
+                ],
+            )
+
+
+def delete_ingested_netcdf_files(db: sqlite3.Connection) -> None:
+    """Delete NCAR NetCDF downloads after all selected hours are published.
+
+    After deletion, clear the download-completion timestamp so a later download
+    fetches the file again. If deletion fails, keep the timestamp so the next
+    archive run retries cleanup.
+
+    Args:
+        db: Catalog connection protected by publication or writer ownership.
+
+    Raises:
+        sqlite3.Error: Reading source state or recording removal fails.
+    """
+    for source in db.execute(
+        """SELECT id, path FROM source_files f
+           WHERE downloaded_at IS NOT NULL AND NOT EXISTS (
+               SELECT 1 FROM source_selections s WHERE s.source_id = f.id
+           )"""
+    ).fetchall():
+        try:
+            Path(source["path"]).unlink(missing_ok=True)
+        except OSError as exc:
+            warnings.warn(
+                f"Published data are available; source cleanup remains pending: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            with db:
+                db.execute(
+                    "UPDATE source_files SET downloaded_at = NULL WHERE id = ?",
+                    (source["id"],),
+                )
+
 
 @contextmanager
 def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
@@ -307,7 +414,8 @@ def register_sources(
 
     The object key and ETag identify a source revision. Repeated selections
     reuse its recorded path and completion state without inspecting the file.
-    Selected hours remain separate from the additional hours packaged by NCAR.
+    Only requested hours enter the pending selections. Remove them after their
+    monthly publication succeeds; extra hours in the file remain unselected.
 
     Args:
         db: Catalog connection protected by the archive writer lock.
@@ -393,9 +501,15 @@ def current_month(
     report = json.loads(revision["report_json"])
     report["revision_id"] = revision["id"]
     report["fields"] = [
-        {key: field[key] for key in field.keys() if key != "revision_id"}
+        {
+            key: field[key] for key in field.keys()
+            if key != "revision_id" and field[key] is not None
+        }
         for field in db.execute(
-            "SELECT * FROM coverage WHERE revision_id = ? ORDER BY variable, valid_time",
+            """SELECT c.*, s.source_file_id, s.source_variable
+               FROM coverage c LEFT JOIN field_sources s
+                 USING (revision_id, variable, valid_time)
+               WHERE c.revision_id = ? ORDER BY c.variable, c.valid_time""",
             (revision["id"],),
         )
     ]
@@ -454,15 +568,22 @@ def missing_fields(
 
 
 def prepare_revision(
-    db: sqlite3.Connection, archive: Path, batches: Sequence[Path], metadata: dict[str, Any]
+    db: sqlite3.Connection, archive: Path, batches: Sequence[Path], metadata: dict[str, Any],
+    *, year: int, month: int,
 ) -> tuple[str, Path]:
-    """Replace abandoned assembly attempts and record the month to publish.
+    """Record a new monthly revision and create its staging directory.
+
+    First remove unfinished staging directories for the same month. Each
+    directory contains the staged Zarr store and its temporary decoded arrays,
+    so restarting also removes files left by an interrupted conversion.
 
     Args:
         db: Catalog connection from archive_session.
         archive: Archive directory.
         batches: Completed source download directories contributing to this revision.
-        metadata: Download provenance or a monthly manifest of source requests.
+        metadata: Download provenance or a monthly source selection manifest.
+        year: Calendar year of the publication's valid UTC hours.
+        month: Calendar month of the publication's valid UTC hours.
 
     Returns:
         Revision identifier and the Zarr path to build in staging.
@@ -472,9 +593,6 @@ def prepare_revision(
         ValueError: An abandoned store is outside the archive revision directory.
         Exception: File and catalog errors propagate.
     """
-    source = metadata.get("sources", [metadata])[0]
-    year = int(source["request"]["year"][0])
-    month = int(source["request"]["month"][0])
     final = Path(f"{year:04d}") / f"{month:02d}" / "era5.zarr"
     parent = db.execute(
         "SELECT current_revision_id FROM months WHERE year = ? AND month = ?", (year, month)
@@ -486,7 +604,7 @@ def prepare_revision(
         "SELECT id, staged_path FROM revisions WHERE year = ? AND month = ? AND status = 'preparing'",
         (year, month),
     ).fetchall():
-        abandoned = (archive / attempt["staged_path"]).resolve()
+        abandoned = (archive / attempt["staged_path"]).parent.resolve()
         if abandoned == owned or not abandoned.is_relative_to(owned):
             raise ValueError(f"The abandoned revision is outside the archive revision directory: {abandoned}.")
         if abandoned.exists():
@@ -494,8 +612,8 @@ def prepare_revision(
         with db:
             db.execute("DELETE FROM revisions WHERE id = ?", (attempt["id"],))
     revision_id = uuid4().hex
-    stage = Path("staging") / "revisions" / f"{revision_id}.zarr"
-    backup = stage.with_name(f"{revision_id}.previous.zarr") if parent is not None else None
+    stage = Path("staging") / "revisions" / revision_id / "era5.zarr"
+    backup = stage.with_name("previous.zarr") if parent is not None else None
     (archive / stage).parent.mkdir(parents=True, exist_ok=True)
     with db:
         db.execute(

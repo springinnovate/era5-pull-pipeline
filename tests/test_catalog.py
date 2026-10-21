@@ -69,7 +69,7 @@ def _stage(
         "request_sha256": f"request-{year}-{month}-{variable}-{hours}",
         "sha256": "source-checksum",
     }
-    revision, stage = catalog.prepare_revision(db, archive, [batch], metadata)
+    revision, stage = catalog.prepare_revision(db, archive, [batch], metadata, year=year, month=month)
     timestamps = [int(value.timestamp()) for value in dates]
     report = {
         "year": year,
@@ -194,7 +194,7 @@ def _stage_multiple(
         "dataset": template["dataset"], "request_sha256": "monthly-request",
         "sources": sources,
     }
-    revision, stage = catalog.prepare_revision(db, archive, batches, metadata)
+    revision, stage = catalog.prepare_revision(db, archive, batches, metadata, year=2000, month=1)
     times = sorted({field["valid_time"] for field in report["fields"]})
     values = {name: np.full((len(times), 2, 2), np.nan) for name in report["variables"]}
     for field in report["fields"]:
@@ -465,11 +465,15 @@ def test_restarting_assembly_removes_only_abandoned_same_month_store(tmp_path: P
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
         abandoned, old_stage, batches, _, metadata = _stage_multiple(db, archive)
+        scratch = old_stage.parent / ".decoded-interrupted"
+        scratch.mkdir()
+        (scratch / "values.bin").write_bytes(b"unfinished decoded source")
         parent = catalog.current_month(db, archive, 2000, 1)[1]["revision_id"]
         other, other_stage, _, _ = _stage(db, archive, month=2)
-        revision, stage = catalog.prepare_revision(db, archive, batches, metadata)
+        revision, stage = catalog.prepare_revision(db, archive, batches, metadata, year=2000, month=1)
         assert revision != abandoned
         assert not old_stage.exists()
+        assert not scratch.exists()
         assert not stage.exists()
         assert db.execute("SELECT id FROM revisions WHERE id = ?", (abandoned,)).fetchone() is None
         assert db.execute("SELECT status FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == "preparing"
@@ -496,7 +500,7 @@ def test_abandoned_store_cleanup_rejects_path_outside_revision_directory(tmp_pat
         with db:
             db.execute("UPDATE revisions SET staged_path = ? WHERE id = ?", (str(outside), revision))
         with pytest.raises(ValueError, match="outside the archive revision directory"):
-            catalog.prepare_revision(db, archive, [batch], metadata)
+            catalog.prepare_revision(db, archive, [batch], metadata, year=2000, month=1)
         assert marker.read_text(encoding="utf-8") == "keep"
         assert db.execute("SELECT id FROM revisions WHERE id = ?", (revision,)).fetchone() is not None
 

@@ -22,13 +22,13 @@ Each run accepts:
 | Date range | Inclusive start and end dates in UTC. |
 | Variables | The ERA5 single-level variables to retrieve. |
 | Output directory | The archive to create or extend. |
-| Download batch size | How many days to request at a time. |
+| Download batch size | How many days to request at a time from CDS; NCAR downloads whole source files. |
 | Spatial chunk shape | How many grid cells along latitude and longitude to store in each chunk. |
 | Refresh | Retrieve the selected fields again and replace their stored values. |
 
 ## CDS credentials
 
-Access uses a Copernicus Climate Data Store (CDS) account, a personal access token from your [CDS profile](https://cds.climate.copernicus.eu/profile), and acceptance of the [ERA5 dataset's licence](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download). Place a `.cdsapirc` file in the directory from which you run the pipeline:
+CDS commands use a Copernicus Climate Data Store account, a personal access token from your [CDS profile](https://cds.climate.copernicus.eu/profile), and acceptance of the [ERA5 dataset's licence](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download). Place a `.cdsapirc` file in the directory from which you run those commands:
 
 ```yaml
 url: https://cds.climate.copernicus.eu/api
@@ -65,17 +65,54 @@ Use NCAR's short variable names, which are read directly from its file inventory
 | `ssr`, `str` | Net surface solar and thermal radiation |
 | `mtpr` | Mean total precipitation rate |
 
-For example, preview temperature, radiation, and precipitation together with `--variables 2t ssrd mtpr`. Forecast source files can span calendar months, so the selection includes the preceding month's file when it supplies requested valid hours. `mtpr` is the average rate over the preceding hour in kg/m²/s; multiplying by 3,600 gives that hour's water-equivalent precipitation in mm. Source values and units remain in the downloaded NetCDF files.
+For example, preview temperature, radiation, and precipitation together with `--variables 2t ssrd mtpr`. Forecast source files can span calendar months, so the selection includes the preceding month's file when it supplies requested valid hours. `mtpr` is the average rate over the preceding hour in kg/m²/s; multiplying by 3,600 gives that hour's water-equivalent precipitation in mm. Ingestion preserves source values and units without performing this conversion.
 
 Downloads run one file at a time and show byte progress, transfer rate, elapsed time, and a transfer-time estimate. Press Ctrl+C to stop, then run the same command to resume at the saved byte position. The downloader makes up to three attempts for transient transfer failures, with backoff. Each request is tied to the discovered source identity so a partial file cannot be combined with a different source revision. Completed downloads are reused without reopening or revalidating them; each invocation still reads NCAR's inventory.
 
-The command retains NetCDF files under `staging/ncar/<source-id>/` inside the chosen archive. SQLite records their paths, source identities, selected hours, and download completion. These staged files can be incomplete until the catalog records completion. The command downloads sources only; it creates no Zarr stores. The `pull` commands below use CDS and GRIB.
+The command retains NetCDF files under `staging/ncar/<source-id>/` inside the chosen archive. SQLite records their paths, source identities, selected hours, and download completion. These staged files can be incomplete until the catalog records completion. The command downloads sources only; `ingest-ncar` publishes them as Zarr. The `pull` commands below use CDS and GRIB; use a separate archive directory for each source.
 
 Repeat the download command to see `Reusing completed source`. Inspect the recorded file sizes and completion state with:
 
 ```powershell
 python -c "import sqlite3; db=sqlite3.connect('downloads/manual-ncar-23/catalog.sqlite'); print(*db.execute('SELECT variable, size, downloaded_at, path FROM source_files'), sep='\n'); db.close()"
 ```
+
+## Ingest NCAR downloads
+
+Publish the recorded selections for one calendar month without contacting NCAR:
+
+```powershell
+python -m era5_pull_pipeline ingest-ncar --archive downloads/manual-ncar-23 --year 2000 --month 1
+```
+
+This creates `downloads/manual-ncar-23/2000/01/era5.zarr`. Only the hours selected by `download-ncar` enter the archive; extra hours packaged in the source files are excluded. Repeat the ingestion command to reuse published coverage without decoding again. To add variables or fill gaps, run `download-ncar` for that selection, then ingest its month. Existing variables and hours remain intact. To replace selected stored values, download that selection again and add `--refresh` to `ingest-ncar`.
+
+Temperature, radiation, and precipitation can be tested together in a separate archive:
+
+```powershell
+python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 2000-01-31 --variables 2t ssrd mtpr --archive downloads/manual-ncar-24
+python -m era5_pull_pipeline ingest-ncar --archive downloads/manual-ncar-24 --year 2000 --month 1
+```
+
+Read the published weather arrays and their shapes through the coordinated reader:
+
+```python
+from pathlib import Path
+from era5_pull_pipeline.catalog import open_month
+
+with open_month(Path("downloads/manual-ncar-24"), 2000, 1) as dataset:
+    for name, array in dataset.data_vars.items():
+        if array.ndim == 3:
+            print(name, array.shape, array.dtype, array.attrs["units"])
+```
+
+For this full January selection, each weather array has shape `(744, 721, 1440)` and retains NCAR's float32 precision. Source attributes, including upstream precision-processing metadata, remain in the Zarr provenance. Lossless compression preserves the supplied decoded values; it does not reverse NCAR's upstream processing.
+
+Forecast valid time is initialization time plus forecast lead hours. Radiation accumulations describe the preceding hour and are stored without differencing. The source radiation unit `W m**-2 s` is energy per square metre, equivalent to J/m². `mean_total_precipitation_rate` retains `kg m**-2 s**-1`. Analysis fields use their valid time directly; absent forecast reference/lead metadata remain missing. No temporal aggregation or derived ET0 is performed.
+
+Ingestion reads native NetCDF chunks into disk-backed arrays and writes bounded spatial shards directly into the monthly replacement, with lossless Zstandard compression. It retains no intermediate converted Zarr copies. Temporary space includes the retained NetCDF files, decoded selected arrays, the new compressed month, and any previous published month. One float32 global hourly field occupies about 4.15 MB before compression. Native forecast read blocks are about 50 MB; decoded memory mappings can also use the operating system's file cache.
+
+Source files are removed only after their selected hours are published and recorded in SQLite. A forecast file needed by selections in two months stays until both months succeed. Failed decoding or publication retains the inputs; rerunning ingestion rebuilds incomplete assembly or recovers a validated publication. Incomplete downloads or missing selected hours inside a source prevent a partial refresh from being published. `--spatial-chunks LAT LON` sets the read chunk shape when creating the archive and must match it on subsequent writes.
 
 ## Check access
 
@@ -154,7 +191,7 @@ The source is [ERA5 hourly data on single levels](https://cds.climate.copernicus
 
 The archive retains source units, grid coordinates, UTC timestamps, decoded numerical precision, and interval metadata. It preserves each variable's time semantics, including accumulation intervals. See the [ERA5 data documentation](https://confluence.ecmwf.int/spaces/CKB/pages/76414402/ERA5%2Bdata%2Bdocumentation).
 
-## Pipeline steps
+## CDS pipeline steps
 
 1. **Select coverage.** Compare the requested dates and variables with the archive's SQLite catalog. Ordinary runs skip stored variable/hour combinations and include gaps and newly requested variables. `--refresh` includes every selected field. Match the selection against CDS's availability constraints, including partially available days.
 2. **Load credentials when needed.** Authenticate with CDS using the local `.cdsapirc` file when a download is required. A completed repeat needs no credentials or service calls.
@@ -185,7 +222,7 @@ archive/
 
 Each `YYYY/MM/era5.zarr/` is a [Zarr 3 directory](https://zarr.readthedocs.io/en/stable/user-guide/arrays/#persistent-arrays), containing metadata and compressed array data. Each variable has its own array, with shared time, latitude, and longitude coordinates, and can be read independently.
 
-Arrays use ecCodes' descriptive names, normalized to lowercase words separated by underscores, such as `2_metre_temperature` and `total_precipitation`. Their attributes retain the original descriptive name, short name, numeric parameter ID, and units; the source request retains the original CDS variable names. Time coordinates identify when fields are valid. Per-variable metadata arrays retain forecast reference times and interval boundaries, including precipitation intervals that begin on the preceding day.
+Arrays use source descriptive names, normalized to lowercase words separated by underscores, such as `2_metre_temperature`, `surface_solar_radiation_downwards`, and `mean_total_precipitation_rate`. Attributes retain the original descriptive name, short name, units, and source identifiers. Time coordinates identify when fields are valid. Per-variable metadata arrays retain forecast reference times and interval boundaries, including precipitation intervals that begin on the preceding day.
 
 Variables can cover different hours within the shared monthly time coordinate. Each variable's matching `<variable>_coverage` array, such as `2_metre_temperature_coverage`, identifies which hours contain retrieved fields. A false entry means the field is absent; a true entry can still contain spatial missing values. Missing fields have NaN weather values and missing interval metadata. Coverage comes from validated source fields, independently of their numeric values.
 
@@ -197,12 +234,12 @@ The monthly directories form one continuous archive. A reader selects the releva
 
 ## Repeat runs and source updates
 
-SQLite records each staged request and destination before downloading, then records download and conversion completion. It also records published coverage by variable and hour on the fixed global grid. Source request details, retrieval times, GRIB checksums, validation results, and published revisions remain in the catalog after temporary downloads are removed.
+SQLite records staged sources and destinations before downloading. It records published coverage by variable and hour on the fixed global grid. Source selections, identities, retrieval times, validation results, and published revisions remain in the catalog after temporary downloads are removed. NCAR coverage links each actual decoded field to its source file; object keys, ETags, and original source metadata remain in publication provenance.
 
-Requesting an additional variable, a longer interval, or an interior gap downloads only missing variable/hour combinations. The planner uses CDS variable names and successfully published source requests to identify completed selections, even when requested in a different combination of variables or dates. Ordinary requests preserve already stored values, including fields whose grid cells are all missing. Published field provenance continues to identify the retrieval that supplied each field through subsequent monthly replacements.
+For CDS pulls, requesting an additional variable, a longer interval, or an interior gap downloads only missing variable/hour combinations. The planner uses CDS variable names and successfully published source requests to identify completed selections, even when requested in a different combination of variables or dates. NCAR ingestion selects missing fields from whole downloaded files. Ordinary ingestion preserves already stored values, including fields whose grid cells are all missing. Published field provenance continues to identify the retrieval that supplied each field through subsequent monthly replacements.
 
 A single writer updates an archive. It prepares a replacement month in staging and retains the previous version until publication and catalog recording succeed. Readers coordinate with publication so they do not read a mixture of old and new arrays. SQLite transactions record state; they do not make filesystem changes atomic. Interrupted publication is reconciled before the affected month becomes readable again.
 
-Python readers use `era5_pull_pipeline.catalog.open_month` as a context manager and finish reading before leaving it. The context holds the publication lock while its xarray dataset is open; opening Zarr directly bypasses that coordination. Downloads and conversion can proceed while a reader is active. Restarting an archive command recovers a validated publication interrupted between its filesystem rename and catalog commit, and retries any pending GRIB cleanup. Unvalidated staging data remain outside published coverage.
+Python readers use `era5_pull_pipeline.catalog.open_month` as a context manager and finish reading before leaving it. The context holds the publication lock while its xarray dataset is open; opening Zarr directly bypasses that coordination. Downloads and conversion can proceed while a reader is active. Restarting an archive command recovers a validated publication interrupted between its filesystem rename and catalog commit, and retries pending source cleanup. Unvalidated staging data remain outside published coverage.
 
 Adding hours to a partial month or refreshing a selected historical interval produces a replacement version of the affected monthly dataset. This trades rewriting that month for a simple publication and recovery process; the rest of the archive remains untouched. Ordinary catch-up runs fill missing coverage. A deliberate refresh replaces already stored values when ERA5 changes them.
