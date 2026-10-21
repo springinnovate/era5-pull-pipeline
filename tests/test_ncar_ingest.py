@@ -1,5 +1,6 @@
 """Exercise monthly NCAR ingestion with real NetCDF, Zarr, and SQLite files."""
 
+from contextlib import nullcontext
 from datetime import UTC, date, datetime
 from pathlib import Path
 import sqlite3
@@ -23,8 +24,8 @@ def small_grid(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _stage_analysis(
     archive: Path, variable: str = "2t", *,
-    first_day: int = 1, last_day: int = 1, version: int = 1,
-    offset: float = 0.0, omit_hour: int | None = None,
+    first_day: int = 1, last_day: int = 1, version: int = 1, year: int = 2000,
+    offset: float = 0.0, omit_hour: int | None = None, complete: bool = True,
 ) -> tuple[sqlite3.Row, NDArray[np.float32]]:
     """Create a completed two-day provider file with separately selected dates.
 
@@ -34,8 +35,10 @@ def _stage_analysis(
         first_day: First selected January day.
         last_day: Last selected January day.
         version: Distinct provider revision for refresh fixtures.
+        year: Calendar year for the January source and selected dates.
         offset: Value added before the source is recorded as complete.
         omit_hour: Optional missing external source hour for coverage failure.
+        complete: False leaves half the file on disk as an interrupted download.
 
     Returns:
         Completed source catalog row and the original two days of values.
@@ -45,15 +48,15 @@ def _stage_analysis(
         "10u": ("10 metre U wind component", "m s**-1"),
     }
     source = SourceFile(
-        key=f"e5.oper.an.sfc/200001/e5.oper.an.sfc.{variable}.nc",
+        key=f"e5.oper.an.sfc/{year:04d}01/e5.oper.an.sfc.{variable}.nc",
         variable=variable, size=1, etag=f'"version-{version}"',
         last_modified=f"2026-01-{version:02d}T00:00:00+00:00",
-        valid_start=datetime(2000, 1, 1, tzinfo=UTC),
-        valid_end=datetime(2000, 1, 2, 23, tzinfo=UTC),
+        valid_start=datetime(year, 1, 1, tzinfo=UTC),
+        valid_end=datetime(year, 1, 2, 23, tzinfo=UTC),
     )
     with catalog.archive_session(archive) as db:
         row = catalog.register_sources(
-            db, archive, [source], date(2000, 1, first_day), date(2000, 1, last_day),
+            db, archive, [source], date(year, 1, first_day), date(year, 1, last_day),
         )[0]
         path = Path(row["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,7 +69,7 @@ def _stage_analysis(
                 "units": names[variable][1], "number_of_significant_digits": np.int32(7),
             })},
             coords={
-                "time": np.arange("2000-01-01T00", "2000-01-03T00", dtype="datetime64[h]"),
+                "time": np.arange(f"{year:04d}-01-01T00", f"{year:04d}-01-03T00", dtype="datetime64[h]"),
                 "latitude": conversion.GLOBAL_LATITUDES,
                 "longitude": conversion.GLOBAL_LONGITUDES,
             },
@@ -81,10 +84,14 @@ def _stage_analysis(
             "latitude": {"_FillValue": None},
             "longitude": {"_FillValue": None},
         })
+        source_size = path.stat().st_size
+        if not complete:
+            with path.open("r+b") as stream:
+                stream.truncate(source_size // 2)
         with db:
             db.execute(
                 "UPDATE source_files SET size = ?, downloaded_at = ? WHERE id = ?",
-                (path.stat().st_size, datetime.now(UTC).isoformat(), row["id"]),
+                (source_size, datetime.now(UTC).isoformat() if complete else None, row["id"]),
             )
         return db.execute("SELECT * FROM source_files WHERE id = ?", (row["id"],)).fetchone(), values
 
@@ -209,5 +216,99 @@ def test_failed_replacement_retains_source_and_previous_values(
         np.testing.assert_array_equal(dataset["2_metre_temperature"].values, original[:24])
     ncar_ingest.ingest_ncar(archive, 2000, 1, (2, 2), refresh=True)
     assert not Path(refreshed["path"]).exists()
+    with catalog.open_month(archive, 2000, 1) as dataset:
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, corrected[:24])
+
+
+def test_pre_1970_source_reads_and_publishes_exact_utc_hours(tmp_path: Path) -> None:
+    """Read January 1950 NetCDF timestamps and retain them through publication."""
+    archive = tmp_path / "archive"
+    source, expected = _stage_analysis(archive, year=1950)
+    first_hour = int(datetime(1950, 1, 1, tzinfo=UTC).timestamp())
+    selected_hours = {("2t", first_hour + hour * 3600) for hour in range(24)}
+    with catalog.archive_session(archive) as db:
+        result = ncar_ingest.ingest_ncar_month(
+            db, archive, 1950, 1, (2, 2),
+            selected_hours=selected_hours, source_ids={source["id"]},
+        )
+        assert result == archive / "1950" / "01" / "era5.zarr"
+        assert catalog.get_published_hours(db, 1950, 1) == selected_hours
+        assert db.execute("SELECT COUNT(*) FROM source_selections").fetchone()[0] == 0
+    assert not Path(source["path"]).exists()
+    with catalog.open_month(archive, 1950, 1) as dataset:
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, expected[:24])
+        np.testing.assert_array_equal(
+            dataset["time"].values,
+            np.arange("1950-01-01T00", "1950-01-02T00", dtype="datetime64[h]"),
+        )
+
+
+def test_current_etag_consumes_superseded_pending_hours_only_within_selection(tmp_path: Path) -> None:
+    """Publishing corrected hours releases their old selections and retains other days."""
+    archive = tmp_path / "archive"
+    older, original = _stage_analysis(archive, last_day=2)
+    newer, corrected = _stage_analysis(archive, version=2, offset=1000)
+    first_hour = int(datetime(2000, 1, 1, tzinfo=UTC).timestamp())
+    selected_hours = {("2t", first_hour + hour * 3600) for hour in range(24)}
+    with catalog.archive_session(archive) as db:
+        ncar_ingest.ingest_ncar_month(
+            db, archive, 2000, 1, (2, 2), refresh=True,
+            selected_hours=selected_hours, source_ids={newer["id"]},
+        )
+        remaining = [tuple(row) for row in db.execute(
+            "SELECT source_id, start_time, end_time FROM source_selections"
+        )]
+        assert remaining == [(older["id"], "2000-01-02T00:00:00+00:00", "2000-01-02T23:00:00+00:00")]
+        fields = catalog.current_month(db, archive, 2000, 1)[1]["fields"]
+        assert {field["source_file_id"] for field in fields} == {newer["id"]}
+    assert Path(older["path"]).exists()
+    assert not Path(newer["path"]).exists()
+    with catalog.open_month(archive, 2000, 1) as dataset:
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, corrected[:24])
+    ncar_ingest.ingest_ncar(archive, 2000, 1, (2, 2))
+    assert not Path(older["path"]).exists()
+    with catalog.open_month(archive, 2000, 1) as dataset:
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values[:24], corrected[:24])
+        np.testing.assert_array_equal(dataset["2_metre_temperature"].values[24:], original[24:])
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_current_etag_discards_superseded_partial_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_fails: bool,
+) -> None:
+    """Delete an obsolete partial source after publication, retrying failed cleanup."""
+    archive = tmp_path / "archive"
+    older, _ = _stage_analysis(archive, complete=False)
+    newer, corrected = _stage_analysis(archive, version=2, offset=1000)
+    partial = Path(older["path"])
+    assert partial.stat().st_size < older["size"]
+    first_hour = int(datetime(2000, 1, 1, tzinfo=UTC).timestamp())
+    selected_hours = {("2t", first_hour + hour * 3600) for hour in range(24)}
+    unlink = Path.unlink
+
+    def reject_partial_cleanup(path: Path, missing_ok: bool = False) -> None:
+        """Simulate a partial download still held open by another process."""
+        if path == partial:
+            raise PermissionError("partial source is open")
+        unlink(path, missing_ok=missing_ok)
+
+    with catalog.archive_session(archive) as db:
+        with monkeypatch.context() as patch:
+            if cleanup_fails:
+                patch.setattr(Path, "unlink", reject_partial_cleanup)
+            expectation = pytest.warns(RuntimeWarning, match="source cleanup remains pending") if cleanup_fails else nullcontext()
+            with expectation:
+                ncar_ingest.ingest_ncar_month(
+                    db, archive, 2000, 1, (2, 2), refresh=True,
+                    selected_hours=selected_hours, source_ids={newer["id"]},
+                )
+        assert db.execute("SELECT COUNT(*) FROM source_selections").fetchone()[0] == 0
+        remaining = db.execute("SELECT downloaded_at, removed_at FROM source_files WHERE id = ?", (older["id"],)).fetchone()
+        assert remaining["downloaded_at"] is None
+        assert (remaining["removed_at"] is None) == cleanup_fails
+        assert partial.exists() == cleanup_fails
+    with catalog.archive_session(archive) as db:
+        assert db.execute("SELECT removed_at FROM source_files WHERE id = ?", (older["id"],)).fetchone()[0] is not None
+    assert not partial.exists()
     with catalog.open_month(archive, 2000, 1) as dataset:
         np.testing.assert_array_equal(dataset["2_metre_temperature"].values, corrected[:24])

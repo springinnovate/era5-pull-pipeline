@@ -1,59 +1,64 @@
 # ERA5 pull pipeline
 
-A Python pipeline that runs from the command line, downloads full global ERA5 rasters, and maintains a compressed Zarr archive. Each invocation processes a requested date range and set of variables, fills missing coverage, and exits. The same archive grows from 1950 through the latest available data as subsequent runs add new hours.
+A Python command-line pipeline that downloads full global ERA5 rasters from [NCAR's public archive](https://registry.opendata.aws/nsf-ncar-era5/) and maintains a compressed monthly Zarr archive. Each invocation fills a requested date range and set of variables, publishes each month, and exits. Repeated runs skip stored hours and resume unfinished downloads. No account or access token is required.
 
 ## Installation
 
-Use Python 3.11 or newer. From the repository directory, create a virtual environment and install the package:
+Use Python 3.11 or newer. From the repository directory:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-These commands use PowerShell on Windows. On macOS or Linux, use `.venv/bin/python` in place of `.\.venv\Scripts\python.exe`.
+The examples below use `python` from the environment where the package is installed. On Windows, `.\.venv\Scripts\python.exe` selects the environment explicitly; on macOS or Linux, use `.venv/bin/python`. The installed `era5-pull` command is equivalent to `python -m era5_pull_pipeline`.
 
-## Inputs
+## Download a date range
 
-Each run accepts:
+This example retrieves three UTC days of temperature, solar radiation, and precipitation across a year boundary:
 
-| Input | Meaning |
+```powershell
+python -m era5_pull_pipeline pull --start-date 1999-12-31 --end-date 2000-01-02 --variables 2t ssrd mtpr --archive downloads/manual-ncar-25
+```
+
+It publishes `1999/12/era5.zarr` and `2000/01/era5.zarr`, with 24 and 48 selected hours respectively. Every weather field covers the full 721 × 1440 global grid at 0.25° resolution. The pipeline performs no geographic selection, temporal aggregation, or derived ET0 calculation.
+
+Repeat the same command to check resume behavior. Once the selection is complete, it prints `completed=0, skipped=216` and makes no NCAR calls. Counts are **variable-hours**: three variables × three days × 24 hours = 216. The summary also reports unavailable hours, hours in a failed month, and remaining pending hours.
+
+To add wind for those dates, run the same command with `--variables 10u 10v`. The monthly replacements preserve existing variables and hours. Extend the dates to fill additional months or interior gaps.
+
+| Option | Meaning |
 | --- | --- |
-| Date range | Inclusive start and end dates in UTC. |
-| Variables | The ERA5 single-level variables to retrieve. |
-| Output directory | The archive to create or extend. |
-| Download batch size | How many days to request at a time from CDS; NCAR downloads whole source files. |
-| Spatial chunk shape | How many grid cells along latitude and longitude to store in each chunk. |
-| Refresh | Retrieve the selected fields again and replace their stored values. |
+| `--start-date` | First requested UTC date, inclusive; required. |
+| `--end-date` | Last requested UTC date, inclusive; defaults to today in UTC. |
+| `--variables` | One or more NCAR short variable names; required. |
+| `--archive` | Directory containing the catalog, staging, and monthly stores; defaults to `archive`. |
+| `--download-workers` | Maximum simultaneous file transfers; defaults to 2. |
+| `--max-source-gb` | Maximum reserved NetCDF source bytes in decimal GB; defaults to 16. Conversion requires additional space. |
+| `--spatial-chunks LAT LON` | Grid cells per spatial read chunk; defaults to `32 32`. Must match the archive's existing layout. |
+| `--refresh` | Retrieve current sources and replace selected stored fields. |
 
-## CDS credentials
+NCAR packages analysis fields as one variable per month, and radiation and precipitation in roughly half-month files. Selecting a single day still downloads whole source files; only selected hours enter the Zarr archive. A forecast file can supply hours on both sides of a month boundary and is downloaded once, then retained until both selected months are published.
 
-CDS commands use a Copernicus Climate Data Store account, a personal access token from your [CDS profile](https://cds.climate.copernicus.eu/profile), and acceptance of the [ERA5 dataset's licence](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download). Place a `.cdsapirc` file in the directory from which you run those commands:
+Transfers show bytes, speed, elapsed time, and estimated remaining transfer time. Month messages identify availability lookup, conversion, and publication. There is no overall backfill completion estimate.
 
-```yaml
-url: https://cds.climate.copernicus.eu/api
-key: YOUR_PERSONAL_ACCESS_TOKEN
-```
+## Backfill from 1950
 
-## Download NCAR source files
-
-`download-ncar` retrieves full global hourly ERA5 NetCDF files from [NCAR's public archive](https://registry.opendata.aws/nsf-ncar-era5/). It needs no CDS token or AWS account. NCAR updates monthly with roughly a 3–4 month delay; availability differs by variable.
-
-Preview the files and total download size for a date range:
+To download the selected variables from 1950 through the latest data available from NCAR:
 
 ```powershell
-python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 2000-01-31 --variables 2t --archive downloads/manual-ncar-23 --dry-run
+python -m era5_pull_pipeline pull --start-date 1950-01-01 --variables 2t 2d 10u 10v sp ssrd strd mtpr --archive archive
 ```
 
-The preview reads NCAR's inventory and creates no local files. Remove `--dry-run` to download:
+NCAR updates monthly and typically trails real time by about 3–4 months. Availability is checked separately for each variable. Unavailable hours remain absent from coverage and are checked again on subsequent runs, so the same command extends the archive as NCAR adds data. An explicit `--end-date` limits the requested interval.
 
-```powershell
-python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 2000-01-31 --variables 2t --archive downloads/manual-ncar-23
-```
+The workflow schedules one month at a time. At most `--download-workers` transfers are active, and conversion and publication run serially after that month's downloads. The source budget reserves full file sizes before transfers start, including files retained from an interrupted run or for a later month. If a month cannot fit, the command stops before downloading it and reports the required size. Increase `--max-source-gb` or request fewer variables at a time.
 
-Run these commands with the Python environment where you installed the package. The January 2000 temperature selection downloads one file of **1,131,152,166 bytes** (about 1.05 GiB). NCAR packages analysis fields as one variable per month and radiation/precipitation fields in roughly half-month files. Selecting a single day still downloads the whole source file. The date range records which hours are selected for ingestion; downloading extra hours does not mark them as published coverage.
+This budget limits staged NetCDF sources, not total disk use or RAM. Peak working space also includes decoded selected arrays, the new compressed monthly store, and any previous month being replaced. One float32 global hourly field takes about 4.15 MB before compression. Decoded arrays use disk-backed memory mappings; their pages can occupy the operating system's file cache. Conversion reads native NetCDF blocks and writes bounded Zarr shards without loading a whole month into Python heap memory.
 
-Use NCAR's short variable names, which are read directly from its file inventory:
+## Variables and time semantics
+
+Names come directly from NCAR's file inventory; examples include:
 
 | Name | Variable |
 | --- | --- |
@@ -65,144 +70,29 @@ Use NCAR's short variable names, which are read directly from its file inventory
 | `ssr`, `str` | Net surface solar and thermal radiation |
 | `mtpr` | Mean total precipitation rate |
 
-For example, preview temperature, radiation, and precipitation together with `--variables 2t ssrd mtpr`. Forecast source files can span calendar months, so the selection includes the preceding month's file when it supplies requested valid hours. `mtpr` is the average rate over the preceding hour in kg/m²/s; multiplying by 3,600 gives that hour's water-equivalent precipitation in mm. Ingestion preserves source values and units without performing this conversion.
+The pipeline retains source values, units, grid coordinates, UTC timestamps, decoded precision, and interval metadata. Analysis fields use their valid timestamps directly. Forecast valid time is initialization time plus lead hours.
 
-Downloads run one file at a time and show byte progress, transfer rate, elapsed time, and a transfer-time estimate. Press Ctrl+C to stop, then run the same command to resume at the saved byte position. The downloader makes up to three attempts for transient transfer failures, with backoff. Each request is tied to the discovered source identity so a partial file cannot be combined with a different source revision. Completed downloads are reused without reopening or revalidating them; each invocation still reads NCAR's inventory.
+Radiation accumulations describe the preceding hour and are stored without differencing. The source radiation unit `W m**-2 s` is energy per square metre, equivalent to J/m². `mtpr` describes the mean rate over the preceding hour in `kg m**-2 s**-1`; multiplying by 3,600 gives that hour's water-equivalent precipitation in mm. The archive retains the rate without performing that conversion.
 
-The command retains NetCDF files under `staging/ncar/<source-id>/` inside the chosen archive. SQLite records their paths, source identities, selected hours, and download completion. These staged files can be incomplete until the catalog records completion. The command downloads sources only; `ingest-ncar` publishes them as Zarr. The `pull` commands below use CDS and GRIB; use a separate archive directory for each source.
+Original source attributes, including upstream precision-processing metadata, remain in provenance. Lossless Zstandard compression preserves NCAR's supplied decoded values; it does not reverse upstream processing. See the [ERA5 data documentation](https://confluence.ecmwf.int/spaces/CKB/pages/76414402/ERA5%2Bdata%2Bdocumentation).
 
-Repeat the download command to see `Reusing completed source`. Inspect the recorded file sizes and completion state with:
+## Stop, resume, and refresh
 
-```powershell
-python -c "import sqlite3; db=sqlite3.connect('downloads/manual-ncar-23/catalog.sqlite'); print(*db.execute('SELECT variable, size, downloaded_at, path FROM source_files'), sep='\n'); db.close()"
-```
+Press Ctrl+C to stop. Transfers stop between received chunks and retain partial bytes. An idle network read times out after 30 seconds. Run the same ordinary `pull` command to resume. SQLite supplies recorded paths and selections, completed downloads are reused directly, and partial downloads resume from their saved byte position. Transient transfer failures allow up to three attempts with backoff. Requests are pinned to the discovered source identity so bytes from different versions cannot be combined.
 
-## Ingest NCAR downloads
+Each month commits independently. Failed conversion or publication retains its source files, and a restart rebuilds incomplete conversion or finishes a validated publication. NetCDF inputs are removed only after all their selected hours are published and recorded in SQLite. Completed ordinary repeats require no source access.
 
-Publish the recorded selections for one calendar month without contacting NCAR:
+Use `--refresh` to check current source identities and replace selected stored hours:
 
 ```powershell
-python -m era5_pull_pipeline ingest-ncar --archive downloads/manual-ncar-23 --year 2000 --month 1
+python -m era5_pull_pipeline pull --start-date 2000-01-01 --end-date 2000-01-01 --variables 2t --archive downloads/manual-ncar-25 --refresh
 ```
 
-This creates `downloads/manual-ncar-23/2000/01/era5.zarr`. Only the hours selected by `download-ncar` enter the archive; extra hours packaged in the source files are excluded. Repeat the ingestion command to reuse published coverage without decoding again. To add variables or fill gaps, run `download-ncar` for that selection, then ingest its month. Existing variables and hours remain intact. To replace selected stored values, download that selection again and add `--refresh` to `ingest-ncar`.
+This replaces January 1 temperature while preserving the other hours and variables. Every selected hour in that month must be available; incomplete availability or an incomplete decoded source prevents publication. A newer source replaces any older pending source for the same selected hours after publication succeeds. Unrelated pending selections remain available.
 
-Temperature, radiation, and precipitation can be tested together in a separate archive:
+An interrupted refresh reuses staged files when they match the current inventory. Rerunning `--refresh` selects the entire interval again, including months already refreshed. Adjust the start date to continue only the unfinished interval.
 
-```powershell
-python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 2000-01-31 --variables 2t ssrd mtpr --archive downloads/manual-ncar-24
-python -m era5_pull_pipeline ingest-ncar --archive downloads/manual-ncar-24 --year 2000 --month 1
-```
-
-Read the published weather arrays and their shapes through the coordinated reader:
-
-```python
-from pathlib import Path
-from era5_pull_pipeline.catalog import open_month
-
-with open_month(Path("downloads/manual-ncar-24"), 2000, 1) as dataset:
-    for name, array in dataset.data_vars.items():
-        if array.ndim == 3:
-            print(name, array.shape, array.dtype, array.attrs["units"])
-```
-
-For this full January selection, each weather array has shape `(744, 721, 1440)` and retains NCAR's float32 precision. Source attributes, including upstream precision-processing metadata, remain in the Zarr provenance. Lossless compression preserves the supplied decoded values; it does not reverse NCAR's upstream processing.
-
-Forecast valid time is initialization time plus forecast lead hours. Radiation accumulations describe the preceding hour and are stored without differencing. The source radiation unit `W m**-2 s` is energy per square metre, equivalent to J/m². `mean_total_precipitation_rate` retains `kg m**-2 s**-1`. Analysis fields use their valid time directly; absent forecast reference/lead metadata remain missing. No temporal aggregation or derived ET0 is performed.
-
-Ingestion reads native NetCDF chunks into disk-backed arrays and writes bounded spatial shards directly into the monthly replacement, with lossless Zstandard compression. It retains no intermediate converted Zarr copies. Temporary space includes the retained NetCDF files, decoded selected arrays, the new compressed month, and any previous published month. One float32 global hourly field occupies about 4.15 MB before compression. Native forecast read blocks are about 50 MB; decoded memory mappings can also use the operating system's file cache.
-
-Source files are removed only after their selected hours are published and recorded in SQLite. A forecast file needed by selections in two months stays until both months succeed. Failed decoding or publication retains the inputs; rerunning ingestion rebuilds incomplete assembly or recovers a validated publication. Incomplete downloads or missing selected hours inside a source prevent a partial refresh from being published. `--spatial-chunks LAT LON` sets the read chunk shape when creating the archive and must match it on subsequent writes.
-
-## Check access
-
-From the directory containing `.cdsapirc`, run:
-
-```powershell
-.\.venv\Scripts\python.exe -m era5_pull_pipeline check-access
-```
-
-The check downloads one full global field of 2 m temperature for **2000-01-01 at 00:00 UTC** to `downloads/era5-access-check.grib` and decodes it with xarray's cfgrib reader. Success prints `CDS access verified` and the saved path. The probe file stays separate from the monthly archive.
-
-CDS may queue the request. Press Ctrl+C to stop waiting locally. Connection settings are passed directly to CDS; file, service, and decoding failures show their original errors.
-
-Repeat the same command to check access again; it replaces the probe file. Use `--output` to choose a different location:
-
-```powershell
-.\.venv\Scripts\python.exe -m era5_pull_pipeline check-access --output downloads/check-2.grib
-```
-
-The installed `era5-pull check-access` command provides the same check. Use `--help` to see its options.
-
-## Download a date range
-
-From the directory containing `.cdsapirc`, run:
-
-```powershell
-.\.venv\Scripts\python.exe -m era5_pull_pipeline pull --start-date 1999-12-31 --end-date 2000-01-02 --variables 2m_temperature total_precipitation --archive downloads/manual-archive-13 --batch-days 1
-```
-
-This retrieves three complete UTC days on the global grid, in one-day batches, and publishes `1999/12/era5.zarr` and `2000/01/era5.zarr` beneath the archive directory. `--batch-days` defaults to 7. Requests stop at month boundaries and are subdivided further to respect CDS field limits. It limits calendar days per batch; compressed GRIB sizes vary by variable and data values.
-
-CDS prints the request ID and status changes, such as `accepted`, `running`, and `successful`. While waiting, the pipeline also reports a successful status check approximately every 30 seconds, showing whether the job is queued or running and the elapsed time since the request started. That elapsed time includes earlier invocations when resuming a saved job. For example:
-
-```text
-CDS request <job-id>: still queued (accepted); 0:15:30 since request started. Still checking CDS.
-```
-
-Once the file transfer begins, a progress bar shows downloaded bytes, transfer rate, and an estimated remaining transfer time. The transfer estimate does not include queue time; CDS does not provide a queue completion estimate.
-
-Repeat the same command to verify coverage: a completed range prints `completed=0, skipped=144` and makes no CDS calls. Counts are **variable-hours**: two variables over three 24-hour days total 144. `completed` counts fields published in this invocation; `skipped` counts already stored fields; `unavailable` counts requested hours absent from CDS's availability snapshot. `failed` identifies a failed batch or monthly publication, and `pending` counts remaining unattempted or staged fields. A failure prints the summary and original error. Hours marked unavailable are requested again on a subsequent run.
-
-To add wind for the same dates, run the command with `--variables 10m_u_component_of_wind 10m_v_component_of_wind`. Existing temperature and precipitation remain in the monthly stores. Use `--spatial-chunks LAT LON` when creating an archive to change the default `32 32` tile shape; subsequent writes must use the archive's existing shape.
-
-Press Ctrl+C to stop. Run the same command to resume: the pipeline uses SQLite's staged batch records to recover submitted CDS jobs and reuse completed downloads and conversions. An interrupted transfer restarts from the beginning; an interrupted conversion is rebuilt from its retained GRIB. Completed artifacts are immutable and reused directly. CDS requests run serially with bounded retries and backoff for transient service failures.
-
-If CDS reports that a saved job has failed or expired, remove that job's `.partial` directory under `staging/batches/` and rerun to submit it again. Its `request.json` identifies the selection and CDS job ID. Completed batches remain reusable.
-
-## Refresh stored data
-
-Add `--refresh` to retrieve the selected dates and variables again, including fields already in the archive:
-
-```powershell
-.\.venv\Scripts\python.exe -m era5_pull_pipeline pull --start-date 2000-01-01 --end-date 2000-01-01 --variables 2m_temperature --archive downloads/manual-archive-13 --batch-days 1 --refresh
-```
-
-This replaces all 24 temperature fields for January 1 and prints `completed=24, skipped=0`. Other dates, variables, and months retain their data and source information. Gaps within the selection are filled. Each successful refresh records a new retrieval and publication, even if CDS returns identical values. Running without `--refresh` continues to skip stored fields.
-
-Each month's selected fields must all be available from CDS. If availability is incomplete, a download fails, or a response lacks required fields, that month remains unchanged. Absent fields and array fill slots cannot replace stored fields; missing grid cells explicitly encoded in a returned GRIB retain their source meaning.
-
-An interrupted refresh reuses its own staged downloads and conversions, separately from ordinary catch-up work. Publication commits one month at a time. Months already published remain committed if a later month fails; rerunning with `--refresh` selects the entire requested range again, including those completed months. To continue only the unfinished interval, adjust the dates accordingly.
-
-## Tests
-
-Install the optional test dependencies and run the automated tests from the repository directory:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[test]"
-.\.venv\Scripts\python.exe -m pytest -q --basetemp .pytest_cache/manual-check
-```
-
-The tests use local fixtures and simulated service responses, including a local HTTP server for interrupted transfers. They need no credentials or external network access. `download-ncar` reads NCAR's live inventory; `check-access` and `pull` contact CDS when a download is needed.
-
-## Data
-
-The source is [ERA5 hourly data on single levels](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels), using the full global regular 0.25° latitude/longitude grid. Every requested variable and timestep covers this same grid. Geographic selection and clipping belong to downstream consumers.
-
-The archive retains source units, grid coordinates, UTC timestamps, decoded numerical precision, and interval metadata. It preserves each variable's time semantics, including accumulation intervals. See the [ERA5 data documentation](https://confluence.ecmwf.int/spaces/CKB/pages/76414402/ERA5%2Bdata%2Bdocumentation).
-
-## CDS pipeline steps
-
-1. **Select coverage.** Compare the requested dates and variables with the archive's SQLite catalog. Ordinary runs skip stored variable/hour combinations and include gaps and newly requested variables. `--refresh` includes every selected field. Match the selection against CDS's availability constraints, including partially available days.
-2. **Load credentials when needed.** Authenticate with CDS using the local `.cdsapirc` file when a download is required. A completed repeat needs no credentials or service calls.
-3. **Download GRIB batches.** Split the requested time interval according to the download batch size, stopping at calendar-month boundaries. Every downloaded field covers the full global grid. Batch size is independent of the Zarr storage layout.
-4. **Assemble the month.** Decode the GRIB fields into arrays with dimensions `(time, latitude, longitude)` and save validated, compressed batch checkpoints. Assemble all selected batches for the month in staging, preserving existing fields unless selected for refresh. Publish each affected month once per invocation.
-5. **Validate and publish.** Check the variables, global grid, timestamps, interval metadata, numerical values, and readability of the compressed output. Publish the validated monthly dataset and record its coverage and revision in SQLite.
-6. **Remove temporary sources.** Delete the corresponding GRIB files and conversion checkpoints only after publication and the catalog update succeed. The monthly Zarr datasets are the retained data archive.
-
-Processing is serial and limited to one month at a time. Peak disk use includes that month's GRIBs, compressed batch checkpoints, one batch's temporary decoded arrays, the staged monthly replacement, and any previous published month being replaced. Decoded arrays use disk-backed storage; each global float64 field occupies about 8.3 MB before compression. Conversion processes one global field at a time and assembles bounded spatial shards without loading a whole month into RAM. Smaller day batches reduce decoded scratch space. The latest month can contain only part of a month, and unavailable hours remain absent from catalog coverage.
-
-## Archive layout
+## Inspect the archive
 
 ```text
 archive/
@@ -212,34 +102,57 @@ archive/
       era5.zarr/
     02/
       era5.zarr/
-  2026/
-    09/
-      era5.zarr/
-    10/
-      era5.zarr/
   staging/
+    ncar/
+    revisions/
 ```
 
-Each `YYYY/MM/era5.zarr/` is a [Zarr 3 directory](https://zarr.readthedocs.io/en/stable/user-guide/arrays/#persistent-arrays), containing metadata and compressed array data. Each variable has its own array, with shared time, latitude, and longitude coordinates, and can be read independently.
+Each `YYYY/MM/era5.zarr/` is a [Zarr 3 directory](https://zarr.readthedocs.io/en/stable/user-guide/arrays/#persistent-arrays) containing metadata and losslessly compressed arrays. Weather arrays have dimensions `(time, latitude, longitude)` and descriptive source names such as `2_metre_temperature`, `surface_solar_radiation_downwards`, and `mean_total_precipitation_rate`.
 
-Arrays use source descriptive names, normalized to lowercase words separated by underscores, such as `2_metre_temperature`, `surface_solar_radiation_downwards`, and `mean_total_precipitation_rate`. Attributes retain the original descriptive name, short name, units, and source identifiers. Time coordinates identify when fields are valid. Per-variable metadata arrays retain forecast reference times and interval boundaries, including precipitation intervals that begin on the preceding day.
+Within a month, read chunks span its time axis and a spatial tile. [Zarr sharding](https://zarr.readthedocs.io/en/stable/user-guide/performance/) packs multiple independently readable chunks into larger files to control file counts. Each variable can be read separately; the monthly directories together form the time archive.
 
-Variables can cover different hours within the shared monthly time coordinate. Each variable's matching `<variable>_coverage` array, such as `2_metre_temperature_coverage`, identifies which hours contain retrieved fields. A false entry means the field is absent; a true entry can still contain spatial missing values. Missing fields have NaN weather values and missing interval metadata. Coverage comes from validated source fields, independently of their numeric values.
+Variables can cover different hours within the shared time coordinate. Each `<variable>_coverage` array identifies which hours contain retrieved fields. A false entry means the field is absent; a true entry can still contain spatial missing values from the source. Companion arrays retain forecast reference times and interval boundaries.
 
-Within each monthly dataset, read chunks span the calendar month along time and a tile of grid cells in space. These chunks partition the stored global arrays. The spatial chunk shape is configured when creating the archive; Zarr does not require a particular tile size. Zarr sharding packs multiple independently readable chunks into larger files to control file counts.
+Python readers use `open_month` and finish reading within its context:
 
-Chunks use **lossless Zstandard compression**. Storage does not introduce numerical rounding, quantization, or a reduction in decoded precision. Compression reduces storage and transfer volume, while chunks allow portions of an array to be read independently. See [Zarr's chunking and sharding guidance](https://zarr.readthedocs.io/en/stable/user-guide/performance/).
+```python
+from pathlib import Path
+from era5_pull_pipeline.catalog import open_month
 
-The monthly directories form one continuous archive. A reader selects the relevant months and combines their selected arrays along time. Monthly boundaries also keep validation, recovery, and replacement limited to the affected periods.
+with open_month(Path("downloads/manual-ncar-25"), 2000, 1) as dataset:
+    for name, array in dataset.data_vars.items():
+        if array.ndim == 3:
+            print(name, array.shape, array.dtype, array.attrs["units"])
+```
 
-## Repeat runs and source updates
+For the three-day example, January's three weather arrays have shape `(48, 721, 1440)` and retain NCAR's float32 precision. December's arrays have shape `(24, 721, 1440)`.
 
-SQLite records staged sources and destinations before downloading. It records published coverage by variable and hour on the fixed global grid. Source selections, identities, retrieval times, validation results, and published revisions remain in the catalog after temporary downloads are removed. NCAR coverage links each actual decoded field to its source file; object keys, ETags, and original source metadata remain in publication provenance.
+SQLite records published coverage, source selections, identities, retrieval times, and revisions. One writer prepares a replacement month while readers continue to use the published version. Publication coordinates with `open_month` so readers see a complete version. Opening Zarr directly bypasses that coordination. The previous version remains available until publication and catalog recording succeed; interrupted publication is recovered before reading or writing resumes.
 
-For CDS pulls, requesting an additional variable, a longer interval, or an interior gap downloads only missing variable/hour combinations. The planner uses CDS variable names and successfully published source requests to identify completed selections, even when requested in a different combination of variables or dates. NCAR ingestion selects missing fields from whole downloaded files. Ordinary ingestion preserves already stored values, including fields whose grid cells are all missing. Published field provenance continues to identify the retrieval that supplied each field through subsequent monthly replacements.
+## Separate download and ingestion
 
-A single writer updates an archive. It prepares a replacement month in staging and retains the previous version until publication and catalog recording succeed. Readers coordinate with publication so they do not read a mixture of old and new arrays. SQLite transactions record state; they do not make filesystem changes atomic. Interrupted publication is reconciled before the affected month becomes readable again.
+To preview whole source files and their sizes without creating local state:
 
-Python readers use `era5_pull_pipeline.catalog.open_month` as a context manager and finish reading before leaving it. The context holds the publication lock while its xarray dataset is open; opening Zarr directly bypasses that coordination. Downloads and conversion can proceed while a reader is active. Restarting an archive command recovers a validated publication interrupted between its filesystem rename and catalog commit, and retries pending source cleanup. Unvalidated staging data remain outside published coverage.
+```powershell
+python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 2000-01-31 --variables 2t ssrd mtpr --dry-run
+```
 
-Adding hours to a partial month or refreshing a selected historical interval produces a replacement version of the affected monthly dataset. This trades rewriting that month for a simple publication and recovery process; the rest of the archive remains untouched. Ordinary catch-up runs fill missing coverage. A deliberate refresh replaces already stored values when ERA5 changes them.
+For a local download followed by offline ingestion:
+
+```powershell
+python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 2000-01-31 --variables 2t --archive downloads/local-ncar
+python -m era5_pull_pipeline ingest-ncar --archive downloads/local-ncar --year 2000 --month 1
+```
+
+`download-ncar` retains all selected files under `staging/ncar/` and records selected hours in SQLite. It supports `--download-workers` but does not impose the bulk workflow's source budget; use `pull` for long backfills. `ingest-ncar` publishes pending selections for one month without network access. Add `--refresh` to ingestion to replace their stored values.
+
+## Tests
+
+Install the optional test dependencies and run:
+
+```powershell
+python -m pip install -e ".[test]"
+python -m pytest -q --tb=short
+```
+
+Tests use local NetCDF fixtures, real SQLite and Zarr stores, and a local HTTP server. They exercise interruption, byte-range resume, concurrent transfers, month boundaries, changing availability, historical additions, selected refresh, publication recovery, source cleanup, and resource limits without contacting external services.

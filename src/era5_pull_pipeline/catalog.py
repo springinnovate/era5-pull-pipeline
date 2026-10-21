@@ -1,6 +1,6 @@
 """Coordinate monthly Zarr publication, recovery, and cataloged coverage."""
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import closing, contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 import json
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS source_files (
     path TEXT UNIQUE NOT NULL,
     created_at TEXT NOT NULL,
     downloaded_at TEXT,
+    removed_at TEXT,
     UNIQUE (object_key, etag)
 );
 CREATE TABLE IF NOT EXISTS source_selections (
@@ -42,16 +43,6 @@ CREATE TABLE IF NOT EXISTS source_selections (
     start_time TEXT NOT NULL,
     end_time TEXT NOT NULL,
     PRIMARY KEY (source_id, start_time, end_time)
-);
-CREATE TABLE IF NOT EXISTS staged_batches (
-    id TEXT PRIMARY KEY,
-    year INTEGER NOT NULL,
-    month INTEGER NOT NULL,
-    refresh INTEGER NOT NULL DEFAULT 0,
-    request_json TEXT NOT NULL,
-    batch_path TEXT UNIQUE NOT NULL,
-    metadata_json TEXT,
-    report_json TEXT
 );
 CREATE TABLE IF NOT EXISTS revisions (
     id TEXT PRIMARY KEY,
@@ -61,12 +52,10 @@ CREATE TABLE IF NOT EXISTS revisions (
     status TEXT NOT NULL CHECK (status IN ('preparing', 'ready', 'published')),
     staged_path TEXT NOT NULL,
     final_path TEXT NOT NULL,
-    batch_paths_json TEXT NOT NULL,
     provenance_json TEXT NOT NULL,
     report_json TEXT,
     created_at TEXT NOT NULL,
     published_at TEXT,
-    grib_removed INTEGER NOT NULL DEFAULT 0,
     parent_revision_id TEXT REFERENCES revisions(id),
     backup_path TEXT
 );
@@ -218,10 +207,10 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                         revision["id"], field["variable"], field["valid_time"],
                         field["source_file_id"], field["source_variable"],
                     )
-                    for field in report["fields"] if "source_file_id" in field
+                    for field in report["fields"]
                 ],
             )
-            remove_published_source_hours(db, provenance.get("source_selections", []))
+            remove_published_source_hours(db, provenance["source_selections"])
             db.execute(
                 "UPDATE revisions SET status = 'published', published_at = ? WHERE id = ?",
                 (datetime.now(UTC).isoformat(), revision["id"]),
@@ -231,12 +220,6 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                    ON CONFLICT (year, month) DO UPDATE
                    SET current_revision_id = excluded.current_revision_id""",
                 (revision["year"], revision["month"], revision["id"]),
-            )
-            # The published revision now owns cleanup, so these downloads must
-            # not be reused as unfinished work by another refresh.
-            db.executemany(
-                "DELETE FROM staged_batches WHERE batch_path = ?",
-                [(path,) for path in json.loads(revision["batch_paths_json"])],
             )
 
     for revision in db.execute(
@@ -259,36 +242,6 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
         else:
             with db:
                 db.execute("UPDATE revisions SET backup_path = NULL WHERE id = ?", (revision["id"],))
-
-    for revision in db.execute(
-        "SELECT id, batch_paths_json FROM revisions WHERE status = 'published' AND grib_removed = 0"
-    ).fetchall():
-        try:
-            batches = [Path(path) for path in json.loads(revision["batch_paths_json"])]
-            for batch in batches:
-                (batch / "data.grib").unlink(missing_ok=True)
-            owned = (archive / "staging" / "batches").resolve()
-            for batch in batches:
-                batch = batch.resolve()
-                if batch == owned or not batch.is_relative_to(owned):
-                    continue
-                checkpoint = batch / "converted.zarr"
-                target = checkpoint.resolve()
-                if target == batch or not target.is_relative_to(batch):
-                    raise ValueError(f"The converted checkpoint is outside its batch directory: {checkpoint}.")
-                if checkpoint.exists():
-                    shutil.rmtree(target)
-        except OSError as exc:
-            warnings.warn(
-                f"Published data are available; source cleanup remains pending: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        else:
-            with db:
-                db.execute(
-                    "UPDATE revisions SET grib_removed = 1 WHERE id = ?", (revision["id"],)
-                )
 
     delete_ingested_netcdf_files(db)
 
@@ -343,9 +296,9 @@ def remove_published_source_hours(
 def delete_ingested_netcdf_files(db: sqlite3.Connection) -> None:
     """Delete NCAR NetCDF downloads after all selected hours are published.
 
-    After deletion, clear the download-completion timestamp so a later download
-    fetches the file again. If deletion fails, keep the timestamp so the next
-    archive run retries cleanup.
+    Delete completed or partial files once no selected hours still need them.
+    Record removal and clear download completion so later selections fetch the
+    source again. A failed deletion remains pending for the next archive run.
 
     Args:
         db: Catalog connection protected by publication or writer ownership.
@@ -355,7 +308,7 @@ def delete_ingested_netcdf_files(db: sqlite3.Connection) -> None:
     """
     for source in db.execute(
         """SELECT id, path FROM source_files f
-           WHERE downloaded_at IS NOT NULL AND NOT EXISTS (
+           WHERE removed_at IS NULL AND NOT EXISTS (
                SELECT 1 FROM source_selections s WHERE s.source_id = f.id
            )"""
     ).fetchall():
@@ -370,8 +323,8 @@ def delete_ingested_netcdf_files(db: sqlite3.Connection) -> None:
         else:
             with db:
                 db.execute(
-                    "UPDATE source_files SET downloaded_at = NULL WHERE id = ?",
-                    (source["id"],),
+                    "UPDATE source_files SET downloaded_at = NULL, removed_at = ? WHERE id = ?",
+                    (datetime.now(UTC).isoformat(), source["id"]),
                 )
 
 
@@ -403,12 +356,32 @@ def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
             yield db
 
 
+def group_hour_intervals(hours: Iterable[int]) -> list[tuple[int, int]]:
+    """Group UTC hours into contiguous inclusive timestamp intervals.
+
+    Args:
+        hours: UTC hours as integer Unix timestamps, in any order.
+
+    Returns:
+        Sorted pairs containing each interval's first and last hour.
+    """
+    intervals: list[tuple[int, int]] = []
+    for hour in sorted(set(hours)):
+        if intervals and hour == intervals[-1][1] + 3600:
+            intervals[-1] = (intervals[-1][0], hour)
+        else:
+            intervals.append((hour, hour))
+    return intervals
+
+
 def register_sources(
     db: sqlite3.Connection,
     archive: Path,
     sources: Sequence[SourceFile],
     start: date,
     end: date,
+    *,
+    selected_hours: set[tuple[str, int]] | None = None,
 ) -> list[sqlite3.Row]:
     """Register source files and selected hours before starting downloads.
 
@@ -423,6 +396,8 @@ def register_sources(
         sources: Discovered source files overlapping the requested dates.
         start: First selected UTC date, inclusive.
         end: Last selected UTC date, inclusive.
+        selected_hours: Exact variable/hour pairs to register within these dates;
+            None selects every available hour.
 
     Returns:
         Source catalog rows in discovery order, including download completion.
@@ -458,14 +433,23 @@ def register_sources(
                 row = db.execute(
                     "SELECT * FROM source_files WHERE id = ?", (identifier,)
                 ).fetchone()
-            db.execute(
+            elif row["removed_at"] is not None:
+                db.execute("UPDATE source_files SET removed_at = NULL WHERE id = ?", (row["id"],))
+                row = db.execute("SELECT * FROM source_files WHERE id = ?", (row["id"],)).fetchone()
+            first = int(max(selected_start, source.valid_start).timestamp())
+            last = int(min(selected_end, source.valid_end).timestamp())
+            intervals = [(first, last)] if selected_hours is None else group_hour_intervals(
+                hour for variable, hour in selected_hours
+                if variable == source.variable and first <= hour <= last
+            )
+            db.executemany(
                 """INSERT OR IGNORE INTO source_selections
                    (source_id, start_time, end_time) VALUES (?, ?, ?)""",
-                (
-                    row["id"],
-                    max(selected_start, source.valid_start).astimezone(UTC).isoformat(),
-                    min(selected_end, source.valid_end).astimezone(UTC).isoformat(),
-                ),
+                [
+                    (row["id"], (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=first)).isoformat(),
+                     (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=last)).isoformat())
+                    for first, last in intervals
+                ],
             )
             rows.append(row)
     return rows
@@ -503,11 +487,11 @@ def current_month(
     report["fields"] = [
         {
             key: field[key] for key in field.keys()
-            if key != "revision_id" and field[key] is not None
+            if key != "revision_id"
         }
         for field in db.execute(
             """SELECT c.*, s.source_file_id, s.source_variable
-               FROM coverage c LEFT JOIN field_sources s
+               FROM coverage c JOIN field_sources s
                  USING (revision_id, variable, valid_time)
                WHERE c.revision_id = ? ORDER BY c.variable, c.valid_time""",
             (revision["id"],),
@@ -516,59 +500,32 @@ def current_month(
     return final, report
 
 
-def missing_fields(
-    db: sqlite3.Connection,
-    year: int,
-    month: int,
-    variables: Sequence[str],
-    valid_times: Sequence[int],
-) -> dict[str, list[int]]:
-    """Find CDS variable/hour pairs absent from completed source requests.
-
-    Published monthly replacements preserve earlier coverage. Their recorded
-    requests therefore identify completed selections independently of the
-    decoder's array names and each retained field's original retrieval.
+def get_published_hours(
+    db: sqlite3.Connection, year: int, month: int,
+) -> set[tuple[str, int]]:
+    """Return NCAR variable/hour pairs published in the current monthly store.
 
     Args:
-        db: Catalog connection from archive_session.
+        db: Catalog connection protected by writer or publication ownership.
         year: Calendar year.
         month: Calendar month.
-        variables: Exact CDS variable names from the requested selection.
-        valid_times: Requested UTC hours as integer Unix timestamps.
 
     Returns:
-        Variables with missing hours, each sorted in ascending time order.
-        An empty mapping means all requested fields are already published.
-
-    Raises:
-        sqlite3.Error: Reading catalog coverage fails.
+        Source short names and UTC hours as integer Unix timestamps.
     """
-    missing = {variable: set(valid_times) for variable in variables}
-    for revision in db.execute(
-        """SELECT provenance_json FROM revisions
-           WHERE year = ? AND month = ? AND status = 'published'""", (year, month)
-    ):
-        provenance = json.loads(revision["provenance_json"])
-        for source in provenance.get("sources", [provenance]):
-            request = source["request"]
-            selected = missing.keys() & request["variable"]
-            if not selected:
-                continue
-            covered = {
-                int(datetime.fromisoformat(
-                    f"{year:04d}-{month:02d}-{int(day):02d}T{hour}:00+00:00"
-                ).timestamp())
-                for day in request["day"] for hour in request["time"]
-            }
-            for variable in selected:
-                missing[variable].difference_update(covered)
     return {
-        variable: sorted(times) for variable, times in missing.items() if times
+        (row["source_variable"], row["valid_time"])
+        for row in db.execute(
+            """SELECT f.source_variable, f.valid_time FROM months m
+               JOIN field_sources f ON f.revision_id = m.current_revision_id
+               WHERE m.year = ? AND m.month = ?""",
+            (year, month),
+        )
     }
 
 
 def prepare_revision(
-    db: sqlite3.Connection, archive: Path, batches: Sequence[Path], metadata: dict[str, Any],
+    db: sqlite3.Connection, archive: Path, metadata: dict[str, Any],
     *, year: int, month: int,
 ) -> tuple[str, Path]:
     """Record a new monthly revision and create its staging directory.
@@ -580,8 +537,7 @@ def prepare_revision(
     Args:
         db: Catalog connection from archive_session.
         archive: Archive directory.
-        batches: Completed source download directories contributing to this revision.
-        metadata: Download provenance or a monthly source selection manifest.
+        metadata: NCAR source provenance and selected hours for this publication.
         year: Calendar year of the publication's valid UTC hours.
         month: Calendar month of the publication's valid UTC hours.
 
@@ -619,12 +575,11 @@ def prepare_revision(
         db.execute(
             """INSERT INTO revisions
             (id, year, month, request_sha256, status, staged_path, final_path,
-             batch_paths_json, provenance_json, created_at, parent_revision_id, backup_path)
-            VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?, ?, ?, ?)""",
+             provenance_json, created_at, parent_revision_id, backup_path)
+            VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?, ?, ?)""",
             (
                 revision_id, year, month, metadata["request_sha256"], stage.as_posix(),
-                final.as_posix(),
-                json.dumps([str(batch.resolve()) for batch in batches]), json.dumps(metadata),
+                final.as_posix(), json.dumps(metadata),
                 datetime.now(UTC).isoformat(), parent[0] if parent is not None else None,
                 backup.as_posix() if backup is not None else None,
             ),

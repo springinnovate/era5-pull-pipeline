@@ -1,7 +1,7 @@
-"""Verify command-line behavior without contacting CDS."""
+"""Verify the public NCAR command-line inputs and error reporting."""
 
+from datetime import UTC, date, datetime
 from pathlib import Path
-from datetime import date
 from unittest.mock import Mock
 
 import pytest
@@ -9,174 +9,74 @@ import pytest
 from era5_pull_pipeline import cli
 
 
-@pytest.mark.parametrize("dry_run", [False, True])
-def test_ncar_command_without_credentials(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool,
-) -> None:
-    """Expose anonymous source selection and inventory preview from the CLI."""
-    monkeypatch.chdir(tmp_path)
-    download = Mock(return_value=[])
-    monkeypatch.setattr(cli, "download_ncar", download)
-    args = [
-        "download-ncar", "--start-date", "1950-01-01", "--end-date", "1950-01-31",
-        "--variables", "2t", "ssrd", "mtpr", "--archive", "ncar-archive",
-    ]
-    if dry_run:
-        args.append("--dry-run")
-    assert cli.main(args) == 0
-    download.assert_called_once_with(
-        date(1950, 1, 1), date(1950, 1, 31), ["2t", "ssrd", "mtpr"],
-        Path("ncar-archive"), dry_run=dry_run,
-    )
-
-
-def test_ncar_interruption_explains_resume(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Keep a stopped download resumable through the same user command."""
-    monkeypatch.setattr(cli, "download_ncar", Mock(side_effect=KeyboardInterrupt))
-    assert cli.main([
-        "download-ncar", "--start-date", "2000-01-01", "--end-date", "2000-01-01",
-        "--variables", "2t",
-    ]) == 130
-    assert "Run the same command again" in capsys.readouterr().err
-
-
-def test_missing_credentials_raise_before_request(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Let the missing-file error identify the local configuration path."""
-    monkeypatch.chdir(tmp_path)
-    check = Mock()
-    monkeypatch.setattr(cli, "check_access", check)
-    with pytest.raises(FileNotFoundError, match=".cdsapirc"):
-        cli.main(["check-access"])
-    check.assert_not_called()
-
-
-@pytest.mark.parametrize("outcome", [32, KeyboardInterrupt()])
-def test_cli_reports_success_and_interruption(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    outcome: int | BaseException,
-) -> None:
-    """Use the local file and return useful status codes without exposing its token."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".cdsapirc").write_text(
-        "url: https://example.test/api\nkey: secret-test-token\n", encoding="utf-8"
-    )
-    check = Mock(return_value=outcome) if isinstance(outcome, int) else Mock(side_effect=outcome)
-    monkeypatch.setattr(cli, "check_access", check)
-    code = cli.main(["check-access", "--output", "probe.grib"])
-    output = capsys.readouterr()
-    assert "secret-test-token" not in output.out + output.err
-    assert check.call_args.args[0].key == "secret-test-token"
-    assert check.call_args.args[1] == Path("probe.grib")
-    if isinstance(outcome, int):
-        assert code == 0
-        assert "CDS access verified" in output.out
-        assert "Saved GRIB to probe.grib" in output.out
-    else:
-        assert code == 130
-        assert "CDS access verified" not in output.out
-
-
-def test_service_errors_retain_original_details(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Keep service failures available for diagnosis without reporting success."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".cdsapirc").write_text(
-        "url: https://example.test/api\nkey: test-token\n", encoding="utf-8"
-    )
-    failure = RuntimeError("CDS job failed with provider details")
-    monkeypatch.setattr(cli, "check_access", Mock(side_effect=failure))
-    with pytest.raises(RuntimeError) as caught:
-        cli.main(["check-access"])
-    assert caught.value is failure
-    assert "CDS access verified" not in capsys.readouterr().out
-
-
-def test_cli_rejects_geographic_selection() -> None:
-    """Keep clipping and extent selection outside the command's inputs."""
-    with pytest.raises(SystemExit) as caught:
-        cli.main(["check-access", "--area", "0,0,1,1"])
-    assert caught.value.code == 2
-
-
-def test_download_batch_command(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Pass the selected dates, variables, and batch settings to the downloader."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".cdsapirc").write_text(
-        "url: https://example.test/api\nkey: test-token\n", encoding="utf-8"
-    )
-    completed = Path("staging/completed-batch")
-    download = Mock(return_value=completed)
-    monkeypatch.setattr(cli, "download_batch", download)
-
-    assert cli.main([
-        "download-batch",
-        "--start-date", "2000-01-01",
-        "--end-date", "2000-01-02",
-        "--variables", "2m_temperature", "total_precipitation",
-        "--max-days", "2",
-        "--staging", "staging",
-    ]) == 0
-
-    credentials, *selection = download.call_args.args
-    assert credentials.key == "test-token"
-    assert selection[0] == cli.build_batch_request(
-        date(2000, 1, 1), date(2000, 1, 2),
-        ["2m_temperature", "total_precipitation"], 2,
-    )
-    assert selection[1].parent == Path("staging")
-    assert f"Saved completed batch to {completed}" in capsys.readouterr().out
-
-
-def test_archive_commands_do_not_load_credentials_before_catalog_lookup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Allow offline ingestion and repeat requests without a local token."""
-    monkeypatch.chdir(tmp_path)
-    published = Path("archive/2000/01/era5.zarr")
-    pull = Mock(return_value=published)
-    ingest = Mock(return_value=published)
-    monkeypatch.setattr(cli, "pull_batch", pull)
-    monkeypatch.setattr(cli, "ingest_batch", ingest)
-
-    assert cli.main([
-        "pull-batch", "--start-date", "2000-01-01", "--end-date", "2000-01-01",
-        "--variables", "2m_temperature", "--spatial-chunks", "16", "32",
-    ]) == 0
-    pull.assert_called_once_with(
-        date(2000, 1, 1), date(2000, 1, 1), ["2m_temperature"],
-        Path("archive"), (16, 32), 7,
-    )
-    assert cli.main(["ingest-batch", "--batch", "completed"]) == 0
-    ingest.assert_called_once_with(Path("completed"), Path("archive"), (32, 32))
-    assert capsys.readouterr().out.count(f"Published data available at {published}") == 2
-
-
 @pytest.mark.parametrize("refresh", [False, True])
-def test_range_command_accepts_month_boundaries_and_batch_size(
-    monkeypatch: pytest.MonkeyPatch, refresh: bool,
-) -> None:
-    """Expose resumable range processing with separate batching and storage inputs."""
+def test_pull_selection_and_limits(monkeypatch: pytest.MonkeyPatch, refresh: bool) -> None:
+    """Pass a cross-year selection and resource limits to the bulk workflow."""
     pull = Mock()
     monkeypatch.setattr(cli, "pull_range", pull)
     args = [
         "pull", "--start-date", "1999-12-31", "--end-date", "2000-01-02",
-        "--variables", "2m_temperature", "total_precipitation", "--batch-days", "1",
-        "--archive", "downloads/manual-archive-13", "--spatial-chunks", "16", "32",
+        "--variables", "2t", "ssrd", "mtpr", "--archive", "archive",
+        "--download-workers", "1", "--max-source-gb", "8", "--spatial-chunks", "16", "32",
     ]
     if refresh:
         args.append("--refresh")
     assert cli.main(args) == 0
     pull.assert_called_once_with(
-        date(1999, 12, 31), date(2000, 1, 2), ["2m_temperature", "total_precipitation"],
-        Path("downloads/manual-archive-13"), (16, 32), 1,
-        refresh=refresh,
+        date(1999, 12, 31), date(2000, 1, 2), ["2t", "ssrd", "mtpr"], Path("archive"),
+        (16, 32), download_workers=1, max_source_gb=8, refresh=refresh,
     )
+
+
+def test_full_history_ends_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a backfill command continue through the current UTC date."""
+    pull = Mock()
+    monkeypatch.setattr(cli, "pull_range", pull)
+    before = datetime.now(UTC).date()
+    assert cli.main(["pull", "--start-date", "1950-01-01", "--variables", "2t"]) == 0
+    assert pull.call_args.args[0] == date(1950, 1, 1)
+    assert before <= pull.call_args.args[1] <= datetime.now(UTC).date()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_source_download_command(monkeypatch: pytest.MonkeyPatch, dry_run: bool) -> None:
+    """Keep standalone downloads and inventory previews available."""
+    download = Mock()
+    monkeypatch.setattr(cli, "download_ncar", download)
+    args = [
+        "download-ncar", "--start-date", "1950-01-01", "--end-date", "1950-01-31",
+        "--variables", "2t", "--download-workers", "3",
+    ]
+    if dry_run:
+        args.append("--dry-run")
+    assert cli.main(args) == 0
+    download.assert_called_once_with(
+        date(1950, 1, 1), date(1950, 1, 31), ["2t"], Path("archive"),
+        dry_run=dry_run, download_workers=3,
+    )
+
+
+def test_local_ingestion_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Select a local month and replacement behavior without inventory access."""
+    ingest = Mock(return_value=Path("archive/2000/01/era5.zarr"))
+    monkeypatch.setattr(cli, "ingest_ncar", ingest)
+    assert cli.main(["ingest-ncar", "--year", "2000", "--month", "1", "--refresh"]) == 0
+    ingest.assert_called_once_with(Path("archive"), 2000, 1, (32, 32), refresh=True)
+
+
+def test_interruption_explains_resume(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Return a useful exit code after the workflow preserves interrupted work."""
+    monkeypatch.setattr(cli, "pull_range", Mock(side_effect=KeyboardInterrupt))
+    assert cli.main(["pull", "--start-date", "2000-01-01", "--variables", "2t"]) == 130
+    assert "Run the same command again" in capsys.readouterr().err
+
+
+def test_failures_keep_original_details(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Propagate the original failure so the traceback remains useful."""
+    failure = RuntimeError("NCAR source request failed")
+    monkeypatch.setattr(cli, "pull_range", Mock(side_effect=failure))
+    with pytest.raises(RuntimeError) as caught:
+        cli.main(["pull", "--start-date", "2000-01-01", "--variables", "2t"])
+    assert caught.value is failure

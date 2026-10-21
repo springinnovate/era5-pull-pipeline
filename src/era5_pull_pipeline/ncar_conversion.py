@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from contextlib import ExitStack
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import product
 import mmap
 from pathlib import Path
@@ -71,7 +71,7 @@ def read_ncar_netcdf_arrays(
         Exception: NetCDF and filesystem failures propagate.
     """
     requested = np.array(sorted(selected_times), dtype=np.int64)
-    month = datetime.fromtimestamp(int(requested[0]), UTC)
+    month = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=int(requested[0]))
     with xr.open_dataset(path, engine="h5netcdf", decode_timedelta=False) as dataset:
         if not (
             np.array_equal(dataset.latitude.values, conversion.GLOBAL_LATITUDES)

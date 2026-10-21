@@ -9,14 +9,10 @@ description = "Command-line tools for a global ERA5 archive"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "cdsapi>=0.7.7,<0.8",
-    "cfgrib>=0.9.15.1,<0.10",
-    "eccodes>=2.40,<3",
     "h5netcdf[h5py]>=1.8,<2",
     "multiurl>=0.3.9,<0.4",
     "numpy>=1.26",
     "portalocker>=3,<4",
-    "PyYAML>=6,<7",
     "requests>=2.31,<3",
     "tqdm>=4.66,<5",
     "xarray>=2025.3.1",
