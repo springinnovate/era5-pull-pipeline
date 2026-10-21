@@ -1,4 +1,4 @@
-"""Publish one month of cataloged NCAR downloads without contacting the provider."""
+"""Ingest downloaded NCAR NetCDF data into monthly Zarr stores."""
 
 from calendar import monthrange
 from collections import defaultdict
@@ -26,12 +26,12 @@ def ingest_ncar(
     *,
     refresh: bool = False,
 ) -> Path:
-    """Merge selected downloaded hours into a losslessly compressed monthly store.
+    """Ingest downloaded NCAR NetCDF data into the monthly Zarr archive.
 
-    The catalog supplies source paths and pending selections. Existing fields
-    are preserved unless refresh is requested. A source shared by months stays
-    staged until all its selected hours have been published. Decoding and
-    publication failures retain sources and leave the current month unchanged.
+    Read file paths and selected hours from the catalog, convert the data, and
+    publish the month. Preserve existing fields unless refresh is requested.
+    Delete each NetCDF file after all its selected hours have been published.
+    A failed conversion or publication retains the files for another attempt.
 
     Args:
         archive: Archive containing a download-ncar catalog and staged sources.
