@@ -1,4 +1,4 @@
-"""Decode selected NCAR NetCDF hours into bounded, disk-backed monthly inputs."""
+"""Read selected hourly data from NCAR NetCDF files into NumPy arrays."""
 
 from collections.abc import Sequence
 from contextlib import ExitStack
@@ -31,7 +31,7 @@ def _attributes(values: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def decode_source(
+def read_ncar_netcdf_arrays(
     path: Path,
     source_id: str,
     source_variable: str,
@@ -41,26 +41,29 @@ def decode_source(
     *,
     source_identity: str,
 ) -> tuple[dict[str, NDArray[Any]], dict[str, Any]]:
-    """Read selected global hours once per native chunk without changing values.
+    """Read selected hours from an NCAR NetCDF file into NumPy arrays.
 
-    Analysis fields use their time coordinate. Forecast fields use initialization
-    plus lead time; NCAR accumulation and mean-flux fields already describe the
-    preceding hour and are copied without differencing or unit conversion.
-    Original source metadata is returned separately from stable array attributes.
-    The caller owns publication, scratch lifetime, and source-file cleanup.
+    The arrays have dimensions (time, latitude, longitude) and use temporary
+    memory-mapped files. Keep resources open while using the returned arrays.
+    Read each needed NetCDF chunk once and preserve its decoded values and units.
+
+    Analysis fields use their time coordinate. Forecast valid times are
+    initialization time plus lead hours. Accumulations and mean rates retain
+    their preceding-hour intervals. The returned report includes field coverage,
+    interval endpoints, and the original file attributes for Zarr publication.
 
     Args:
-        path: Completed source file recorded in the catalog.
+        path: Downloaded NCAR NetCDF file recorded in the catalog.
         source_id: Catalog identity of this exact provider file revision.
         source_variable: NCAR short name selected by the user.
         selected_times: Requested UTC Unix seconds, all in one calendar month.
         scratch: Existing directory for disk-backed decoded values.
-        resources: Scope retaining and closing the decoded memory mapping.
+        resources: ExitStack that closes the temporary files and memory mappings.
         source_identity: SHA256 identity of the recorded source provenance.
 
     Returns:
-        A single-variable array mapping and a report of actual field coverage,
-        source identity, interval semantics, grid, and source attributes.
+        A dictionary mapping the variable's readable name to its NumPy array,
+        and a report containing field times, grid, source identity, and attributes.
 
     Raises:
         ValueError: The external file lacks selected hours, duplicates valid

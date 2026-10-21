@@ -133,7 +133,7 @@ def test_repeat_uses_published_coverage_without_decoding(
     _stage_analysis(archive)
     published = ncar_ingest.ingest_ncar(archive, 2000, 1, (2, 2))
     repeated, _ = _stage_analysis(archive)
-    monkeypatch.setattr(ncar_ingest, "decode_source", Mock(side_effect=AssertionError("repeat decoded")))
+    monkeypatch.setattr(ncar_ingest, "read_ncar_netcdf_arrays", Mock(side_effect=AssertionError("repeat decoded")))
     assert ncar_ingest.ingest_ncar(archive, 2000, 1, (2, 2)) == published
     assert not Path(repeated["path"]).exists()
     assert ncar_ingest.ingest_ncar(archive, 2000, 1, (2, 2)) == published

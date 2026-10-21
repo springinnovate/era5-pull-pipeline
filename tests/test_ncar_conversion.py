@@ -76,7 +76,7 @@ def test_analysis_preserves_selected_float32_values_and_metadata(tmp_path: Path)
     expected = write_source(path)
     selected = np.array(["2000-01-01T00", "2000-01-01T03"], dtype="datetime64[s]").astype(np.int64)
     with ExitStack() as resources:
-        arrays, report = ncar_conversion.decode_source(
+        arrays, report = ncar_conversion.read_ncar_netcdf_arrays(
             path, "analysis-source", "2t", selected, tmp_path, resources,
             source_identity="analysis-sha256",
         )
@@ -110,7 +110,7 @@ def test_forecasts_keep_preceding_hour_values_across_month_boundary(
     expected = write_source(path, variable)
     selected = np.array(["2000-01-01T00", "2000-01-01T01"], dtype="datetime64[s]").astype(np.int64)
     with ExitStack() as resources:
-        arrays, report = ncar_conversion.decode_source(
+        arrays, report = ncar_conversion.read_ncar_netcdf_arrays(
             path, "forecast-source", variable, selected, tmp_path, resources,
             source_identity="forecast-sha256",
         )
@@ -135,7 +135,7 @@ def test_missing_selected_hour_rejects_incomplete_source(tmp_path: Path) -> None
     write_source(path)
     selected = [int(np.datetime64("2000-01-01T05", "s").astype(np.int64))]
     with ExitStack() as resources, pytest.raises(ValueError, match="each selected UTC hour"):
-        ncar_conversion.decode_source(
+        ncar_conversion.read_ncar_netcdf_arrays(
             path, "missing-hour", "2t", selected, tmp_path, resources,
             source_identity="source-sha256",
         )
@@ -150,7 +150,7 @@ def test_regional_source_is_not_accepted_as_global(tmp_path: Path) -> None:
     region.to_netcdf(path, engine="h5netcdf")
     selected = [int(np.datetime64("2000-01-01T00", "s").astype(np.int64))]
     with ExitStack() as resources, pytest.raises(ValueError, match="full global"):
-        ncar_conversion.decode_source(
+        ncar_conversion.read_ncar_netcdf_arrays(
             path, "regional-source", "2t", selected, tmp_path, resources,
             source_identity="source-sha256",
         )

@@ -15,7 +15,7 @@ from era5_pull_pipeline.catalog import (
     prepare_revision, publish_revision,
 )
 from era5_pull_pipeline.conversion import write_month
-from era5_pull_pipeline.ncar_conversion import decode_source
+from era5_pull_pipeline.ncar_conversion import read_ncar_netcdf_arrays
 
 
 def ingest_ncar(
@@ -121,7 +121,7 @@ def ingest_ncar(
                     source_identity = hashlib.sha256(
                         json.dumps(source, sort_keys=True, separators=(",", ":")).encode()
                     ).hexdigest()
-                    arrays, report = decode_source(
+                    arrays, report = read_ncar_netcdf_arrays(
                         Path(record["path"]), record["id"], record["variable"],
                         source["selected_hours"], Path(scratch), resources,
                         source_identity=source_identity,
