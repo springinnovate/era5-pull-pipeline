@@ -257,7 +257,7 @@ def convert_batch(
                     for field in fields
                 ],
             }
-            return write_month(
+            return write_monthly_zarr(
                 [(arrays, report)], metadata, output, spatial_chunks,
                 previous=previous, previous_report=previous_report,
             )
@@ -303,13 +303,13 @@ def assemble_month(
             {variable: group[variable] for variable in report["variables"]},
             report,
         ))
-    return write_month(
+    return write_monthly_zarr(
         incoming, metadata, output, spatial_chunks,
         previous=previous, previous_report=previous_report, refresh=refresh,
     )
 
 
-def write_month(
+def write_monthly_zarr(
     incoming: Sequence[tuple[dict[str, NDArray[Any] | zarr.Array], dict[str, Any]]],
     metadata: dict[str, Any],
     output: Path,
@@ -319,7 +319,11 @@ def write_month(
     previous_report: dict[str, Any] | None,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Merge source coverage, write each spatial shard, and validate reopened data.
+    """Write and validate a monthly Zarr store from source arrays.
+
+    Combine incoming arrays with the existing store for the same month, keeping
+    existing values unless refresh is requested. Write one spatial shard at a
+    time, then reopen the store to compare its values and metadata with the inputs.
 
     Args:
         incoming: Source arrays and validated reports for one calendar month.

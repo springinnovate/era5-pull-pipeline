@@ -11,10 +11,10 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from era5_pull_pipeline.catalog import (
-    archive_session, cleanup_source_files, consume_source_selections, current_month,
-    prepare_revision, publish_revision,
+    archive_session, current_month, delete_ingested_netcdf_files,
+    prepare_revision, publish_revision, remove_published_source_hours,
 )
-from era5_pull_pipeline.conversion import write_month
+from era5_pull_pipeline.conversion import write_monthly_zarr
 from era5_pull_pipeline.ncar_conversion import read_ncar_netcdf_arrays
 
 
@@ -88,8 +88,8 @@ def ingest_ncar(
             if previous is None:
                 raise ValueError(f"No downloaded selections for {year:04d}-{month:02d}. Run download-ncar first.")
             with db:
-                consume_source_selections(db, selections)
-            cleanup_source_files(db)
+                remove_published_source_hours(db, selections)
+            delete_ingested_netcdf_files(db)
             print(f"{year:04d}-{month:02d}: selected hours are already published.", flush=True)
             return previous[0]
 
@@ -133,7 +133,7 @@ def ingest_ncar(
                         "UPDATE revisions SET provenance_json = ? WHERE id = ?",
                         (json.dumps(metadata), revision),
                     )
-                report = write_month(
+                report = write_monthly_zarr(
                     incoming, metadata, staged, spatial_chunks,
                     previous=previous[0] if previous else None,
                     previous_report=previous[1] if previous else None,

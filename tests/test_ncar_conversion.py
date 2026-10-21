@@ -19,7 +19,7 @@ def small_grid(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(conversion, "GLOBAL_LONGITUDES", np.array([0.0, 0.25, 0.5, 0.75]))
 
 
-def write_source(path: Path, variable: str = "2t") -> NDArray[np.float32]:
+def write_ncar_netcdf_fixture(path: Path, variable: str = "2t") -> NDArray[np.float32]:
     """Write a compressed NetCDF fixture with NCAR's time and field conventions.
 
     Args:
@@ -73,7 +73,7 @@ def write_source(path: Path, variable: str = "2t") -> NDArray[np.float32]:
 def test_analysis_preserves_selected_float32_values_and_metadata(tmp_path: Path) -> None:
     """Selected noncontiguous hours retain precision and analysis interval meaning."""
     path = tmp_path / "temperature.nc"
-    expected = write_source(path)
+    expected = write_ncar_netcdf_fixture(path)
     selected = np.array(["2000-01-01T00", "2000-01-01T03"], dtype="datetime64[s]").astype(np.int64)
     with ExitStack() as resources:
         arrays, report = ncar_conversion.read_ncar_netcdf_arrays(
@@ -107,7 +107,7 @@ def test_forecasts_keep_preceding_hour_values_across_month_boundary(
 ) -> None:
     """Radiation and precipitation retain values rather than being differenced."""
     path = tmp_path / f"e5.oper.fc.sfc.{collection}.nc"
-    expected = write_source(path, variable)
+    expected = write_ncar_netcdf_fixture(path, variable)
     selected = np.array(["2000-01-01T00", "2000-01-01T01"], dtype="datetime64[s]").astype(np.int64)
     with ExitStack() as resources:
         arrays, report = ncar_conversion.read_ncar_netcdf_arrays(
@@ -132,7 +132,7 @@ def test_forecasts_keep_preceding_hour_values_across_month_boundary(
 def test_missing_selected_hour_rejects_incomplete_source(tmp_path: Path) -> None:
     """A source with less time coverage than the catalog promises cannot publish."""
     path = tmp_path / "temperature.nc"
-    write_source(path)
+    write_ncar_netcdf_fixture(path)
     selected = [int(np.datetime64("2000-01-01T05", "s").astype(np.int64))]
     with ExitStack() as resources, pytest.raises(ValueError, match="each selected UTC hour"):
         ncar_conversion.read_ncar_netcdf_arrays(
@@ -144,7 +144,7 @@ def test_missing_selected_hour_rejects_incomplete_source(tmp_path: Path) -> None
 def test_regional_source_is_not_accepted_as_global(tmp_path: Path) -> None:
     """Unexpected provider grid extents fail before creating archive coverage."""
     path = tmp_path / "temperature.nc"
-    write_source(path)
+    write_ncar_netcdf_fixture(path)
     with xr.open_dataset(path, engine="h5netcdf") as dataset:
         region = dataset.isel(latitude=slice(0, 2)).load()
     region.to_netcdf(path, engine="h5netcdf")

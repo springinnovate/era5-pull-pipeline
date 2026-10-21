@@ -81,8 +81,18 @@ layout.
 - Give new or materially changed functions, methods, and contracts complete type
   annotations and concise Google-style docstrings. Explain purpose first, then
   `Args`, `Returns`, and `Raises` where applicable.
-- Use names that describe the object or action. A name and its first documentation
-  sentence should make sense to someone unfamiliar with the implementation.
+- Name functions for the concrete action and object. For conversions, identify
+  the input and output when that makes the operation clearer, such as
+  `read_ncar_netcdf_arrays` or `write_monthly_zarr`. Avoid vague names such as
+  `resolve_data` or `decode_source` that leave the reader guessing what is read,
+  changed, or returned. Use the shortest name that makes the operation clear.
+- Start docstrings with a plain sentence saying what the function does, such as
+  "Ingest downloaded NCAR NetCDF data into the monthly Zarr archive." Put
+  implementation details, constraints, and failure cases afterward. Do not lead
+  with incidental behavior, abstract terminology, or explanations of what the
+  function avoids doing. Check the name and opening sentence together: someone
+  unfamiliar with the code should understand the operation without reading its
+  implementation.
 - Keep human-facing documentation in the README: requirements, setup, inputs,
   usage, and output layout. Describe the current design in present tense.
   Exclude implementation recaps, plans, progress reports, change histories, and

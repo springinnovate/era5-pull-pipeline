@@ -16,7 +16,7 @@ import xarray as xr
 from era5_pull_pipeline import conversion
 
 
-def _attributes(values: dict[str, Any]) -> dict[str, Any]:
+def _attributes_to_json_values(values: dict[str, Any]) -> dict[str, Any]:
     """Convert NetCDF attribute scalars and arrays to JSON-compatible values.
 
     Args:
@@ -123,7 +123,7 @@ def read_ncar_netcdf_arrays(
             "step_type": step_type,
             "step_units": "s",
         }
-        attributes.update(_attributes({
+        attributes.update(_attributes_to_json_values({
             key: value for key, value in array.attrs.items()
             if key in {"ecmwf_local_table", "ecmwf_parameter", "number_of_significant_digits"}
             or key.startswith("Quantize")
@@ -193,16 +193,16 @@ def read_ncar_netcdf_arrays(
             "variables": {variable: attributes},
             "fields": fields,
             "source_attributes": {
-                "global": _attributes(dataset.attrs),
-                "variable": _attributes(array.attrs),
+                "global": _attributes_to_json_values(dataset.attrs),
+                "variable": _attributes_to_json_values(array.attrs),
                 "coordinates": {
-                    key: _attributes(dataset[key].attrs)
+                    key: _attributes_to_json_values(dataset[key].attrs)
                     for key in (*temporal_dimensions, "latitude", "longitude")
                 },
                 "encoding": {
                     key: {
                         "dtype": str(dataset[key].encoding["dtype"]),
-                        **_attributes({
+                        **_attributes_to_json_values({
                             name: value for name, value in dataset[key].encoding.items()
                             if name in {"units", "calendar", "_FillValue", "missing_value", "scale_factor", "add_offset"}
                         }),

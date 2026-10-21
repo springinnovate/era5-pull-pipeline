@@ -221,7 +221,7 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                     for field in report["fields"] if "source_file_id" in field
                 ],
             )
-            consume_source_selections(db, provenance.get("source_selections", []))
+            remove_published_source_hours(db, provenance.get("source_selections", []))
             db.execute(
                 "UPDATE revisions SET status = 'published', published_at = ? WHERE id = ?",
                 (datetime.now(UTC).isoformat(), revision["id"]),
@@ -290,21 +290,20 @@ def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
                     "UPDATE revisions SET grib_removed = 1 WHERE id = ?", (revision["id"],)
                 )
 
-    cleanup_source_files(db)
+    delete_ingested_netcdf_files(db)
 
 
-def consume_source_selections(
+def remove_published_source_hours(
     db: sqlite3.Connection, selections: Sequence[dict[str, str]]
 ) -> None:
-    """Subtract published UTC hours from pending source selection intervals.
+    """Remove published hours from pending NCAR selections in the catalog.
 
-    The caller owns the transaction, so selection consumption and publication
-    become durable together. A shared source retains its other selected hours
-    until their publications succeed.
+    The caller commits this update in the same transaction as publication.
+    Hours outside the published intervals remain pending.
 
     Args:
         db: Catalog connection inside the caller's publication transaction.
-        selections: Consumed inclusive intervals with source_id, start_time,
+        selections: Published inclusive intervals with source_id, start_time,
             and end_time as UTC ISO timestamps.
 
     Raises:
@@ -341,12 +340,12 @@ def consume_source_selections(
             )
 
 
-def cleanup_source_files(db: sqlite3.Connection) -> None:
-    """Remove completed NetCDF inputs after all pending selections are consumed.
+def delete_ingested_netcdf_files(db: sqlite3.Connection) -> None:
+    """Delete NCAR NetCDF downloads after all selected hours are published.
 
-    A failed unlink leaves catalog completion intact for a later cleanup retry.
-    Clearing completion after removal makes a later download reuse the source
-    identity without mistakenly reusing its deleted local file.
+    After deletion, clear the download-completion timestamp so a later download
+    fetches the file again. If deletion fails, keep the timestamp so the next
+    archive run retries cleanup.
 
     Args:
         db: Catalog connection protected by publication or writer ownership.
@@ -415,8 +414,8 @@ def register_sources(
 
     The object key and ETag identify a source revision. Repeated selections
     reuse its recorded path and completion state without inspecting the file.
-    Pending selected hours remain separate from the additional hours packaged
-    by NCAR and are consumed after their monthly publication succeeds.
+    Only requested hours enter the pending selections. Remove them after their
+    monthly publication succeeds; extra hours in the file remain unselected.
 
     Args:
         db: Catalog connection protected by the archive writer lock.
@@ -572,10 +571,11 @@ def prepare_revision(
     db: sqlite3.Connection, archive: Path, batches: Sequence[Path], metadata: dict[str, Any],
     *, year: int, month: int,
 ) -> tuple[str, Path]:
-    """Replace abandoned revision workspaces and record the month to publish.
+    """Record a new monthly revision and create its staging directory.
 
-    The staged store's parent owns its decoded scratch files as well, allowing
-    a restart to reclaim an assembly interrupted by process termination.
+    First remove unfinished staging directories for the same month. Each
+    directory contains the staged Zarr store and its temporary decoded arrays,
+    so restarting also removes files left by an interrupted conversion.
 
     Args:
         db: Catalog connection from archive_session.

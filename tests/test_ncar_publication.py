@@ -13,10 +13,10 @@ from era5_pull_pipeline import catalog
 from era5_pull_pipeline.ncar import SourceFile
 
 
-def _download_source(
+def _stage_downloaded_source(
     db: sqlite3.Connection, archive: Path, start: datetime, end: datetime
 ) -> tuple[SourceFile, sqlite3.Row]:
-    """Register a selected source and retain completed bytes for publication.
+    """Create a placeholder NetCDF download and record its selected hours.
 
     Args:
         db: Open writer catalog.
@@ -99,7 +99,7 @@ def test_shared_forecast_source_survives_until_both_months_publish(tmp_path: Pat
     start = datetime(1999, 12, 31, 23, tzinfo=UTC)
     end = datetime(2000, 1, 1, 1, tzinfo=UTC)
     with catalog.archive_session(archive) as db:
-        source, row = _download_source(db, archive, start, end)
+        source, row = _stage_downloaded_source(db, archive, start, end)
         path = Path(row["path"])
         first, _, report = _stage_month(db, archive, row, start, start)
         catalog.publish_revision(db, archive, first, report)
@@ -125,7 +125,7 @@ def test_publishing_middle_selection_retains_both_unpublished_sides(tmp_path: Pa
     archive = tmp_path / "archive"
     start = datetime(2000, 1, 1, tzinfo=UTC)
     with catalog.archive_session(archive) as db:
-        _, row = _download_source(db, archive, start, start + timedelta(hours=71))
+        _, row = _stage_downloaded_source(db, archive, start, start + timedelta(hours=71))
         revision, _, report = _stage_month(
             db, archive, row, start + timedelta(hours=24), start + timedelta(hours=47),
         )
@@ -145,7 +145,7 @@ def test_failed_publication_does_not_consume_selections(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     start = datetime(2000, 1, 1, tzinfo=UTC)
     with catalog.archive_session(archive) as db:
-        _, row = _download_source(db, archive, start, start)
+        _, row = _stage_downloaded_source(db, archive, start, start)
         revision, stage, report = _stage_month(db, archive, row, start, start)
         db.execute(
             "CREATE TEMP TRIGGER fail_month BEFORE INSERT ON months "
@@ -177,7 +177,7 @@ def test_interrupted_publication_recovers_source_consumption(
         raise KeyboardInterrupt
 
     with catalog.archive_session(archive) as db:
-        _, row = _download_source(db, archive, start, start)
+        _, row = _stage_downloaded_source(db, archive, start, start)
         revision, _, report = _stage_month(db, archive, row, start, start)
         with monkeypatch.context() as patch:
             patch.setattr(catalog, "_rename_store", interrupt_after_rename)
@@ -199,7 +199,7 @@ def test_source_cleanup_failure_retries_without_losing_published_data(
     start = datetime(2000, 1, 1, tzinfo=UTC)
     unlink = Path.unlink
     with catalog.archive_session(archive) as db:
-        _, row = _download_source(db, archive, start, start)
+        _, row = _stage_downloaded_source(db, archive, start, start)
         path = Path(row["path"])
         revision, _, report = _stage_month(db, archive, row, start, start)
 
