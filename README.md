@@ -169,6 +169,10 @@ One writer owns the archive. Consumers follow **update → refresh → calculate
 
 The [one-time converter](scripts/convert_zarr_archive.py) copies the current published observations into a **separate** COG archive. It reads only cataloged coverage, preserves source values and time semantics, and copies pending selections and any retained or partial NetCDF downloads. It leaves the original archive unchanged. Conversion needs room for the COG archive, retained NetCDF copies, and one variable/month of decoded scratch data (about 3.1 GB for 744 float32 global hours).
 
+The converter uses four worker processes by default to encode and validate separate COGs. `--workers` sets the maximum number of observations in flight; each worker receives one hourly raster while the coordinator owns SQLite and publication. Use `--workers 1` for serial conversion. On a 24-core machine, start with `--workers 8`, then compare against 16 using the publication rate. Zarr reads, network storage, and catalog commits can limit the benefit of additional workers.
+
+Progress displays cover source metadata import, retained-file copying, spatial-shard reads, and COG publication, with counts, elapsed time, and rates.
+
 1. Leave the existing download running until you are ready to convert. Stop it with Ctrl+C and wait for it to exit. Keep the old archive stopped throughout conversion, including between interrupted converter runs. If its catalog has a validated but unfinished publication, the converter asks you to run the old pipeline once to recover it before retrying.
 2. Check out this code and install the optional conversion dependency in your environment:
 
@@ -179,10 +183,12 @@ The [one-time converter](scripts/convert_zarr_archive.py) copies the current pub
 3. Run from the repository directory, using a new sibling destination:
 
    ```powershell
-   python scripts/convert_zarr_archive.py --source Z:/wwf-resilience-platform/era5-ncar --archive Z:/wwf-resilience-platform/era5-cog
+   python scripts/convert_zarr_archive.py --source Z:/wwf-resilience-platform/era5-ncar --archive Z:/wwf-resilience-platform/era5-cog --workers 8
    ```
 
    Keep the existing `era5-ncar` directory available for current readers. If conversion stops, rerun the same command: the destination catalog skips completed TIFFs and partial NetCDF copies continue from their saved byte position. Do not run `pull` against the destination until conversion reports completion. The new producer rejects a Zarr catalog rather than modifying it in place.
+
+   To change the worker count or update a running converter, press Ctrl+C and wait for it to exit before restarting with the same paths. Active workers finish before their decoded input is released; completed cataloged observations are reused, and unfinished publications are recovered or rebuilt.
 
 4. Inspect the new archive with the query above, setting `archive` to the COG destination. Then restart downloading with the same date range and variables:
 

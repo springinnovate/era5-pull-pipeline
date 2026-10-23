@@ -1,10 +1,12 @@
 """Exercise the disposable converter against real Zarr, SQLite, and COG files."""
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import importlib.util
 import json
 from pathlib import Path
 import sqlite3
+from threading import Barrier, Event, Lock, get_ident
 from typing import Any
 
 import numpy as np
@@ -20,6 +22,20 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC is not None and SPEC.loader is not None
 converter = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(converter)
+
+
+@pytest.fixture
+def controlled_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use threads for fault coordination while retaining real raster I/O.
+
+    The successful conversion tests exercise spawned processes. These tests
+    need shared events and monkeypatches to stop work at publication boundaries.
+    """
+    def executor(*, max_workers: int, mp_context: Any) -> ThreadPoolExecutor:
+        """Run the same bounded Future workflow with controllable worker threads."""
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    monkeypatch.setattr(converter, "ProcessPoolExecutor", executor)
 
 
 @pytest.fixture
@@ -107,12 +123,13 @@ def old_archive(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
     return source, {"temperature": temperature, "precipitation": precipitation, "times": times, "attributes": source_attributes}
 
 
-def test_conversion_preserves_coverage_values_and_pending_sources(old_archive: tuple[Path, dict[str, Any]], tmp_path: Path) -> None:
+@pytest.mark.parametrize("workers", [1, 3])
+def test_conversion_preserves_coverage_values_and_pending_sources(old_archive: tuple[Path, dict[str, Any]], tmp_path: Path, workers: int) -> None:
     """Publish only current covered observations and preserve both download states."""
     source, expected = old_archive
     archive = tmp_path / "cogs"
     original_bytes = {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()}
-    assert converter.convert_zarr_archive(source, archive) == 3
+    assert converter.convert_zarr_archive(source, archive, workers=workers) == 3
     assert {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()} == original_bytes
     with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
         db.row_factory = sqlite3.Row
@@ -149,7 +166,7 @@ def test_conversion_preserves_coverage_values_and_pending_sources(old_archive: t
     assert not (archive / "staging" / "conversion" / "values.bin").exists()
 
 
-def test_interrupted_conversion_resumes_without_rewriting_published_cogs(old_archive: tuple[Path, dict[str, Any]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_interrupted_conversion_resumes_without_rewriting_published_cogs(old_archive: tuple[Path, dict[str, Any]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, controlled_workers: None) -> None:
     """A failed COG write leaves source bytes and prior publications reusable."""
     source, _ = old_archive
     archive = tmp_path / "cogs"
@@ -165,16 +182,16 @@ def test_interrupted_conversion_resumes_without_rewriting_published_cogs(old_arc
 
     monkeypatch.setattr(converter, "write_observation_cog", interrupt_second)
     with pytest.raises(OSError, match="interrupted"):
-        converter.convert_zarr_archive(source, archive)
+        converter.convert_zarr_archive(source, archive, workers=1)
     with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
         row = db.execute("SELECT path FROM observations").fetchone()
         assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
     published = archive / row[0]
     timestamp = published.stat().st_mtime_ns
     monkeypatch.setattr(converter, "write_observation_cog", write)
-    assert converter.convert_zarr_archive(source, archive) == 2
+    assert converter.convert_zarr_archive(source, archive, workers=1) == 2
     assert published.stat().st_mtime_ns == timestamp
-    assert converter.convert_zarr_archive(source, archive) == 0
+    assert converter.convert_zarr_archive(source, archive, workers=1) == 0
 
 
 def test_interrupted_retained_source_copy_resumes_before_marking_download_complete(old_archive: tuple[Path, dict[str, Any]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -217,3 +234,125 @@ def test_converter_requires_original_publication_recovery(old_archive: tuple[Pat
     with pytest.raises(ValueError, match="old pipeline"):
         converter.convert_zarr_archive(source, tmp_path / "cogs")
     assert not (tmp_path / "cogs").exists()
+
+
+def test_parallel_writers_overlap_with_one_catalog_owner(
+    old_archive: tuple[Path, dict[str, Any]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    controlled_workers: None,
+) -> None:
+    """Write separate rasters concurrently while the caller owns publication."""
+    source, _ = old_archive
+    archive = tmp_path / "parallel"
+    write = converter.write_observation_cog
+    publish = converter.publish_observation
+    owner = get_ident()
+    barrier = Barrier(2, timeout=10)
+    lock = Lock()
+    active = peak = 0
+
+    def overlapping_write(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Hold both temperature writes together at the real raster boundary."""
+        nonlocal active, peak
+        assert get_ident() != owner
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            if args[1]["variable"] == "2_metre_temperature":
+                barrier.wait()
+            return write(*args, **kwargs)
+        finally:
+            with lock:
+                active -= 1
+
+    def publish_from_owner(*args: Any, **kwargs: Any) -> Path:
+        """Check catalog ownership while exercising actual file publication."""
+        assert get_ident() == owner
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(converter, "write_observation_cog", overlapping_write)
+    monkeypatch.setattr(converter, "publish_observation", publish_from_owner)
+    assert converter.convert_zarr_archive(source, archive, workers=2) == 3
+    assert peak == 2 and active == 0
+    monkeypatch.setattr(converter, "write_observation_cog", lambda *args, **kwargs: pytest.fail("Repeat encoded a stored observation"))
+    assert converter.convert_zarr_archive(source, archive, workers=2) == 0
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_parallel_failure_keeps_committed_rasters_and_resumes(
+    old_archive: tuple[Path, dict[str, Any]], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, failure: type[BaseException], controlled_workers: None,
+) -> None:
+    """Retain the committed first raster when a concurrent writer fails."""
+    source, expected = old_archive
+    archive = tmp_path / "interrupted"
+    write = converter.write_observation_cog
+    publish = converter.publish_observation
+    first_published = Event()
+
+    def fail_after_first_commit(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Fail the second temperature write after the first becomes durable."""
+        field = args[1]
+        if field["variable"] == "2_metre_temperature" and field["valid_time"] == int(expected["times"][1]):
+            assert first_published.wait(10)
+            raise failure("parallel conversion interrupted")
+        return write(*args, **kwargs)
+
+    def record_first_commit(*args: Any, **kwargs: Any) -> Path:
+        """Release the failing writer once an actual publication completes."""
+        path = publish(*args, **kwargs)
+        first_published.set()
+        return path
+
+    with monkeypatch.context() as patch:
+        patch.setattr(converter, "write_observation_cog", fail_after_first_commit)
+        patch.setattr(converter, "publish_observation", record_first_commit)
+        with pytest.raises(failure, match="parallel conversion interrupted"):
+            converter.convert_zarr_archive(source, archive, workers=2)
+    with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
+        rows = db.execute("SELECT path FROM observations").fetchall()
+        assert len(rows) == 1
+        assert db.execute("SELECT COUNT(*) FROM source_selections").fetchone()[0] == 2
+    first = archive / rows[0][0]
+    modified = first.stat().st_mtime_ns
+    assert not (archive / "staging/conversion/values.bin").exists()
+    assert converter.convert_zarr_archive(source, archive, workers=2) == 2
+    assert first.stat().st_mtime_ns == modified
+
+
+def test_interrupt_waits_for_active_writers_before_releasing_decoded_arrays(
+    old_archive: tuple[Path, dict[str, Any]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    controlled_workers: None,
+) -> None:
+    """Finish active raster I/O before closing its shared memory mapping."""
+    source, _ = old_archive
+    archive = tmp_path / "stopped"
+    started = Event()
+    release = Event()
+    finished = Event()
+    write = converter.write_observation_cog
+
+    def held_write(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Keep a real TIFF write in flight when the coordinator is stopped."""
+        started.set()
+        assert release.wait(10)
+        result = write(*args, **kwargs)
+        finished.set()
+        return result
+
+    def interrupt_wait(*args: Any, **kwargs: Any) -> Any:
+        """Interrupt the coordinator once a writer has borrowed the array."""
+        assert started.wait(10)
+        with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
+            assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] == 1
+        release.set()
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(converter, "write_observation_cog", held_write)
+        patch.setattr(converter, "wait", interrupt_wait)
+        with pytest.raises(KeyboardInterrupt):
+            converter.convert_zarr_archive(source, archive, workers=1)
+    assert finished.is_set()
+    assert not (archive / "staging/conversion/values.bin").exists()
+    assert converter.convert_zarr_archive(source, archive, workers=2) == 3
