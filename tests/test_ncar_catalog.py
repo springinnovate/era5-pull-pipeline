@@ -43,9 +43,9 @@ def test_register_source_before_download(tmp_path: Path, source: SourceFile) -> 
         assert row["valid_end"] == "2000-01-31T23:00:00+00:00"
         assert row["downloaded_at"] is None
         assert Path(row["path"]) == (
-            archive / "staging" / "ncar" / row["id"] / Path(source.key).name
+            Path("staging") / "ncar" / row["id"] / Path(source.key).name
         )
-        assert not Path(row["path"]).exists()
+        assert not (archive / row["path"]).exists()
         assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
 
     with catalog.archive_session(archive) as db:
@@ -94,7 +94,7 @@ def test_completed_source_registration_uses_recorded_state(
         row = catalog.register_sources(
             db, archive, [source], date(2000, 1, 1), date(2000, 1, 1)
         )[0]
-        path = Path(row["path"])
+        path = archive / row["path"]
         path.parent.mkdir(parents=True)
         path.write_bytes(b"completed source")
         completed_at = datetime.now(UTC).isoformat()

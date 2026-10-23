@@ -1,28 +1,22 @@
-"""Coordinate monthly Zarr publication, recovery, and cataloged coverage."""
+"""Publish observation COGs and track NCAR sources in the SQLite catalog."""
 
+from calendar import monthrange
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import closing, contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 from typing import Any
 from uuid import uuid4
 import warnings
 
 import portalocker
-import xarray as xr
-import zarr
 
 from era5_pull_pipeline.ncar import SourceFile
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS source_files (
     id TEXT PRIMARY KEY,
     object_key TEXT NOT NULL,
@@ -35,7 +29,9 @@ CREATE TABLE IF NOT EXISTS source_files (
     path TEXT UNIQUE NOT NULL,
     created_at TEXT NOT NULL,
     downloaded_at TEXT,
+    retrieved_at TEXT,
     removed_at TEXT,
+    attributes_json TEXT,
     UNIQUE (object_key, etag)
 );
 CREATE TABLE IF NOT EXISTS source_selections (
@@ -44,84 +40,84 @@ CREATE TABLE IF NOT EXISTS source_selections (
     end_time TEXT NOT NULL,
     PRIMARY KEY (source_id, start_time, end_time)
 );
-CREATE TABLE IF NOT EXISTS revisions (
-    id TEXT PRIMARY KEY,
-    year INTEGER NOT NULL,
-    month INTEGER NOT NULL,
-    request_sha256 TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('preparing', 'ready', 'published')),
-    staged_path TEXT NOT NULL,
-    final_path TEXT NOT NULL,
-    provenance_json TEXT NOT NULL,
-    report_json TEXT,
-    created_at TEXT NOT NULL,
-    published_at TEXT,
-    parent_revision_id TEXT REFERENCES revisions(id),
-    backup_path TEXT
-);
-CREATE TABLE IF NOT EXISTS months (
-    year INTEGER NOT NULL,
-    month INTEGER NOT NULL,
-    current_revision_id TEXT NOT NULL REFERENCES revisions(id),
-    PRIMARY KEY (year, month)
+CREATE TABLE IF NOT EXISTS variables (
+    name TEXT PRIMARY KEY,
+    attributes_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS coverage (
-    revision_id TEXT NOT NULL REFERENCES revisions(id),
-    variable TEXT NOT NULL,
+    variable TEXT NOT NULL REFERENCES variables(name),
     valid_time INTEGER NOT NULL,
-    reference_time INTEGER NOT NULL,
+    path TEXT UNIQUE NOT NULL,
+    reference_time INTEGER,
     interval_start INTEGER NOT NULL,
     interval_end INTEGER NOT NULL,
-    start_step INTEGER NOT NULL,
-    end_step INTEGER NOT NULL,
+    start_step INTEGER,
+    end_step INTEGER,
     step_units TEXT NOT NULL,
     step_type TEXT NOT NULL,
-    source_revision_id TEXT NOT NULL REFERENCES revisions(id),
-    source_request_sha256 TEXT NOT NULL,
-    PRIMARY KEY (revision_id, variable, valid_time)
-);
-CREATE TABLE IF NOT EXISTS field_sources (
-    revision_id TEXT NOT NULL,
-    variable TEXT NOT NULL,
-    valid_time INTEGER NOT NULL,
     source_file_id TEXT NOT NULL REFERENCES source_files(id),
     source_variable TEXT NOT NULL,
-    PRIMARY KEY (revision_id, variable, valid_time),
-    FOREIGN KEY (revision_id, variable, valid_time)
-        REFERENCES coverage(revision_id, variable, valid_time)
+    raster_json TEXT NOT NULL,
+    PRIMARY KEY (variable, valid_time)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ready_month
-    ON revisions (year, month) WHERE status = 'ready';
+CREATE INDEX IF NOT EXISTS coverage_time ON coverage (valid_time);
+CREATE TABLE IF NOT EXISTS publications (
+    id TEXT PRIMARY KEY,
+    variable TEXT NOT NULL,
+    valid_time INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('preparing', 'ready')),
+    staged_path TEXT NOT NULL,
+    final_path TEXT NOT NULL,
+    field_json TEXT NOT NULL,
+    attributes_json TEXT NOT NULL,
+    raster_json TEXT,
+    UNIQUE (variable, valid_time)
+);
+CREATE VIEW IF NOT EXISTS observations AS
+SELECT c.variable, c.valid_time, c.path,
+       json_extract(v.attributes_json, '$.name') AS name,
+       json_extract(v.attributes_json, '$.units') AS units,
+       json_extract(c.raster_json, '$.band') AS band,
+       json_extract(c.raster_json, '$.dtype') AS dtype,
+       json_extract(c.raster_json, '$.nodata') AS nodata,
+       json_extract(c.raster_json, '$.crs') AS crs,
+       json_extract(c.raster_json, '$.transform') AS transform,
+       json_extract(c.raster_json, '$.shape[0]') AS height,
+       json_extract(c.raster_json, '$.shape[1]') AS width,
+       c.reference_time, c.interval_start, c.interval_end,
+       CASE c.step_type WHEN 'instant' THEN 'instant'
+                        WHEN 'avg' THEN 'mean'
+                        WHEN 'accum' THEN 'accumulation' END AS temporal_type,
+       c.start_step, c.end_step, c.step_units,
+       c.source_file_id, c.source_variable, f.object_key, f.etag, f.last_modified, f.retrieved_at
+FROM coverage c JOIN variables v ON v.name = c.variable
+JOIN source_files f ON f.id = c.source_file_id
+WHERE NOT EXISTS (
+    SELECT 1 FROM publications p WHERE p.variable = c.variable
+    AND p.valid_time = c.valid_time AND p.status = 'ready'
+);
+"""
+
+DATASET_YAML = """id: era5-ncar
+title: ERA5 hourly weather
+source:
+  format: temporal_cog
+  catalog: catalog.sqlite
 """
 
 
-def _check_store(path: Path, revision: sqlite3.Row) -> None:
-    """Match a store's revision identifier to its publication journal entry.
+def _install_observation(source: Path, destination: Path) -> None:
+    """Replace an observation file and flush directory entries where supported.
 
     Args:
-        path: Existing Zarr store.
-        revision: Catalog revision expected at that path.
+        source: Complete, validated staged COG on the archive filesystem.
+        destination: Deterministic published observation path.
 
     Raises:
-        ValueError: The store identifies another revision.
-        Exception: Zarr reading errors propagate.
+        OSError: Installing or flushing the file fails.
     """
-    attrs = zarr.open_group(path, mode="r").attrs
-    if attrs["revision_id"] != revision["id"]:
-        raise ValueError(f"The store at {path} belongs to a different revision.")
-
-
-def _rename_store(source: Path, destination: Path) -> None:
-    """Rename a store and persist directory entries where supported.
-
-    Args:
-        source: Existing store directory.
-        destination: Unoccupied destination on the same filesystem.
-
-    Raises:
-        OSError: Renaming or flushing the directory entries fails.
-    """
-    source.rename(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(source, destination)
     if os.name != "nt":
         for directory in {source.parent, destination.parent}:
             descriptor = os.open(directory, os.O_RDONLY)
@@ -132,118 +128,199 @@ def _rename_store(source: Path, destination: Path) -> None:
 
 
 def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
-    """Finish validated publications while the publication lock is held.
+    """Finish validated COG publications after file or catalog interruption.
 
     Args:
-        db: Open catalog connection with no active transaction.
-        archive: Archive containing staged and published stores.
+        db: Catalog connection with exclusive writer ownership.
+        archive: Archive containing the journaled relative paths.
 
     Raises:
-        ValueError: A store does not identify its journaled revision.
-        OSError: A required store cannot be published.
-        sqlite3.Error: Recording published coverage fails.
+        Exception: File installation or catalog errors propagate; the ready
+            journal entry remains for the next writer to finish.
     """
-    for revision in db.execute(
-        "SELECT * FROM revisions WHERE status = 'ready'"
+    for publication in db.execute(
+        "SELECT * FROM publications WHERE status = 'ready'"
     ).fetchall():
-        stage = archive / revision["staged_path"]
-        final = archive / revision["final_path"]
-        backup = archive / revision["backup_path"] if revision["backup_path"] else None
-        parent = db.execute(
-            "SELECT * FROM revisions WHERE id = ?", (revision["parent_revision_id"],)
-        ).fetchone()
-        if stage.exists():
-            _check_store(stage, revision)
-            final.parent.mkdir(parents=True, exist_ok=True)
-            if final.exists():
-                if parent is None or backup.exists():
-                    raise FileExistsError(f"The publication destination is occupied: {final}.")
-                _check_store(final, parent)
-                _rename_store(final, backup)
-            elif parent is not None and not backup.exists():
-                raise FileNotFoundError(f"The previous monthly store is missing: {final}.")
-            _rename_store(stage, final)
-        _check_store(final, revision)
-        if parent is not None:
-            _check_store(backup, parent)
-        report = json.loads(revision["report_json"])
-        provenance = json.loads(revision["provenance_json"])
+        staged = archive / publication["staged_path"]
+        final = archive / publication["final_path"]
+        if staged.exists():
+            _install_observation(staged, final)
+        elif not final.is_file():
+            raise FileNotFoundError(f"The journaled observation is missing: {final}")
+        field = json.loads(publication["field_json"])
         with db:
-            db.executemany(
+            db.execute(
+                """INSERT INTO variables VALUES (?, ?)
+                   ON CONFLICT (name) DO UPDATE SET attributes_json = excluded.attributes_json""",
+                (field["variable"], publication["attributes_json"]),
+            )
+            db.execute(
                 """INSERT INTO coverage
-                   (revision_id, variable, valid_time, reference_time, interval_start,
+                   (variable, valid_time, path, reference_time, interval_start,
                     interval_end, start_step, end_step, step_units, step_type,
-                    source_revision_id, source_request_sha256)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    (
-                        revision["id"], field["variable"], field["valid_time"],
-                        field["reference_time"], field["interval_start"],
-                        field["interval_end"], field["start_step"], field["end_step"],
-                        field["step_units"], field["step_type"],
-                        field.get("source_revision_id", revision["id"]),
-                        field["source_request_sha256"],
-                    )
-                    for field in report["fields"]
-                ],
+                    source_file_id, source_variable, raster_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (variable, valid_time) DO UPDATE SET
+                    path = excluded.path, reference_time = excluded.reference_time,
+                    interval_start = excluded.interval_start, interval_end = excluded.interval_end,
+                    start_step = excluded.start_step, end_step = excluded.end_step,
+                    step_units = excluded.step_units, step_type = excluded.step_type,
+                    source_file_id = excluded.source_file_id,
+                    source_variable = excluded.source_variable, raster_json = excluded.raster_json""",
+                (
+                    field["variable"], field["valid_time"], publication["final_path"],
+                    field["reference_time"], field["interval_start"], field["interval_end"],
+                    field["start_step"], field["end_step"], field["step_units"], field["step_type"],
+                    field["source_file_id"], field["source_variable"], publication["raster_json"],
+                ),
             )
-            db.executemany(
-                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-                [
-                    (key, json.dumps(value, sort_keys=True))
-                    for key, value in {
-                        "dataset": provenance["dataset"],
-                        "grid": report["grid"],
-                        "layout": report["layout"],
-                    }.items()
-                ],
-            )
-            db.executemany(
-                """INSERT INTO field_sources
-                   (revision_id, variable, valid_time, source_file_id, source_variable)
-                   VALUES (?, ?, ?, ?, ?)""",
-                [
-                    (
-                        revision["id"], field["variable"], field["valid_time"],
-                        field["source_file_id"], field["source_variable"],
-                    )
-                    for field in report["fields"]
-                ],
-            )
-            remove_published_source_hours(db, provenance["source_selections"])
-            db.execute(
-                "UPDATE revisions SET status = 'published', published_at = ? WHERE id = ?",
-                (datetime.now(UTC).isoformat(), revision["id"]),
-            )
-            db.execute(
-                """INSERT INTO months VALUES (?, ?, ?)
-                   ON CONFLICT (year, month) DO UPDATE
-                   SET current_revision_id = excluded.current_revision_id""",
-                (revision["year"], revision["month"], revision["id"]),
-            )
+            db.execute("DELETE FROM publications WHERE id = ?", (publication["id"],))
 
-    for revision in db.execute(
-        "SELECT id, backup_path FROM revisions WHERE status = 'published' AND backup_path IS NOT NULL"
-    ).fetchall():
-        backup = archive / revision["backup_path"]
-        owned = (archive / "staging" / "revisions").resolve()
-        target = backup.resolve()
-        if target == owned or not target.is_relative_to(owned):
-            raise ValueError(f"The old revision is outside the archive revision directory: {backup}.")
-        try:
-            if backup.exists():
-                shutil.rmtree(backup)
-        except OSError as exc:
-            warnings.warn(
-                f"Published data are available; old revision cleanup remains pending: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        else:
-            with db:
-                db.execute("UPDATE revisions SET backup_path = NULL WHERE id = ?", (revision["id"],))
 
-    delete_ingested_netcdf_files(db)
+@contextmanager
+def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
+    """Open the catalog with one writer and finish interrupted publications.
+
+    Consumers refresh their catalog after updates and hold source files unchanged
+    during calculations. This writer lock prevents competing pipeline processes.
+
+    Args:
+        archive: Archive directory to create or extend.
+
+    Yields:
+        A catalog connection protected from other pipeline writers.
+
+    Raises:
+        portalocker.exceptions.LockException: Another writer holds the archive.
+        ValueError: The archive contains a Zarr catalog and needs separate conversion.
+        Exception: Catalog or publication recovery errors propagate.
+    """
+    archive.mkdir(parents=True, exist_ok=True)
+    with portalocker.Lock(archive / ".writer.lock", "a", timeout=0):
+        with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
+            db.row_factory = sqlite3.Row
+            coverage_columns = {row["name"] for row in db.execute("PRAGMA table_info(coverage)")}
+            if coverage_columns and "path" not in coverage_columns:
+                raise ValueError(
+                    f"The archive at {archive} is not a COG catalog. Convert it with "
+                    "python scripts/convert_zarr_archive.py --source OLD --archive NEW."
+                )
+            db.execute("PRAGMA foreign_keys = ON")
+            db.execute("PRAGMA synchronous = FULL")
+            db.executescript(SCHEMA)
+            _recover_publications(db, archive)
+            delete_ingested_netcdf_files(db, archive)
+            descriptor = archive / "dataset.yaml"
+            if not descriptor.exists():
+                staged_descriptor = archive / ".dataset.yaml.tmp"
+                staged_descriptor.write_text(DATASET_YAML, encoding="utf-8")
+                os.replace(staged_descriptor, descriptor)
+            yield db
+
+
+def prepare_observation(
+    db: sqlite3.Connection, archive: Path, field: dict[str, Any], attributes: dict[str, Any],
+) -> tuple[str, Path]:
+    """Record an observation conversion and return its staged COG path.
+
+    Replace an abandoned conversion for the same observation. Existing published
+    coverage stays visible until the replacement file is complete and validated.
+
+    Args:
+        db: Catalog connection protected by archive_session.
+        archive: Archive receiving the observation.
+        field: Decoded variable, UTC timestamps, interval semantics and source IDs.
+        attributes: Variable name, units and source metadata.
+
+    Returns:
+        Publication identifier and absolute or archive-rooted staged TIFF path.
+
+    Raises:
+        Exception: Filesystem or catalog errors propagate.
+    """
+    previous = db.execute(
+        "SELECT * FROM publications WHERE variable = ? AND valid_time = ?",
+        (field["variable"], field["valid_time"]),
+    ).fetchone()
+    if previous is not None:
+        # archive_session finishes every ready entry before accepting new work.
+        (archive / previous["staged_path"]).unlink(missing_ok=True)
+        with db:
+            db.execute("DELETE FROM publications WHERE id = ?", (previous["id"],))
+    timestamp = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=field["valid_time"])
+    variable = field["variable"]
+    final = Path(f"{timestamp:%Y/%m}") / variable / f"{variable}_{timestamp:%Y%m%dT%H%M%SZ}.tif"
+    identifier = uuid4().hex
+    staged = Path("staging") / "observations" / f"{identifier}.tif"
+    (archive / staged).parent.mkdir(parents=True, exist_ok=True)
+    with db:
+        db.execute(
+            """INSERT INTO publications
+               (id, variable, valid_time, status, staged_path, final_path, field_json, attributes_json)
+               VALUES (?, ?, ?, 'preparing', ?, ?, ?, ?)""",
+            (identifier, variable, field["valid_time"], staged.as_posix(), final.as_posix(),
+             json.dumps(field), json.dumps(attributes)),
+        )
+    return identifier, archive / staged
+
+
+def publish_observation(
+    db: sqlite3.Connection, archive: Path, publication_id: str, raster_report: dict[str, Any],
+) -> Path:
+    """Install a validated COG and record its observation in the catalog.
+
+    Flush the file before recording the ready journal. If installation or the
+    coverage transaction fails, the next archive_session finishes publication.
+    The caller consumes published source selections before deleting downloads.
+
+    Args:
+        db: Catalog connection protected by archive_session.
+        archive: Archive receiving the COG.
+        publication_id: Identifier returned by prepare_observation.
+        raster_report: Validated writer report with shape, dtype, NoData and grid.
+
+    Returns:
+        The deterministic published COG path.
+
+    Raises:
+        Exception: File flushing, installation or catalog errors propagate.
+    """
+    publication = db.execute(
+        "SELECT * FROM publications WHERE id = ?", (publication_id,)
+    ).fetchone()
+    with (archive / publication["staged_path"]).open("r+b") as stream:
+        os.fsync(stream.fileno())
+    with db:
+        db.execute(
+            "UPDATE publications SET status = 'ready', raster_json = ? WHERE id = ?",
+            (json.dumps(raster_report), publication_id),
+        )
+    _recover_publications(db, archive)
+    return archive / publication["final_path"]
+
+
+def get_published_hours(
+    db: sqlite3.Connection, year: int, month: int,
+) -> set[tuple[str, int]]:
+    """Return published NCAR variable/hour pairs within one calendar month.
+
+    Args:
+        db: Catalog connection protected by writer ownership.
+        year: Calendar year.
+        month: Calendar month.
+
+    Returns:
+        Source short names and UTC hours as integer Unix timestamps.
+    """
+    start = datetime(year, month, 1, tzinfo=UTC)
+    end = start + timedelta(days=monthrange(year, month)[1])
+    return {
+        (row["source_variable"], row["valid_time"])
+        for row in db.execute(
+            "SELECT source_variable, valid_time FROM observations WHERE valid_time >= ? AND valid_time < ?",
+            (int(start.timestamp()), int(end.timestamp())),
+        )
+    }
 
 
 def remove_published_source_hours(
@@ -293,7 +370,7 @@ def remove_published_source_hours(
             )
 
 
-def delete_ingested_netcdf_files(db: sqlite3.Connection) -> None:
+def delete_ingested_netcdf_files(db: sqlite3.Connection, archive: Path) -> None:
     """Delete NCAR NetCDF downloads after all selected hours are published.
 
     Delete completed or partial files once no selected hours still need them.
@@ -301,7 +378,8 @@ def delete_ingested_netcdf_files(db: sqlite3.Connection) -> None:
     source again. A failed deletion remains pending for the next archive run.
 
     Args:
-        db: Catalog connection protected by publication or writer ownership.
+        db: Catalog connection protected by writer ownership.
+        archive: Root containing the recorded relative source paths.
 
     Raises:
         sqlite3.Error: Reading source state or recording removal fails.
@@ -313,7 +391,7 @@ def delete_ingested_netcdf_files(db: sqlite3.Connection) -> None:
            )"""
     ).fetchall():
         try:
-            Path(source["path"]).unlink(missing_ok=True)
+            (archive / source["path"]).unlink(missing_ok=True)
         except OSError as exc:
             warnings.warn(
                 f"Published data are available; source cleanup remains pending: {exc}",
@@ -326,34 +404,6 @@ def delete_ingested_netcdf_files(db: sqlite3.Connection) -> None:
                     "UPDATE source_files SET downloaded_at = NULL, removed_at = ? WHERE id = ?",
                     (datetime.now(UTC).isoformat(), source["id"]),
                 )
-
-
-@contextmanager
-def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
-    """Open the catalog with exclusive writer ownership and recover publication.
-
-    Args:
-        archive: Archive directory to create or extend.
-
-    Yields:
-        A catalog connection protected from other pipeline writers.
-
-    Raises:
-        portalocker.exceptions.LockException: Another writer holds the archive.
-        Exception: Catalog or publication recovery errors propagate.
-    """
-    archive.mkdir(parents=True, exist_ok=True)
-    with portalocker.Lock(archive / ".writer.lock", "a", timeout=0):
-        with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA foreign_keys = ON")
-            db.execute("PRAGMA synchronous = FULL")
-            with portalocker.Lock(
-                archive / ".publication.lock", "a", flags=portalocker.LOCK_EX
-            ):
-                db.executescript(SCHEMA)
-                _recover_publications(db, archive)
-            yield db
 
 
 def group_hour_intervals(hours: Iterable[int]) -> list[tuple[int, int]]:
@@ -388,7 +438,7 @@ def register_sources(
     The object key and ETag identify a source revision. Repeated selections
     reuse its recorded path and completion state without inspecting the file.
     Only requested hours enter the pending selections. Remove them after their
-    monthly publication succeeds; extra hours in the file remain unselected.
+    observation publication succeeds; extra hours in the file remain unselected.
 
     Args:
         db: Catalog connection protected by the archive writer lock.
@@ -427,7 +477,7 @@ def register_sources(
                         source.etag, source.last_modified,
                         source.valid_start.astimezone(UTC).isoformat(),
                         source.valid_end.astimezone(UTC).isoformat(),
-                        str(path.absolute()), datetime.now(UTC).isoformat(),
+                        path.relative_to(archive).as_posix(), datetime.now(UTC).isoformat(),
                     ),
                 )
                 row = db.execute(
@@ -453,242 +503,3 @@ def register_sources(
             )
             rows.append(row)
     return rows
-
-
-def current_month(
-    db: sqlite3.Connection, archive: Path, year: int, month: int
-) -> tuple[Path, dict[str, Any]] | None:
-    """Find the current monthly store and its cataloged field origins.
-
-    Args:
-        db: Catalog connection protected by writer or publication ownership.
-        archive: Archive directory.
-        year: Calendar year.
-        month: Calendar month.
-
-    Returns:
-        Store path and validation report with revision and field source IDs,
-        or None when the month has no published coverage.
-
-    Raises:
-        ValueError: The published store identifies a different revision.
-        Exception: Catalog or Zarr reading errors propagate.
-    """
-    revision = db.execute(
-        """SELECT r.* FROM months m JOIN revisions r ON r.id = m.current_revision_id
-           WHERE m.year = ? AND m.month = ?""", (year, month)
-    ).fetchone()
-    if revision is None:
-        return None
-    final = archive / revision["final_path"]
-    _check_store(final, revision)
-    report = json.loads(revision["report_json"])
-    report["revision_id"] = revision["id"]
-    report["fields"] = [
-        {
-            key: field[key] for key in field.keys()
-            if key != "revision_id"
-        }
-        for field in db.execute(
-            """SELECT c.*, s.source_file_id, s.source_variable
-               FROM coverage c JOIN field_sources s
-                 USING (revision_id, variable, valid_time)
-               WHERE c.revision_id = ? ORDER BY c.variable, c.valid_time""",
-            (revision["id"],),
-        )
-    ]
-    return final, report
-
-
-def get_published_hours(
-    db: sqlite3.Connection, year: int, month: int,
-) -> set[tuple[str, int]]:
-    """Return NCAR variable/hour pairs published in the current monthly store.
-
-    Args:
-        db: Catalog connection protected by writer or publication ownership.
-        year: Calendar year.
-        month: Calendar month.
-
-    Returns:
-        Source short names and UTC hours as integer Unix timestamps.
-    """
-    return {
-        (row["source_variable"], row["valid_time"])
-        for row in db.execute(
-            """SELECT f.source_variable, f.valid_time FROM months m
-               JOIN field_sources f ON f.revision_id = m.current_revision_id
-               WHERE m.year = ? AND m.month = ?""",
-            (year, month),
-        )
-    }
-
-
-def prepare_revision(
-    db: sqlite3.Connection, archive: Path, metadata: dict[str, Any],
-    *, year: int, month: int,
-) -> tuple[str, Path]:
-    """Record a new monthly revision and create its staging directory.
-
-    First remove unfinished staging directories for the same month. Each
-    directory contains the staged Zarr store and its temporary decoded arrays,
-    so restarting also removes files left by an interrupted conversion.
-
-    Args:
-        db: Catalog connection from archive_session.
-        archive: Archive directory.
-        metadata: NCAR source provenance and selected hours for this publication.
-        year: Calendar year of the publication's valid UTC hours.
-        month: Calendar month of the publication's valid UTC hours.
-
-    Returns:
-        Revision identifier and the Zarr path to build in staging.
-
-    Raises:
-        FileExistsError: An uncataloged store occupies the monthly path.
-        ValueError: An abandoned store is outside the archive revision directory.
-        Exception: File and catalog errors propagate.
-    """
-    final = Path(f"{year:04d}") / f"{month:02d}" / "era5.zarr"
-    parent = db.execute(
-        "SELECT current_revision_id FROM months WHERE year = ? AND month = ?", (year, month)
-    ).fetchone()
-    if parent is None and (archive / final).exists():
-        raise FileExistsError(f"An uncataloged store occupies the target month: {archive / final}")
-    owned = (archive / "staging" / "revisions").resolve()
-    for attempt in db.execute(
-        "SELECT id, staged_path FROM revisions WHERE year = ? AND month = ? AND status = 'preparing'",
-        (year, month),
-    ).fetchall():
-        abandoned = (archive / attempt["staged_path"]).parent.resolve()
-        if abandoned == owned or not abandoned.is_relative_to(owned):
-            raise ValueError(f"The abandoned revision is outside the archive revision directory: {abandoned}.")
-        if abandoned.exists():
-            shutil.rmtree(abandoned)
-        with db:
-            db.execute("DELETE FROM revisions WHERE id = ?", (attempt["id"],))
-    revision_id = uuid4().hex
-    stage = Path("staging") / "revisions" / revision_id / "era5.zarr"
-    backup = stage.with_name("previous.zarr") if parent is not None else None
-    (archive / stage).parent.mkdir(parents=True, exist_ok=True)
-    with db:
-        db.execute(
-            """INSERT INTO revisions
-            (id, year, month, request_sha256, status, staged_path, final_path,
-             provenance_json, created_at, parent_revision_id, backup_path)
-            VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?, ?, ?)""",
-            (
-                revision_id, year, month, metadata["request_sha256"], stage.as_posix(),
-                final.as_posix(), json.dumps(metadata),
-                datetime.now(UTC).isoformat(), parent[0] if parent is not None else None,
-                backup.as_posix() if backup is not None else None,
-            ),
-        )
-    return revision_id, archive / stage
-
-
-def publish_revision(
-    db: sqlite3.Connection, archive: Path, revision_id: str, report: dict[str, Any]
-) -> Path:
-    """Publish a validated replacement without discarding the previous revision.
-
-    Args:
-        db: Catalog connection from archive_session.
-        archive: Archive directory.
-        revision_id: Preparing revision returned by prepare_revision.
-        report: Converter report containing all retained and newly added fields.
-
-    Returns:
-        The published monthly Zarr path.
-
-    Raises:
-        ValueError: The report, parent revision, or archive configuration differs.
-        Exception: Publication errors propagate after restoring the old store
-            where possible. Interrupted restoration remains journaled for recovery.
-    """
-    revision = db.execute("SELECT * FROM revisions WHERE id = ?", (revision_id,)).fetchone()
-    if (report["year"], report["month"]) != (revision["year"], revision["month"]):
-        raise ValueError("The validation report does not match the revision's month.")
-    provenance = json.loads(revision["provenance_json"])
-    for key, value in {
-        "dataset": provenance["dataset"], "grid": report["grid"], "layout": report["layout"]
-    }.items():
-        stored = db.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
-        if stored is not None and json.loads(stored["value"]) != value:
-            raise ValueError(f"The requested {key} differs from the archive configuration.")
-    stage = archive / revision["staged_path"]
-    group = zarr.open_group(stage, mode="r+")
-    if group.attrs["provenance"]["request_sha256"] != revision["request_sha256"]:
-        raise ValueError("The staged store belongs to a different request.")
-    group.attrs["revision_id"] = revision_id
-    # A writable handle is necessary for fsync on Windows.
-    for directory, _, files in os.walk(stage, topdown=False):
-        for filename in files:
-            with (Path(directory) / filename).open("r+b") as stream:
-                os.fsync(stream.fileno())
-        if os.name != "nt":
-            descriptor = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-    with portalocker.Lock(archive / ".publication.lock", "a", flags=portalocker.LOCK_EX):
-        parent = db.execute(
-            "SELECT current_revision_id FROM months WHERE year = ? AND month = ?",
-            (revision["year"], revision["month"]),
-        ).fetchone()
-        if (parent[0] if parent is not None else None) != revision["parent_revision_id"]:
-            raise ValueError("The current month changed after this replacement was prepared.")
-        with db:
-            db.execute(
-                "UPDATE revisions SET status = 'ready', report_json = ? WHERE id = ?",
-                (json.dumps(report), revision_id),
-            )
-        try:
-            _recover_publications(db, archive)
-        except (OSError, sqlite3.Error):
-            status = db.execute("SELECT status FROM revisions WHERE id = ?", (revision_id,)).fetchone()[0]
-            if status == "ready":
-                final = archive / revision["final_path"]
-                backup = archive / revision["backup_path"] if revision["backup_path"] else None
-                if not stage.exists() and final.exists():
-                    _check_store(final, revision)
-                    _rename_store(final, stage)
-                if backup is not None and backup.exists():
-                    _rename_store(backup, final)
-                with db:
-                    db.execute("UPDATE revisions SET status = 'preparing' WHERE id = ?", (revision_id,))
-            raise
-    return archive / revision["final_path"]
-
-
-@contextmanager
-def open_month(archive: Path, year: int, month: int) -> Iterator[xr.Dataset]:
-    """Read a published month while preventing replacement during lazy reads.
-
-    Args:
-        archive: Existing archive directory.
-        year: Calendar year to read.
-        month: Calendar month to read.
-
-    Yields:
-        An xarray dataset usable until the context exits.
-
-    Raises:
-        FileNotFoundError: The catalog or published month does not exist.
-        Exception: Recovery or Zarr reader errors propagate.
-    """
-    if not (archive / "catalog.sqlite").is_file():
-        raise FileNotFoundError(f"No catalog exists at {archive / 'catalog.sqlite'}.")
-    with portalocker.Lock(archive / ".publication.lock", "a", flags=portalocker.LOCK_EX):
-        with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA foreign_keys = ON")
-            db.execute("PRAGMA synchronous = FULL")
-            db.executescript(SCHEMA)
-            _recover_publications(db, archive)
-            current = current_month(db, archive, year, month)
-            if current is None:
-                raise FileNotFoundError(f"No published data exist for {year:04d}-{month:02d}.")
-            with xr.open_zarr(current[0], consolidated=False, chunks=None) as dataset:
-                yield dataset

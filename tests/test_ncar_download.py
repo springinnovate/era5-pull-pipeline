@@ -136,7 +136,10 @@ def test_interrupted_transfer_resumes_and_completed_file_is_reused(
     assert server.requests[1]["Range"] == f"bytes={ncar_download.CHUNK_BYTES}-"
     assert all(request["If-Match"] == server.source.etag for request in server.requests)
     with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
-        assert db.execute("SELECT downloaded_at FROM source_files").fetchone()[0] is not None
+        downloaded_at, retrieved_at = db.execute(
+            "SELECT downloaded_at, retrieved_at FROM source_files"
+        ).fetchone()
+        assert downloaded_at is not None and retrieved_at == downloaded_at
         assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
     assert ncar_download.download_ncar(START, START, ["2t"], archive) == paths
     assert len(server.requests) == 2
@@ -156,7 +159,7 @@ def test_retry_limit_keeps_partial_source_for_next_invocation(
         recorded_path, downloaded_at = db.execute(
             "SELECT path, downloaded_at FROM source_files"
         ).fetchone()
-    path = Path(recorded_path)
+    path = archive / recorded_path
     assert downloaded_at is None
     assert path.read_bytes() == server.payload[:ncar_download.CHUNK_BYTES]
     paths = ncar_download.download_ncar(START, START, ["2t"], archive)
@@ -177,7 +180,7 @@ def test_range_refusal_keeps_partial_bytes_unchanged(
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
         row = catalog.register_sources(db, archive, [server.source], START, START)[0]
-        path = Path(row["path"])
+        path = archive / row["path"]
         path.parent.mkdir(parents=True)
         path.write_bytes(server.payload[:ncar_download.CHUNK_BYTES])
     server.responses = ["refuse-range"]
@@ -302,10 +305,11 @@ def test_transfer_failure_stops_scheduling_and_records_concurrent_success(
     assert set(calls) == {sources[0].key, sources[1].key}
     with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
         rows = db.execute(
-            "SELECT object_key, downloaded_at FROM source_files ORDER BY object_key"
+            "SELECT object_key, downloaded_at, retrieved_at FROM source_files ORDER BY object_key"
         ).fetchall()
     assert rows[0][1] is None
     assert rows[1][1] is not None
+    assert rows[1][2] == rows[1][1]
     assert rows[2][1] is None
 
 
@@ -368,5 +372,5 @@ def test_keyboard_interrupt_stops_workers_and_retains_pending_bytes(
             "SELECT path, downloaded_at FROM source_files ORDER BY object_key"
         ).fetchall()
     assert all(downloaded_at is None for _, downloaded_at in rows)
-    assert all(Path(path).read_bytes() == server.payload[:17] for path, _ in rows[:2])
+    assert all((archive / path).read_bytes() == server.payload[:17] for path, _ in rows[:2])
     assert not Path(rows[2][0]).exists()

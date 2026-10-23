@@ -23,7 +23,7 @@ layout.
 
 ## Ownership and dependencies
 
-- Keep orchestration, NCAR inventory and downloads, NetCDF conversion, Zarr storage,
+- Keep orchestration, NCAR inventory and downloads, NetCDF conversion, COG storage,
   and catalog state as clear responsibilities. Use functions and modules where
   sufficient; this list does not require a service or framework for each one.
 - Orchestration coordinates the workflow. Storage and catalog publication use
@@ -52,12 +52,17 @@ layout.
 - Preserve source units, grid coordinates, UTC timestamps, interval semantics,
   and decoded numerical precision. Lossless compression does not justify a
   lossy conversion of numeric types.
-- Treat each published revision as immutable while readers use it. Additions
-  and ERA5 corrections produce replacement monthly revisions, preserving other
-  stored variables and hours.
-- Keep one writer per archive, coordinate readers with publication, and make
-  interrupted publication recoverable. SQLite transactions do not make changes
-  to Zarr files atomic.
+- Publish one COG per variable and observation. Additions and ERA5 corrections
+  replace only selected observations, preserving other files.
+- Keep one writer per archive and make interrupted file/catalog publication
+  recoverable. Finish and validate each COG before recording coverage. SQLite
+  transactions do not make filesystem changes atomic.
+- Consumers follow update, refresh, then calculate, with files unchanged during
+  calculations. Do not add runtime fingerprints, historical raster copies, or
+  mutation checks to enforce that operating agreement.
+- Store paths relative to the archive root. Keep the public observation catalog
+  sufficient for a temporal raster consumer to locate files and interpret units
+  and intervals without provider-specific filename parsing.
 - Track completion by variable, hour, and source selection. Record completion
   only after validated data are durably published. Remove corresponding NetCDF
   downloads only after publication and catalog recording succeed.
@@ -83,11 +88,11 @@ layout.
   `Args`, `Returns`, and `Raises` where applicable.
 - Name functions for the concrete action and object. For conversions, identify
   the input and output when that makes the operation clearer, such as
-  `read_ncar_netcdf_arrays` or `write_monthly_zarr`. Avoid vague names such as
+  `read_ncar_netcdf_arrays` or `write_observation_cog`. Avoid vague names such as
   `resolve_data` or `decode_source` that leave the reader guessing what is read,
   changed, or returned. Use the shortest name that makes the operation clear.
 - Start docstrings with a plain sentence saying what the function does, such as
-  "Ingest downloaded NCAR NetCDF data into the monthly Zarr archive." Put
+  "Publish downloaded NCAR NetCDF hours as COG observations." Put
   implementation details, constraints, and failure cases afterward. Do not lead
   with incidental behavior, abstract terminology, or explanations of what the
   function avoids doing. Check the name and opening sentence together: someone
@@ -107,8 +112,8 @@ layout.
 
 - Test changed behavior in its owning component and interactions at real
   boundaries. Cover relevant failure cases: interrupted downloads, missing
-  coverage, repeat runs, monthly replacement, publication failure, and NetCDF
-  retention until successful publication.
+  coverage, repeat runs, selected observation replacement, publication failure,
+  and NetCDF retention until successful publication.
 - Do not change tests merely to accept accidental coupling or lost guarantees.
   Do not add tests that only repeat implementation details.
 - Test observable workflow behavior and real failure boundaries. Do not invent
