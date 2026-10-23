@@ -122,7 +122,7 @@ def download_file(
 
 def download_registered_sources(
     db: sqlite3.Connection, sources: Sequence[SourceFile],
-    rows: Sequence[sqlite3.Row], download_workers: int = 2,
+    rows: Sequence[sqlite3.Row], download_workers: int = 2, *, archive: Path,
 ) -> None:
     """Download registered NCAR files concurrently and record their completion.
 
@@ -134,6 +134,7 @@ def download_registered_sources(
         db: Open archive catalog owned by the calling thread.
         sources: NCAR objects to download, in the same order as their rows.
         rows: Registered source rows containing paths and download state.
+        archive: Root used to resolve cataloged relative source paths.
         download_workers: Maximum number of simultaneous file downloads.
 
     Raises:
@@ -157,7 +158,7 @@ def download_registered_sources(
         for position in range(min(download_workers, len(pending))):
             source, row = next(remaining)
             future = executor.submit(
-                download_file, source, Path(row["path"]),
+                download_file, source, archive / row["path"],
                 stop_event=stop_event, position=position,
             )
             active[future] = (row, position)
@@ -167,10 +168,11 @@ def download_registered_sources(
             for future in done:
                 future.result()
                 row, position = active[future]
+                retrieved_at = datetime.now(UTC).isoformat()
                 with db:
                     db.execute(
-                        "UPDATE source_files SET downloaded_at = ? WHERE id = ?",
-                        (datetime.now(UTC).isoformat(), row["id"]),
+                        "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
+                        (retrieved_at, retrieved_at, row["id"]),
                     )
                 del active[future]
                 positions.append(position)
@@ -180,15 +182,16 @@ def download_registered_sources(
                     break
                 source, row = next_source
                 future = executor.submit(
-                    download_file, source, Path(row["path"]),
+                    download_file, source, archive / row["path"],
                     stop_event=stop_event, position=position,
                 )
                 active[future] = (row, position)
     except BaseException as exc:
         stop_event.set()
         executor.shutdown(wait=True, cancel_futures=True)
+        retrieved_at = datetime.now(UTC).isoformat()
         completed = [
-            (datetime.now(UTC).isoformat(), row["id"])
+            (retrieved_at, retrieved_at, row["id"])
             for future, (row, _) in active.items()
             if not future.cancelled() and future.exception() is None
         ]
@@ -196,7 +199,7 @@ def download_registered_sources(
             try:
                 with db:
                     db.executemany(
-                        "UPDATE source_files SET downloaded_at = ? WHERE id = ?",
+                        "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
                         completed,
                     )
             except sqlite3.Error as catalog_error:
@@ -216,7 +219,7 @@ def download_ncar(
 
     Source files can contain extra hours; SQLite records the requested overlap
     separately for ingestion. Completed downloads are reused directly and are
-    retained on disk. This command does not publish Zarr coverage.
+    retained on disk. This command does not publish COG observations.
 
     Args:
         start: First selected UTC date.
@@ -246,7 +249,7 @@ def download_ncar(
             return []
         with archive_session(archive) as db:
             rows = register_sources(db, archive, sources, start, end)
-            download_registered_sources(db, sources, rows, download_workers)
-            completed = [Path(row["path"]) for row in rows]
+            download_registered_sources(db, sources, rows, download_workers, archive=archive)
+            completed = [archive / row["path"] for row in rows]
         print(f"Retained {len(completed)} NetCDF files; catalog: {archive / 'catalog.sqlite'}", flush=True)
         return completed

@@ -17,14 +17,14 @@ def test_pull_selection_and_limits(monkeypatch: pytest.MonkeyPatch, refresh: boo
     args = [
         "pull", "--start-date", "1999-12-31", "--end-date", "2000-01-02",
         "--variables", "2t", "ssrd", "mtpr", "--archive", "archive",
-        "--download-workers", "1", "--max-source-gb", "8", "--spatial-chunks", "16", "32",
+        "--download-workers", "1", "--max-source-gb", "8",
     ]
     if refresh:
         args.append("--refresh")
     assert cli.main(args) == 0
     pull.assert_called_once_with(
         date(1999, 12, 31), date(2000, 1, 2), ["2t", "ssrd", "mtpr"], Path("archive"),
-        (16, 32), download_workers=1, max_source_gb=8, refresh=refresh,
+        download_workers=1, max_source_gb=8, refresh=refresh,
     )
 
 
@@ -58,10 +58,10 @@ def test_source_download_command(monkeypatch: pytest.MonkeyPatch, dry_run: bool)
 
 def test_local_ingestion_command(monkeypatch: pytest.MonkeyPatch) -> None:
     """Select a local month and replacement behavior without inventory access."""
-    ingest = Mock(return_value=Path("archive/2000/01/era5.zarr"))
+    ingest = Mock(return_value=Path("archive/2000/01"))
     monkeypatch.setattr(cli, "ingest_ncar", ingest)
     assert cli.main(["ingest-ncar", "--year", "2000", "--month", "1", "--refresh"]) == 0
-    ingest.assert_called_once_with(Path("archive"), 2000, 1, (32, 32), refresh=True)
+    ingest.assert_called_once_with(Path("archive"), 2000, 1, refresh=True)
 
 
 def test_interruption_explains_resume(

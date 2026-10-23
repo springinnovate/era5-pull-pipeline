@@ -19,25 +19,23 @@ def pull_range(
     end: date,
     variables: Sequence[str],
     archive: Path,
-    spatial_chunks: tuple[int, int] = (32, 32),
     *,
     download_workers: int = 2,
     max_source_gb: float = 16,
     refresh: bool = False,
 ) -> dict[str, int]:
-    """Download selected NCAR hours and publish each month to the Zarr archive.
+    """Download selected NCAR hours and publish hourly COG observations.
 
     Schedule one month at a time. Reuse cataloged downloads, skip published
     hours, and keep forecast files needed by the next month's selection.
     The source-file budget includes pending downloads and retained inputs;
-    decoded arrays and monthly Zarr replacements require additional space.
+    decoded arrays and staged COG files require additional space.
 
     Args:
         start: First requested UTC date, inclusive.
         end: Last requested UTC date, inclusive.
         variables: NCAR short variable names from the source inventory.
-        archive: Directory containing the catalog and monthly stores.
-        spatial_chunks: Latitude and longitude cells per read chunk.
+        archive: Directory containing the catalog and observation files.
         download_workers: Maximum simultaneous file transfers.
         max_source_gb: Maximum reserved NetCDF source bytes in decimal GB.
         refresh: Retrieve current sources and replace selected stored fields.
@@ -50,7 +48,7 @@ def pull_range(
         ValueError: Dates or limits are invalid, the source budget is too small,
             or required refresh hours are unavailable.
         Exception: Transfer, conversion, and publication failures propagate.
-            Previously published months and staged downloads remain recoverable.
+            Previously published observations and staged downloads remain recoverable.
     """
     if end < start:
         raise ValueError("The end date must be on or after the start date.")
@@ -61,6 +59,14 @@ def pull_range(
                    pending=((end - start).days + 1) * 24 * len(variables))
     active_hours = 0
     activity = "opening the archive"
+
+    def record_completed_observation() -> None:
+        """Count each committed observation even if later work is interrupted."""
+        nonlocal active_hours
+        summary["completed"] += 1
+        summary["pending"] -= 1
+        active_hours -= 1
+
     try:
         with archive_session(archive) as db, requests.Session() as session:
             cursor = start
@@ -89,7 +95,7 @@ def pull_range(
                     )
                     if any(row["variable"] in variables for row in pending):
                         ingest_ncar_month(
-                            db, archive, cursor.year, cursor.month, spatial_chunks,
+                            db, archive, cursor.year, cursor.month,
                             selected_hours=requested & published, source_ids=set(),
                         )
                 if not needed:
@@ -188,15 +194,14 @@ def pull_range(
                 print(f"{label}: {len(owners)} variable-hours to publish; {skipped} skipped; "
                       f"{len(required_sources)} source files; {required_bytes / 1_000_000_000:.3f} GB reserved.", flush=True)
                 activity = f"downloading {label}"
-                download_registered_sources(db, required_sources, rows, download_workers)
+                download_registered_sources(db, required_sources, rows, download_workers, archive=archive)
                 activity = f"converting and publishing {label}"
                 print(f"{label}: converting and publishing.", flush=True)
                 result = ingest_ncar_month(
-                    db, archive, cursor.year, cursor.month, spatial_chunks, refresh=refresh,
+                    db, archive, cursor.year, cursor.month, refresh=refresh,
                     selected_hours=set(owners), source_ids={row["id"] for row in rows},
+                    on_published=record_completed_observation,
                 )
-                summary["completed"] += len(owners)
-                summary["pending"] -= len(owners)
                 active_hours = 0
                 print(f"Published {result}.", flush=True)
                 cursor = last + timedelta(days=1)
@@ -204,7 +209,7 @@ def pull_range(
         summary["failed"] += active_hours
         summary["pending"] -= active_hours
         print(f"Stopped while {activity}. Run the same command to resume; "
-              "published months and unfinished downloads remain in the archive.", flush=True)
+              "published observations and unfinished downloads remain in the archive.", flush=True)
         raise
     finally:
         print("Summary: " + ", ".join(f"{key}={value}" for key, value in summary.items()), flush=True)

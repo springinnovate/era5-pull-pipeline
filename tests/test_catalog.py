@@ -1,20 +1,19 @@
-"""Exercise NCAR publication recovery and locking with real SQLite and Zarr."""
+"""Exercise per-observation COG publication, recovery and writer ownership."""
 
 from datetime import UTC, datetime, timedelta
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 from typing import Any
-from uuid import uuid4
-from unittest.mock import Mock
 
 import numpy as np
 import portalocker
 import pytest
-import xarray as xr
-import zarr
+import rasterio
+from rasterio.transform import from_origin
 
 from era5_pull_pipeline import catalog
 from era5_pull_pipeline.ncar import SourceFile
@@ -23,426 +22,240 @@ from era5_pull_pipeline.ncar import SourceFile
 def _stage(
     db: sqlite3.Connection,
     archive: Path,
-    month: int = 1,
+    *,
     variable: str = "2_metre_temperature",
-    hours: tuple[int, ...] = (0,),
-    year: int = 2000,
+    hour: int = 0,
+    value: float = 280,
+    step_type: str = "instant",
 ) -> tuple[str, Path, Path, dict[str, Any]]:
-    """Stage a small monthly store and registered NCAR input for publication tests.
-
-    Args:
-        db: Open writer catalog.
-        archive: Archive receiving the store.
-        month: Calendar month for the fixture.
-        variable: Variable to add.
-        hours: Hours since the beginning of the month.
-        year: Calendar year for the fixture.
-
-    Returns:
-        Revision identifier, staged store, source NetCDF path, and field report.
-    """
-    previous = catalog.current_month(db, archive, year, month)
-    short_name = {"2_metre_temperature": "2t", "10_metre_u_wind_component": "10u"}[variable]
-    dates = [datetime(year, month, 1, tzinfo=UTC) + timedelta(hours=hour) for hour in hours]
+    """Stage a real COG and source identity for publication boundary tests."""
+    timestamp = datetime(1950, 1, 1, tzinfo=UTC) + timedelta(hours=hour)
+    short_name = {"2_metre_temperature": "2t", "precipitation": "mtpr"}[variable]
     source = SourceFile(
-        key=f"e5.oper.an.sfc/{year:04d}{month:02d}/{short_name}-{uuid4().hex}.nc",
-        variable=short_name, size=12, etag='"test-version"',
-        last_modified="2026-01-01T00:00:00+00:00",
-        valid_start=dates[0], valid_end=dates[-1],
+        key=f"e5.oper.an.sfc/195001/{short_name}.nc", variable=short_name,
+        size=12, etag='"test-source"', last_modified="2026-01-01T00:00:00+00:00",
+        valid_start=datetime(1950, 1, 1, tzinfo=UTC),
+        valid_end=datetime(1950, 1, 31, 23, tzinfo=UTC),
     )
-    row = catalog.register_sources(db, archive, [source], dates[0].date(), dates[-1].date())[0]
-    source_path = Path(row["path"])
-    source_path.parent.mkdir(parents=True)
+    row = catalog.register_sources(db, archive, [source], timestamp.date(), timestamp.date())[0]
+    source_path = archive / row["path"]
+    source_path.parent.mkdir(parents=True, exist_ok=True)
     source_path.write_bytes(b"source bytes")
     with db:
         db.execute("UPDATE source_files SET downloaded_at = ? WHERE id = ?",
                    (datetime.now(UTC).isoformat(), row["id"]))
-    metadata = {
-        "dataset": "nsf-ncar-era5",
-        "request_sha256": f"selection-{year}-{month}-{variable}-{hours}",
-        "sources": [{"id": row["id"], "object_key": source.key, "etag": source.etag}],
-        "source_selections": [{
-            "source_id": row["id"], "start_time": dates[0].isoformat(), "end_time": dates[-1].isoformat(),
-        }],
+    second = int(timestamp.timestamp())
+    field = {
+        "variable": variable, "valid_time": second,
+        "reference_time": None if step_type == "instant" else second - 3600,
+        "interval_start": second if step_type == "instant" else second - 3600,
+        "interval_end": second, "start_step": None if step_type == "instant" else 0,
+        "end_step": None if step_type == "instant" else 3600,
+        "step_units": "s", "step_type": step_type,
+        "source_file_id": row["id"], "source_variable": short_name,
     }
-    revision, stage = catalog.prepare_revision(db, archive, metadata, year=year, month=month)
-    timestamps = [int(value.timestamp()) for value in dates]
+    attributes = {"name": variable.replace("_", " "), "units": "K" if short_name == "2t" else "kg m-2 s-1"}
+    publication, staged = catalog.prepare_observation(db, archive, field, attributes)
+    transform = from_origin(-180.125, 90.125, 0.25, 0.25)
+    with rasterio.open(
+        staged, "w", driver="COG", width=2, height=2, count=1,
+        dtype="float32", crs="EPSG:4326", transform=transform,
+        nodata=np.nan, compress="DEFLATE", blocksize=512,
+    ) as raster:
+        raster.write(np.full((2, 2), value, dtype=np.float32), 1)
     report = {
-        "year": year, "month": month,
-        "grid": {"latitude_size": 2, "longitude_size": 2},
-        "layout": {"spatial_chunks": [2, 2], "time_chunk": "calendar_month", "shard_spatial_multiple": 2},
-        "variables": {variable: {"short_name": short_name,
-            "units": "K" if short_name == "2t" else "m s**-1", "step_type": "instant"}},
-        "fields": [{
-            "variable": variable, "valid_time": timestamp,
-            "reference_time": timestamp, "interval_start": timestamp, "interval_end": timestamp,
-            "start_step": 0, "end_step": 0, "step_units": "s", "step_type": "instant",
-            "source_request_sha256": metadata["request_sha256"],
-            "source_file_id": row["id"], "source_variable": short_name,
-        } for timestamp in timestamps],
-        "validation": {"fields": len(hours), "roundtrip": True},
+        "band": 1, "shape": [2, 2], "dtype": "float32", "nodata": "NaN",
+        "crs": "EPSG:4326", "transform": list(transform.to_gdal()),
     }
-    dataset = xr.Dataset(
-        {variable: (("time", "latitude", "longitude"),
-            np.full((len(hours), 2, 2), 280.0 if short_name == "2t" else 3.0, dtype=np.float32))},
-        coords={"time": np.array(timestamps, dtype="datetime64[s]"),
-                "latitude": [90.0, 89.75], "longitude": [0.0, 0.25]},
-    )
-    if previous is not None:
-        with xr.open_zarr(previous[0], consolidated=False, chunks=None) as old:
-            dataset = dataset.combine_first(old.load())
-        report["variables"] = {**previous[1]["variables"], **report["variables"]}
-        report["fields"] = list({
-            (field["variable"], field["valid_time"]): field
-            for field in report["fields"] + previous[1]["fields"]
-        }.values())
-    dataset.attrs = {"provenance": metadata}
-    dataset.to_zarr(stage, zarr_format=3, consolidated=False)
-    return revision, stage, source_path, report
+    return publication, staged, source_path, report
 
 
-def test_publication_records_actual_coverage_and_removes_source(tmp_path: Path) -> None:
-    """Record fields and source identities before removing the ingested file."""
+def test_publication_exposes_generic_observation_metadata(tmp_path: Path) -> None:
+    """Expose a relative COG path and UTC semantics only after publication."""
     archive = tmp_path / "archive"
     with catalog.archive_session(archive) as db:
-        revision, stage, source, report = _stage(db, archive, hours=(0, 1))
-        assert catalog.get_published_hours(db, 2000, 1) == set()
-        final = catalog.publish_revision(db, archive, revision, report)
-        assert final == archive / "2000" / "01" / "era5.zarr"
-        assert not stage.exists() and not source.exists()
-        expected = {("2t", field["valid_time"]) for field in report["fields"]}
-        assert catalog.get_published_hours(db, 2000, 1) == expected
-        assert catalog.current_month(db, archive, 2000, 1)[1]["fields"] == [
-            {**field, "source_revision_id": revision} for field in report["fields"]
-        ]
-        assert db.execute("SELECT COUNT(*) FROM source_selections").fetchone()[0] == 0
-    with catalog.open_month(archive, 2000, 1) as dataset:
-        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
-
-
-def test_replacement_preserves_history_and_independent_coverage(tmp_path: Path) -> None:
-    """Keep original field origins while adding another variable and hour."""
-    archive = tmp_path / "archive"
-    start = int(datetime(1950, 1, 1, tzinfo=UTC).timestamp())
-    with catalog.archive_session(archive) as db:
-        first, _, _, report = _stage(db, archive, year=1950, hours=(0, 1))
-        catalog.publish_revision(db, archive, first, report)
-        second, _, source, report = _stage(
-            db, archive, year=1950, variable="10_metre_u_wind_component", hours=(1,),
-        )
-        catalog.publish_revision(db, archive, second, report)
-        assert not source.exists()
-        assert catalog.get_published_hours(db, 1950, 1) == {
-            ("2t", start), ("2t", start + 3600), ("10u", start + 3600),
-        }
+        publication, staged, source, report = _stage(db, archive)
+        assert catalog.get_published_hours(db, 1950, 1) == set()
+        final = catalog.publish_observation(db, archive, publication, report)
+        assert final == archive / "1950/01/2_metre_temperature/2_metre_temperature_19500101T000000Z.tif"
+        assert not staged.exists() and source.exists()
+        observation = db.execute("SELECT * FROM observations").fetchone()
+        assert observation["path"] == final.relative_to(archive).as_posix()
+        assert observation["units"] == "K"
+        assert observation["temporal_type"] == "instant"
+        assert observation["reference_time"] is None
+        assert observation["interval_start"] == observation["interval_end"] == observation["valid_time"]
+        assert observation["dtype"] == "float32" and observation["nodata"] == "NaN"
+        assert observation["band"] == 1 and observation["crs"] == "EPSG:4326"
+        assert json.loads(observation["transform"]) == report["transform"]
+        assert catalog.get_published_hours(db, 1950, 1) == {("2t", observation["valid_time"])}
         assert catalog.get_published_hours(db, 1950, 2) == set()
-        current = catalog.current_month(db, archive, 1950, 1)[1]
-        assert current["revision_id"] == second
-        assert {f["source_revision_id"] for f in current["fields"] if f["source_variable"] == "2t"} == {first}
-        assert db.execute("SELECT COUNT(*) FROM revisions WHERE status = 'published'").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] == 0
+    assert (archive / "dataset.yaml").read_text() == catalog.DATASET_YAML
+    with rasterio.open(final) as raster:
+        np.testing.assert_array_equal(raster.read(1), 280)
 
 
-def test_preparing_revision_is_never_readable(tmp_path: Path) -> None:
-    """Leave incomplete conversion attempts without published coverage."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        revision, stage, source, report = _stage(db, archive)
-    with catalog.archive_session(archive) as db:
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == "preparing"
-        assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
-        assert catalog.current_month(db, archive, 2000, 1) is None
-        timestamp = report["fields"][0]["valid_time"]
-        assert catalog.get_published_hours(db, 2000, 1) == set()
-    with pytest.raises(FileNotFoundError, match="No published"):
-        with catalog.open_month(archive, 2000, 1):
-            pytest.fail("Preparing data must not be exposed.")
-    assert stage.exists()
-    assert source.exists()
+@pytest.mark.parametrize(("step_type", "temporal_type"), [("avg", "mean"), ("accum", "accumulation")])
+def test_interval_semantics_are_explicit(tmp_path: Path, step_type: str, temporal_type: str) -> None:
+    """Describe mean and accumulated observations without interpreting filenames."""
+    with catalog.archive_session(tmp_path) as db:
+        publication, _, _, report = _stage(db, tmp_path, variable="precipitation", step_type=step_type)
+        catalog.publish_observation(db, tmp_path, publication, report)
+        observation = db.execute("SELECT * FROM observations").fetchone()
+        assert observation["temporal_type"] == temporal_type
+        assert observation["interval_end"] - observation["interval_start"] == 3600
+        assert observation["reference_time"] == observation["interval_start"]
 
 
-def test_restarting_conversion_removes_only_abandoned_same_month_store(tmp_path: Path) -> None:
-    """Discard interrupted decoded arrays while retaining sources and other months."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        first, _, _, report = _stage(db, archive)
-        catalog.publish_revision(db, archive, first, report)
-        abandoned, old_stage, source, _ = _stage(db, archive, variable="10_metre_u_wind_component")
-        scratch = old_stage.parent / ".decoded-interrupted"
-        scratch.mkdir()
-        (scratch / "values.bin").write_bytes(b"unfinished decoded source")
-        other, other_stage, _, _ = _stage(db, archive, month=2)
-        metadata = json.loads(db.execute(
-            "SELECT provenance_json FROM revisions WHERE id = ?", (abandoned,),
-        ).fetchone()[0])
-        revision, stage = catalog.prepare_revision(db, archive, metadata, year=2000, month=1)
-        assert revision != abandoned
-        assert not old_stage.exists() and not scratch.exists()
-        assert not stage.exists()
-        assert db.execute("SELECT id FROM revisions WHERE id = ?", (abandoned,)).fetchone() is None
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (other,)).fetchone()[0] == "preparing"
-        assert other_stage.exists() and source.exists()
-        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == first
+def test_refresh_changes_only_selected_file(tmp_path: Path) -> None:
+    """Refresh one observation while preserving other hours and variables."""
+    with catalog.archive_session(tmp_path) as db:
+        first, _, _, report = _stage(db, tmp_path)
+        first_path = catalog.publish_observation(db, tmp_path, first, report)
+        later, _, _, report = _stage(db, tmp_path, hour=1)
+        later_path = catalog.publish_observation(db, tmp_path, later, report)
+        other, _, _, report = _stage(db, tmp_path, variable="precipitation", step_type="avg")
+        other_path = catalog.publish_observation(db, tmp_path, other, report)
+        untouched = {path: path.read_bytes() for path in (later_path, other_path)}
+        replacement, _, _, report = _stage(db, tmp_path, value=281)
+        assert catalog.publish_observation(db, tmp_path, replacement, report) == first_path
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 3
+        assert all(path.read_bytes() == contents for path, contents in untouched.items())
+        with rasterio.open(first_path) as raster:
+            np.testing.assert_array_equal(raster.read(1), 281)
 
 
-@pytest.mark.parametrize("failure_at", [1, 2])
-def test_rename_failure_restores_old_month(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_at: int
+def test_incomplete_conversion_can_restart_without_hiding_previous_file(tmp_path: Path) -> None:
+    """Discard the abandoned staged file for the same observation on retry."""
+    with catalog.archive_session(tmp_path) as db:
+        first, _, _, report = _stage(db, tmp_path)
+        final = catalog.publish_observation(db, tmp_path, first, report)
+        abandoned, old_stage, source, _ = _stage(db, tmp_path, value=281)
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+    with catalog.archive_session(tmp_path) as db:
+        replacement, stage, _, report = _stage(db, tmp_path, value=282)
+        assert not old_stage.exists() and stage.exists() and source.exists()
+        assert replacement != abandoned
+        assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] == 1
+        catalog.publish_observation(db, tmp_path, replacement, report)
+        with rasterio.open(final) as raster:
+            np.testing.assert_array_equal(raster.read(1), 282)
+
+
+@pytest.mark.parametrize("after_install", [False, True])
+def test_interrupted_publication_rolls_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after_install: bool,
 ) -> None:
-    """Keep the previous month readable after either publication rename fails."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        first, _, _, report = _stage(db, archive)
-        catalog.publish_revision(db, archive, first, report)
-        second, stage, source, report = _stage(db, archive, variable="10_metre_u_wind_component")
-        rename = Path.rename
-        calls = 0
+    """Recover both sides of the file-install-to-catalog-commit boundary."""
+    install = catalog._install_observation
 
-        def fail_once(source: Path, destination: Path) -> Path:
-            """Fail one rename while allowing the recovery moves."""
-            nonlocal calls
-            calls += 1
-            if calls == failure_at:
-                raise OSError("rename failed")
-            return rename(source, destination)
+    def interrupt(source: Path, destination: Path) -> None:
+        """Interrupt before or after replacing the complete file."""
+        if after_install:
+            install(source, destination)
+        raise KeyboardInterrupt
 
+    with catalog.archive_session(tmp_path) as db:
+        first, _, _, report = _stage(db, tmp_path)
+        final = catalog.publish_observation(db, tmp_path, first, report)
+        replacement, staged, source, report = _stage(db, tmp_path, value=281)
         with monkeypatch.context() as patch:
-            patch.setattr(Path, "rename", fail_once)
-            with pytest.raises(OSError, match="rename failed"):
-                catalog.publish_revision(db, archive, second, report)
-        assert stage.exists()
+            patch.setattr(catalog, "_install_observation", interrupt)
+            with pytest.raises(KeyboardInterrupt):
+                catalog.publish_observation(db, tmp_path, replacement, report)
+        assert staged.exists() != after_install
         assert source.exists()
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "preparing"
-        assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 0
-        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == first
-        timestamp = report["fields"][0]["valid_time"]
-        assert catalog.get_published_hours(db, 2000, 1) == {("2t", timestamp)}
-        with catalog.open_month(archive, 2000, 1) as dataset:
-            assert set(dataset.data_vars) == {"2_metre_temperature"}
-            np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
-        catalog.publish_revision(db, archive, second, report)
-        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == second
-    assert not source.exists()
+        assert db.execute("SELECT status FROM publications").fetchone()[0] == "ready"
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+    with catalog.archive_session(tmp_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] == 0
+        with rasterio.open(final) as raster:
+            np.testing.assert_array_equal(raster.read(1), 281)
 
 
-def test_catalog_failure_restores_old_month(tmp_path: Path) -> None:
-    """Roll back renamed stores when the catalog transaction cannot commit."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        first, _, _, report = _stage(db, archive)
-        catalog.publish_revision(db, archive, first, report)
-        second, stage, source, report = _stage(db, archive, variable="10_metre_u_wind_component")
-        db.execute(
-            """CREATE TRIGGER fail_month BEFORE UPDATE ON months
-               BEGIN SELECT RAISE(ABORT, 'catalog failure'); END"""
-        )
-        db.commit()
-        with pytest.raises(sqlite3.IntegrityError, match="catalog failure"):
-            catalog.publish_revision(db, archive, second, report)
-        assert stage.exists()
+def test_catalog_failure_retains_ready_journal_and_source(tmp_path: Path) -> None:
+    """Recover an installed observation when its coverage transaction fails."""
+    with catalog.archive_session(tmp_path) as db:
+        publication, stage, source, report = _stage(db, tmp_path)
+        db.execute("CREATE TEMP TRIGGER fail_coverage BEFORE INSERT ON coverage "
+                   "BEGIN SELECT RAISE(ABORT, 'publication failed'); END")
+        with pytest.raises(sqlite3.IntegrityError, match="publication failed"):
+            catalog.publish_observation(db, tmp_path, publication, report)
+        assert not stage.exists() and source.exists()
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+        assert db.execute("SELECT status FROM publications").fetchone()[0] == "ready"
+        assert db.execute("SELECT COUNT(*) FROM source_selections").fetchone()[0] == 1
+    with catalog.archive_session(tmp_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
         assert source.exists()
-        assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 0
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "preparing"
-        with catalog.open_month(archive, 2000, 1) as dataset:
-            assert set(dataset.data_vars) == {"2_metre_temperature"}
-        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == first
-        db.execute("DROP TRIGGER fail_month")
-        db.commit()
-        catalog.publish_revision(db, archive, second, report)
-    assert not source.exists()
 
 
-@pytest.mark.parametrize("completed_renames", [0, 1, 2])
-def test_interrupted_replacement_rolls_forward(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completed_renames: int
-) -> None:
-    """Recover before, between, and after the two filesystem rename boundaries."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        first, _, _, report = _stage(db, archive)
-        final = catalog.publish_revision(db, archive, first, report)
-        second, stage, source, report = _stage(db, archive, variable="10_metre_u_wind_component")
-        rename = Path.rename
-        calls = 0
-
-        def interrupt(source: Path, destination: Path) -> Path:
-            """Exit after the selected durable journal boundary."""
-            nonlocal calls
-            if completed_renames == 0:
-                raise SystemExit("interrupted")
-            result = rename(source, destination)
-            calls += 1
-            if calls == completed_renames:
-                raise SystemExit("interrupted")
-            return result
-
-        with monkeypatch.context() as patch:
-            patch.setattr(Path, "rename", interrupt)
-            with pytest.raises(SystemExit, match="interrupted"):
-                catalog.publish_revision(db, archive, second, report)
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "ready"
-        assert db.execute("SELECT current_revision_id FROM months").fetchone()[0] == first
-        assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 0
-        timestamp = report["fields"][0]["valid_time"]
-        assert catalog.get_published_hours(db, 2000, 1) == {("2t", timestamp)}
-        assert source.exists()
-        assert stage.exists() == (completed_renames < 2)
-        assert final.exists() == (completed_renames != 1)
-    with catalog.open_month(archive, 2000, 1) as dataset:
-        np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
-        np.testing.assert_array_equal(dataset["10_metre_u_wind_component"].values, 3.0)
-    with catalog.archive_session(archive) as db:
-        assert catalog.current_month(db, archive, 2000, 1)[1]["revision_id"] == second
-        assert db.execute("SELECT COUNT(*) FROM coverage WHERE revision_id = ?", (second,)).fetchone()[0] == 2
-        assert db.execute("SELECT backup_path FROM revisions WHERE id = ?", (second,)).fetchone()[0] is None
-        assert catalog.get_published_hours(db, 2000, 1) == {("2t", timestamp), ("10u", timestamp)}
-    assert not source.exists()
+def test_relocation_preserves_relative_catalog_paths(tmp_path: Path) -> None:
+    """Move the whole archive without rewriting output or staged source paths."""
+    original = tmp_path / "original"
+    with catalog.archive_session(original) as db:
+        publication, _, source, report = _stage(db, original)
+        final = catalog.publish_observation(db, original, publication, report)
+        cog_relative = final.relative_to(original)
+        source_relative = source.relative_to(original)
+    relocated = tmp_path / "relocated"
+    original.rename(relocated)
+    with catalog.archive_session(relocated) as db:
+        observation = db.execute("SELECT * FROM observations").fetchone()
+        source_row = db.execute("SELECT * FROM source_files").fetchone()
+        assert relocated / observation["path"] == relocated / cog_relative
+        assert relocated / source_row["path"] == relocated / source_relative
+        assert (relocated / observation["path"]).is_file()
+        assert (relocated / source_row["path"]).is_file()
 
 
-def test_failed_restoration_remains_recoverable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Retain the ready journal if restoring the previous directory also fails."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        first, _, _, report = _stage(db, archive)
-        catalog.publish_revision(db, archive, first, report)
-        second, stage, source, report = _stage(db, archive, variable="10_metre_u_wind_component")
-        rename = Path.rename
-        calls = 0
-
-        def fail_moves(source: Path, destination: Path) -> Path:
-            """Fail the new-store move and the immediate old-store restoration."""
-            nonlocal calls
-            calls += 1
-            if calls in (2, 3):
-                raise OSError("filesystem unavailable")
-            return rename(source, destination)
-
-        with monkeypatch.context() as patch:
-            patch.setattr(Path, "rename", fail_moves)
-            with pytest.raises(OSError, match="filesystem unavailable"):
-                catalog.publish_revision(db, archive, second, report)
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (second,)).fetchone()[0] == "ready"
-        backup = archive / db.execute("SELECT backup_path FROM revisions WHERE id = ?", (second,)).fetchone()[0]
-        assert backup.is_dir()
-        assert stage.is_dir()
-        assert source.exists()
-    with catalog.open_month(archive, 2000, 1) as dataset:
-        assert set(dataset.data_vars) == {"2_metre_temperature", "10_metre_u_wind_component"}
-    assert not source.exists()
-
-
-def test_cleanup_failures_do_not_hide_published_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Retry retained backups and NetCDF sources without hiding a committed replacement."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        first, _, _, report = _stage(db, archive)
-        catalog.publish_revision(db, archive, first, report)
-        second, _, source, report = _stage(db, archive, variable="10_metre_u_wind_component")
-        with monkeypatch.context() as patch:
-            patch.setattr(catalog.shutil, "rmtree", Mock(side_effect=PermissionError("backup is open")))
-            patch.setattr(Path, "unlink", Mock(side_effect=PermissionError("source is open")))
-            with pytest.warns(RuntimeWarning, match="cleanup remains pending") as warnings:
-                catalog.publish_revision(db, archive, second, report)
-            assert len(warnings) == 2
-            row = db.execute("SELECT * FROM revisions WHERE id = ?", (second,)).fetchone()
-            backup = archive / row["backup_path"]
-            assert backup.is_dir()
-            assert source.exists()
-            with pytest.warns(RuntimeWarning, match="cleanup remains pending"):
-                with catalog.open_month(archive, 2000, 1) as dataset:
-                    np.testing.assert_array_equal(dataset["10_metre_u_wind_component"].values, 3.0)
-    with catalog.archive_session(archive) as db:
-        row = db.execute("SELECT * FROM revisions WHERE id = ?", (second,)).fetchone()
-        assert row["backup_path"] is None
-    assert not backup.exists()
-    assert not source.exists()
-
-
-def test_recovery_rejects_unrelated_final_store(tmp_path: Path) -> None:
-    """Never claim a final directory whose revision marker is unrelated."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        revision, stage, source, report = _stage(db, archive)
-        final = archive / "2000" / "01" / "era5.zarr"
-        final.parent.mkdir(parents=True)
-        stage.rename(final)
-        zarr.open_group(final, mode="r+").attrs["revision_id"] = "unrelated"
-        with db:
-            db.execute(
-                "UPDATE revisions SET status = 'ready', report_json = ? WHERE id = ?",
-                (json.dumps(report), revision),
-            )
-    with pytest.raises(ValueError, match="different revision"):
-        with catalog.archive_session(archive):
-            pytest.fail("An unrelated store must not be published.")
-    with sqlite3.connect(archive / "catalog.sqlite") as db:
-        assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
-    assert source.exists()
-
-
-def test_layout_change_is_rejected_before_ready(tmp_path: Path) -> None:
-    """Keep archive layout consistent without blocking the existing month."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        revision, _, _, report = _stage(db, archive)
-        catalog.publish_revision(db, archive, revision, report)
-        revision, stage, source, report = _stage(db, archive, month=2)
-        report["layout"]["spatial_chunks"] = [1, 1]
-        with pytest.raises(ValueError, match="layout"):
-            catalog.publish_revision(db, archive, revision, report)
-        assert db.execute("SELECT status FROM revisions WHERE id = ?", (revision,)).fetchone()[0] == "preparing"
-        assert stage.exists()
-        assert source.exists()
-        with catalog.open_month(archive, 2000, 1) as dataset:
-            np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
-
-
-def test_reader_lock_allows_conversion_and_blocks_publication(tmp_path: Path) -> None:
-    """Allow staged replacement while a reader holds the unchanged old month."""
-    archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
-        revision, _, _, report = _stage(db, archive)
-        catalog.publish_revision(db, archive, revision, report)
+def test_only_one_writer_holds_archive(tmp_path: Path) -> None:
+    """Reject a second writer while permitting reads of the catalog."""
+    with catalog.archive_session(tmp_path) as db:
         with pytest.raises(portalocker.exceptions.LockException):
-            with catalog.archive_session(archive):
+            with catalog.archive_session(tmp_path):
                 pytest.fail("A second writer must not acquire the archive.")
-        with catalog.open_month(archive, 2000, 1) as dataset:
-            revision, stage, _, report = _stage(db, archive, variable="10_metre_u_wind_component")
-            assert stage.is_dir()
-            assert set(dataset.data_vars) == {"2_metre_temperature"}
-            np.testing.assert_array_equal(dataset["2_metre_temperature"].values, 280.0)
-            with pytest.raises(portalocker.exceptions.LockException):
-                with portalocker.Lock(archive / ".publication.lock", "a", timeout=0):
-                    pytest.fail("The reader must retain the publication lock.")
-        catalog.publish_revision(db, archive, revision, report)
-    with catalog.open_month(archive, 2000, 1) as dataset:
-        assert set(dataset.data_vars) == {"2_metre_temperature", "10_metre_u_wind_component"}
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+
+
+def test_zarr_catalog_rejection_leaves_existing_archive_unchanged(tmp_path: Path) -> None:
+    """Reject a Zarr archive before changing schema, source files or metadata."""
+    database = tmp_path / "catalog.sqlite"
+    source = tmp_path / "pending.nc"
+    source.write_bytes(b"retained NetCDF download")
+    with closing(sqlite3.connect(database)) as db:
+        db.executescript(
+            "CREATE TABLE coverage (revision_id TEXT, variable TEXT, valid_time INTEGER);"
+            "CREATE TABLE source_files (id TEXT, path TEXT);"
+            "INSERT INTO coverage VALUES ('old-revision', '2_metre_temperature', 946684800);"
+        )
+        with db:
+            db.execute("INSERT INTO source_files VALUES (?, ?)", ("source", str(source)))
+    before = database.read_bytes()
+    with pytest.raises(ValueError, match="not a COG catalog.*convert_zarr_archive.py"):
+        with catalog.archive_session(tmp_path):
+            pytest.fail("The old archive must not be opened as a COG archive.")
+    assert database.read_bytes() == before
+    assert source.read_bytes() == b"retained NetCDF download"
+    assert not (tmp_path / "dataset.yaml").exists()
 
 
 def test_writer_lock_is_released_when_process_exits(tmp_path: Path) -> None:
-    """Recover writer ownership after a process exits without context cleanup."""
-    archive = tmp_path / "archive"
-    archive.mkdir()
+    """Acquire writer ownership after a process exits without context cleanup."""
     code = (
         "import os, portalocker, sys; "
         "lock = portalocker.Lock(sys.argv[1], 'a', timeout=0); "
         "lock.acquire(); os._exit(0)"
     )
-    subprocess.run(
-        [sys.executable, "-c", code, str(archive / ".writer.lock")],
-        check=True,
-        timeout=20,
-    )
-    with catalog.archive_session(archive) as db:
-        assert db.execute("SELECT COUNT(*) FROM coverage").fetchone()[0] == 0
+    subprocess.run([sys.executable, "-c", code, str(tmp_path / ".writer.lock")], check=True, timeout=20)
+    with catalog.archive_session(tmp_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
 
 
 def test_register_sources_records_only_missing_variable_hours(tmp_path: Path) -> None:
-    """Keep holes, source boundaries, and other variables out of pending selections."""
-    archive = tmp_path / "archive"
+    """Keep holes, source boundaries and other variables out of pending selections."""
     start = datetime(1950, 1, 1, tzinfo=UTC)
     source = SourceFile(
         key="e5.oper.an.sfc/195001/temperature.nc", variable="2t", size=12,
@@ -452,14 +265,11 @@ def test_register_sources_records_only_missing_variable_hours(tmp_path: Path) ->
     midnight = int(start.timestamp())
     selected = {("2t", midnight + hour * 3600) for hour in (-1, 0, 1, 3, 5, 6)}
     selected.add(("10u", midnight + 4 * 3600))
-    with catalog.archive_session(archive) as db:
-        rows = catalog.register_sources(
-            db, archive, [source], start.date(), start.date(), selected_hours=selected,
-        )
+    with catalog.archive_session(tmp_path) as db:
+        catalog.register_sources(db, tmp_path, [source], start.date(), start.date(), selected_hours=selected)
         intervals = [tuple(row) for row in db.execute(
             "SELECT start_time, end_time FROM source_selections ORDER BY start_time"
         )]
-        assert len(rows) == 1
         assert intervals == [
             ((start + timedelta(hours=first)).isoformat(), (start + timedelta(hours=last)).isoformat())
             for first, last in [(0, 1), (3, 3), (5, 5)]

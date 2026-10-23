@@ -1,4 +1,4 @@
-"""Download global ERA5 from NCAR and maintain a compressed monthly archive."""
+"""Download global ERA5 from NCAR and maintain a compressed hourly COG archive."""
 
 import argparse
 from collections.abc import Sequence
@@ -26,7 +26,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="era5-pull", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     pull = commands.add_parser(
-        "pull", help="Download missing global hours and publish each month as Zarr.",
+        "pull", help="Download missing global hours and publish hourly COG files.",
         description=(
             "Fill an inclusive UTC date range, one month at a time. Skip published "
             "hours, resume unfinished downloads, and exit. Refresh requires all "
@@ -41,7 +41,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     ingest = commands.add_parser(
-        "ingest-ncar", help="Publish one month of recorded downloads as Zarr.",
+        "ingest-ncar", help="Publish one month of recorded downloads as hourly COG files.",
         description="Ingest selected UTC hours from local NetCDF files without network access.",
     )
     for selection in (pull, download):
@@ -72,21 +72,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         storage.add_argument(
             "--refresh", action="store_true", help="Replace the selected stored hours and variables.",
         )
-        storage.add_argument(
-            "--spatial-chunks", nargs=2, type=int, default=(32, 32),
-            metavar=("LAT", "LON"), help="Grid cells per spatial read chunk (default: 32 32).",
-        )
     for command in (pull, download, ingest):
         command.add_argument(
             "--archive", type=Path, default=Path("archive"),
-            help="Directory containing catalog.sqlite, staging, and monthly Zarr stores (default: archive).",
+            help="Directory containing catalog.sqlite, staging, and COG observations (default: archive).",
         )
     args = parser.parse_args(argv)
     try:
         if args.command == "pull":
             pull_range(
                 args.start_date, args.end_date, args.variables, args.archive,
-                tuple(args.spatial_chunks), download_workers=args.download_workers,
+                download_workers=args.download_workers,
                 max_source_gb=args.max_source_gb, refresh=args.refresh,
             )
         elif args.command == "download-ncar":
@@ -96,7 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             published = ingest_ncar(
-                args.archive, args.year, args.month, tuple(args.spatial_chunks), refresh=args.refresh,
+                args.archive, args.year, args.month, refresh=args.refresh,
             )
             print(f"Published data available at {published}.")
     except KeyboardInterrupt:

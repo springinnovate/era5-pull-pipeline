@@ -38,8 +38,6 @@ def read_ncar_netcdf_arrays(
     selected_times: Sequence[int],
     scratch: Path,
     resources: ExitStack,
-    *,
-    source_identity: str,
 ) -> tuple[dict[str, NDArray[Any]], dict[str, Any]]:
     """Read selected hours from an NCAR NetCDF file into NumPy arrays.
 
@@ -50,16 +48,16 @@ def read_ncar_netcdf_arrays(
     Analysis fields use their time coordinate. Forecast valid times are
     initialization time plus lead hours. Accumulations and mean rates retain
     their preceding-hour intervals. The returned report includes field coverage,
-    interval endpoints, and the original file attributes for Zarr publication.
+    interval endpoints, and the original file attributes for COG publication.
 
     Args:
         path: Downloaded NCAR NetCDF file recorded in the catalog.
         source_id: Catalog identity of this exact provider file revision.
         source_variable: NCAR short name selected by the user.
         selected_times: Requested UTC Unix seconds, all in one calendar month.
-        scratch: Existing directory for disk-backed decoded values.
+        scratch: Existing directory for one source's disk-backed decoded values.
+            Its values.bin file is reused by the next call.
         resources: ExitStack that closes the temporary files and memory mappings.
-        source_identity: SHA256 identity of the recorded source provenance.
 
     Returns:
         A dictionary mapping the variable's readable name to its NumPy array,
@@ -129,7 +127,7 @@ def read_ncar_netcdf_arrays(
             or key.startswith("Quantize")
         }))
         shape = (len(requested), len(dataset.latitude), len(dataset.longitude))
-        raw = resources.enter_context((scratch / f"{source_id}.bin").open("w+b"))
+        raw = resources.enter_context((scratch / "values.bin").open("w+b"))
         raw.truncate(int(np.prod(shape)) * array.dtype.itemsize)
         mapping = resources.enter_context(mmap.mmap(raw.fileno(), 0))
         decoded = np.ndarray(shape, dtype=array.dtype, buffer=mapping)
@@ -163,15 +161,14 @@ def read_ncar_netcdf_arrays(
                 "variable": variable,
                 "source_variable": source_variable,
                 "source_file_id": source_id,
-                "source_request_sha256": source_identity,
                 "valid_time": int(valid.reshape(-1)[index]),
                 "reference_time": (
-                    int(references.reshape(-1)[index]) if forecast else conversion.MISSING_INTEGER
+                    int(references.reshape(-1)[index]) if forecast else None
                 ),
                 "interval_start": int(references.reshape(-1)[index] + starts.reshape(-1)[index]),
                 "interval_end": int(references.reshape(-1)[index] + ends.reshape(-1)[index]),
-                "start_step": int(starts.reshape(-1)[index]) if forecast else conversion.MISSING_INTEGER,
-                "end_step": int(ends.reshape(-1)[index]) if forecast else conversion.MISSING_INTEGER,
+                "start_step": int(starts.reshape(-1)[index]) if forecast else None,
+                "end_step": int(ends.reshape(-1)[index]) if forecast else None,
                 "step_units": "s",
                 "step_type": step_type,
             }
