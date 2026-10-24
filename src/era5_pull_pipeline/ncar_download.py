@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 from threading import Event
 import time
+from types import TracebackType
 
 import requests
 from tqdm import tqdm
@@ -120,95 +121,154 @@ def download_file(
     )
 
 
+class NcarDownloadPool:
+    """Keep bounded transfers running while the coordinator processes completions."""
+
+    def __init__(
+        self, db: sqlite3.Connection, sources: Sequence[SourceFile],
+        rows: Sequence[sqlite3.Row], download_workers: int, archive: Path,
+    ) -> None:
+        """Prepare transfers for registered sources and reuse completed downloads.
+
+        Args:
+            db: Catalog connection owned exclusively by the calling thread.
+            sources: Provider objects in the same order as their catalog rows.
+            rows: Registered paths and completion state.
+            download_workers: Maximum simultaneous transfers.
+            archive: Root of the cataloged paths.
+        """
+        self.db = db
+        self.archive = archive
+        self.workers = download_workers
+        self.ready: list[str] = []
+        pending = []
+        for source, row in zip(sources, rows, strict=True):
+            if row["downloaded_at"] is not None:
+                print(f"Reusing completed source: {row['path']}", flush=True)
+                self.ready.append(row["id"])
+            else:
+                pending.append((source, row))
+        self.remaining = iter(pending)
+        self.stop_event = Event()
+        self.executor = ThreadPoolExecutor(max_workers=download_workers)
+        self.active: dict[Future[None], tuple[sqlite3.Row, int]] = {}
+
+    def _submit_next(self, position: int) -> None:
+        """Fill a free transfer slot with the next registered source.
+
+        Args:
+            position: Progress display slot freed by a completed transfer.
+        """
+        pending = next(self.remaining, None)
+        if pending is not None:
+            source, row = pending
+            future = self.executor.submit(
+                download_file, source, self.archive / row["path"],
+                stop_event=self.stop_event, position=position,
+            )
+            self.active[future] = (row, position)
+
+    def __enter__(self) -> "NcarDownloadPool":
+        """Start the bounded batch and return its coordinator interface.
+
+        Returns:
+            This batch with its initial transfer futures and reused source IDs.
+
+        Raises:
+            Exception: Submission failures propagate after active transfers stop.
+        """
+        try:
+            for position in range(self.workers):
+                self._submit_next(position)
+        except BaseException as exc:
+            self.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        return self
+
+    def record_completed(self) -> list[str]:
+        """Record finished downloads and refill free transfer slots.
+
+        Returns:
+            Source IDs whose complete bytes are now recorded in SQLite.
+
+        Raises:
+            Exception: Transfer or catalog failures propagate to the coordinator.
+        """
+        completed = []
+        positions = []
+        for future, (row, position) in list(self.active.items()):
+            if not future.done():
+                continue
+            future.result()
+            retrieved_at = datetime.now(UTC).isoformat()
+            with self.db:
+                self.db.execute(
+                    "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
+                    (retrieved_at, retrieved_at, row["id"]),
+                )
+            del self.active[future]
+            completed.append(row["id"])
+            positions.append(position)
+        for position in positions:
+            self._submit_next(position)
+        return completed
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Stop transfers and preserve successful concurrent downloads on failure.
+
+        Args:
+            exc_type: Exception type leaving the coordinator, if any.
+            exc: Original failure to annotate if catalog recording also fails.
+            traceback: Original coordinator traceback.
+
+        Raises:
+            sqlite3.Error: Completion recording fails without an original error.
+        """
+        self.stop_event.set()
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        retrieved_at = datetime.now(UTC).isoformat()
+        completed = [
+            (retrieved_at, retrieved_at, row["id"])
+            for future, (row, _) in self.active.items()
+            if not future.cancelled() and future.exception() is None
+        ]
+        if completed:
+            try:
+                with self.db:
+                    self.db.executemany(
+                        "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
+                        completed,
+                    )
+            except sqlite3.Error as catalog_error:
+                if exc is None:
+                    raise
+                exc.add_note(f"Could not record completed downloads: {catalog_error}")
+
+
 def download_registered_sources(
     db: sqlite3.Connection, sources: Sequence[SourceFile],
     rows: Sequence[sqlite3.Row], download_workers: int = 2, *, archive: Path,
 ) -> None:
     """Download registered NCAR files concurrently and record their completion.
 
-    Only the calling thread writes SQLite. Each transfer owns its HTTP session,
-    and at most ``download_workers`` files are submitted at a time. A failed or
-    interrupted run stops its active transfers and retains partial source files.
-
     Args:
-        db: Open archive catalog owned by the calling thread.
-        sources: NCAR objects to download, in the same order as their rows.
-        rows: Registered source rows containing paths and download state.
-        archive: Root used to resolve cataloged relative source paths.
-        download_workers: Maximum number of simultaneous file downloads.
+        db: Catalog connection owned exclusively by the calling thread.
+        sources: Provider objects in the same order as their catalog rows.
+        rows: Registered paths and completion state.
+        download_workers: Maximum simultaneous file downloads.
+        archive: Root of the cataloged relative paths.
 
     Raises:
         Exception: Transfer and catalog errors propagate after workers stop.
         KeyboardInterrupt: An interrupted run stops its active transfers.
     """
-    pending = []
-    for source, row in zip(sources, rows, strict=True):
-        if row["downloaded_at"] is not None:
-            print(f"Reusing completed source: {row['path']}", flush=True)
-        else:
-            pending.append((source, row))
-    if not pending:
-        return
-
-    remaining = iter(pending)
-    stop_event = Event()
-    executor = ThreadPoolExecutor(max_workers=download_workers)
-    active: dict[Future[None], tuple[sqlite3.Row, int]] = {}
-    try:
-        for position in range(min(download_workers, len(pending))):
-            source, row = next(remaining)
-            future = executor.submit(
-                download_file, source, archive / row["path"],
-                stop_event=stop_event, position=position,
-            )
-            active[future] = (row, position)
-        while active:
-            done, _ = wait(active, return_when=FIRST_COMPLETED)
-            positions = []
-            for future in done:
-                future.result()
-                row, position = active[future]
-                retrieved_at = datetime.now(UTC).isoformat()
-                with db:
-                    db.execute(
-                        "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
-                        (retrieved_at, retrieved_at, row["id"]),
-                    )
-                del active[future]
-                positions.append(position)
-            for position in positions:
-                next_source = next(remaining, None)
-                if next_source is None:
-                    break
-                source, row = next_source
-                future = executor.submit(
-                    download_file, source, archive / row["path"],
-                    stop_event=stop_event, position=position,
-                )
-                active[future] = (row, position)
-    except BaseException as exc:
-        stop_event.set()
-        executor.shutdown(wait=True, cancel_futures=True)
-        retrieved_at = datetime.now(UTC).isoformat()
-        completed = [
-            (retrieved_at, retrieved_at, row["id"])
-            for future, (row, _) in active.items()
-            if not future.cancelled() and future.exception() is None
-        ]
-        if completed:
-            try:
-                with db:
-                    db.executemany(
-                        "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
-                        completed,
-                    )
-            except sqlite3.Error as catalog_error:
-                # Keep the original failure; complete bytes remain resumable
-                # when the catalog itself cannot record their completion.
-                exc.add_note(f"Could not record completed downloads: {catalog_error}")
-        raise
-    else:
-        executor.shutdown(wait=True)
+    with NcarDownloadPool(db, sources, rows, download_workers, archive) as downloads:
+        while downloads.active:
+            wait(downloads.active, return_when=FIRST_COMPLETED)
+            downloads.record_completed()
 
 
 def download_ncar(

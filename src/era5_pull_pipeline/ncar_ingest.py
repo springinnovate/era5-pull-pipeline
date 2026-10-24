@@ -87,48 +87,12 @@ def ingest_ncar_month(
         ValueError: Required source hours are absent or publication is invalid.
         Exception: NetCDF, COG, and catalog errors propagate.
     """
-    start = datetime(year, month, 1, tzinfo=UTC)
-    end = start + timedelta(days=monthrange(year, month)[1], hours=-1)
-    covered = get_published_hours(db, year, month)
+    sources, selected, selections = select_ncar_source_hours(
+        db, year, month, refresh=refresh, selected_hours=selected_hours, source_ids=source_ids,
+    )
     destination = archive / f"{year:04d}" / f"{month:02d}"
-    selections = []
-    sources = {}
-    owners: dict[tuple[str, int], str] = {}
-    # A newer provider object wins if a correction was downloaded before
-    # its older pending selection was ingested.
-    records = db.execute(
-        """SELECT f.*, s.start_time, s.end_time FROM source_files f
-           JOIN source_selections s ON s.source_id = f.id
-           WHERE s.start_time <= ? AND s.end_time >= ?
-           ORDER BY f.last_modified DESC, f.created_at DESC""",
-        (end.isoformat(), start.isoformat()),
-    ).fetchall()
-    for record in records:
-        first = max(start, datetime.fromisoformat(record["start_time"]))
-        last = min(end, datetime.fromisoformat(record["end_time"]))
-        hours = [
-            hour for hour in range(int(first.timestamp()), int(last.timestamp()) + 1, 3600)
-            if selected_hours is None or (record["variable"], hour) in selected_hours
-        ]
-        for first_hour, last_hour in group_hour_intervals(hours):
-            selections.append({
-                "source_id": record["id"],
-                "start_time": (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=first_hour)).isoformat(),
-                "end_time": (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=last_hour)).isoformat(),
-            })
-        # Publishing these variable-hours also completes pending selections
-        # from superseded object versions. Only the chosen versions supply data.
-        if source_ids is not None and record["id"] not in source_ids:
-            continue
-        sources[record["id"]] = record
-        for hour in hours:
-            owners.setdefault((record["variable"], hour), record["id"])
-    selected: dict[str, list[int]] = defaultdict(list)
-    for pair, source_id in owners.items():
-        if refresh or pair not in covered:
-            selected[source_id].append(pair[1])
     if not selected:
-        if not covered:
+        if not get_published_hours(db, year, month):
             raise ValueError(f"No downloaded selections for {year:04d}-{month:02d}. Run download-ncar first.")
         with db:
             remove_published_source_hours(db, selections)
@@ -176,3 +140,68 @@ def ingest_ncar_month(
         remove_published_source_hours(db, selections)
     delete_ingested_netcdf_files(db, archive)
     return destination
+
+
+def select_ncar_source_hours(
+    db: sqlite3.Connection, year: int, month: int, *, refresh: bool = False,
+    selected_hours: set[tuple[str, int]] | None = None,
+    source_ids: set[str] | None = None,
+) -> tuple[dict[str, sqlite3.Row], dict[str, list[int]], list[dict[str, str]]]:
+    """Select the source and pending hours for each monthly observation.
+
+    Both offline ingestion and overlapping pulls use this ownership decision.
+    Include superseded source selections for retirement after publication, while
+    only the chosen sources supply decoded data.
+
+    Args:
+        db: Catalog connection owned by the archive coordinator.
+        year: Selected UTC year.
+        month: Selected UTC month.
+        refresh: Include observations that are already published.
+        selected_hours: Restrict work to these source variable and Unix-hour pairs.
+        source_ids: Restrict data providers to these registered source IDs.
+
+    Returns:
+        Source rows, selected hours grouped by source ID, and source selections
+        to retire after the complete monthly selection is published.
+    """
+    start = datetime(year, month, 1, tzinfo=UTC)
+    end = start + timedelta(days=monthrange(year, month)[1], hours=-1)
+    covered = get_published_hours(db, year, month)
+    selections = []
+    sources = {}
+    owners: dict[tuple[str, int], str] = {}
+    # A newer provider object wins if a correction was downloaded before
+    # its older pending selection was ingested.
+    records = db.execute(
+        """SELECT f.*, s.start_time, s.end_time FROM source_files f
+           JOIN source_selections s ON s.source_id = f.id
+           WHERE s.start_time <= ? AND s.end_time >= ?
+           ORDER BY f.last_modified DESC, f.created_at DESC""",
+        (end.isoformat(), start.isoformat()),
+    ).fetchall()
+    for record in records:
+        first = max(start, datetime.fromisoformat(record["start_time"]))
+        last = min(end, datetime.fromisoformat(record["end_time"]))
+        hours = [
+            hour for hour in range(int(first.timestamp()), int(last.timestamp()) + 1, 3600)
+            if selected_hours is None or (record["variable"], hour) in selected_hours
+        ]
+        for first_hour, last_hour in group_hour_intervals(hours):
+            selections.append({
+                "source_id": record["id"],
+                "start_time": (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=first_hour)).isoformat(),
+                "end_time": (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=last_hour)).isoformat(),
+            })
+        # Publishing these variable-hours also completes pending selections
+        # from superseded object versions. Only the chosen versions supply data.
+        if source_ids is not None and record["id"] not in source_ids:
+            continue
+        sources[record["id"]] = record
+        for hour in hours:
+            owners.setdefault((record["variable"], hour), record["id"])
+    selected: dict[str, list[int]] = defaultdict(list)
+    for pair, source_id in owners.items():
+        if refresh or pair not in covered:
+            selected[source_id].append(pair[1])
+    return sources, selected, selections

@@ -208,3 +208,33 @@ def read_ncar_netcdf_arrays(
                 },
             },
         }
+
+
+def decode_ncar_source(
+    path: Path, source_id: str, source_variable: str,
+    selected_times: Sequence[int], scratch: Path,
+) -> dict[str, Any]:
+    """Decode one NCAR source into scratch storage for COG worker processes.
+
+    Close the NetCDF and writable mapping before returning. The coordinator
+    retains values.bin until every observation worker has finished reading it.
+
+    Args:
+        path: Complete cataloged NetCDF input.
+        source_id: Catalog identity of the provider object.
+        source_variable: Requested NCAR short name.
+        selected_times: Selected Unix hours in one calendar month.
+        scratch: Directory containing the reusable values.bin file.
+
+    Returns:
+        Source, variable, grid, and observation metadata for publication.
+
+    Raises:
+        Exception: NetCDF decoding and scratch-file errors propagate.
+    """
+    with ExitStack() as resources:
+        arrays, report = read_ncar_netcdf_arrays(
+            path, source_id, source_variable, selected_times, scratch, resources,
+        )
+        del arrays
+    return report

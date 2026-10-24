@@ -34,12 +34,13 @@ To add wind for those dates, run the same command with `--variables 10u 10v`. Ex
 | `--variables` | One or more NCAR short variable names; required. |
 | `--archive` | Directory containing dataset.yaml, the catalog, staging, and GeoTIFFs; defaults to `archive`. |
 | `--download-workers` | Maximum simultaneous file transfers; defaults to 2. |
+| `--processing-workers` | Maximum worker processes and in-flight COG observations; defaults to 4. |
 | `--max-source-gb` | Maximum reserved NetCDF source bytes in decimal GB; defaults to 16. Conversion requires additional space. |
 | `--refresh` | Retrieve current sources and replace selected stored fields. |
 
 NCAR packages analysis fields as one variable per month, and radiation and precipitation in roughly half-month files. Selecting a single day still downloads whole source files; only selected hours become GeoTIFFs. A forecast file can supply hours on both sides of a month boundary and is downloaded once, then retained until both selected months are published.
 
-Transfers show bytes, speed, elapsed time, and estimated remaining transfer time. Month messages identify availability lookup, conversion, and publication. There is no overall backfill completion estimate.
+Transfers show bytes, speed, elapsed time, and estimated remaining transfer time. Month messages identify availability lookup, overlapping download/processing, source decoding, and publication. There is no overall backfill completion estimate.
 
 ## Backfill from 1950
 
@@ -51,9 +52,9 @@ python -m era5_pull_pipeline pull --start-date 1950-01-01 --variables 2t 2d 10u 
 
 NCAR updates monthly and typically trails real time by about 3–4 months. Availability is checked separately for each variable. Unavailable hours remain absent from coverage and are checked again on subsequent runs, so the same command extends the archive as NCAR adds data. An explicit `--end-date` limits the requested interval.
 
-The workflow schedules one month at a time. At most `--download-workers` transfers are active, and conversion and publication run serially after that month's downloads. The source budget reserves full file sizes before transfers start, including files retained from an interrupted run or for a later month. If a month cannot fit, the command stops before downloading it and reports the required size. Increase `--max-source-gb` or request fewer variables at a time.
+The workflow schedules one month at a time. At most `--download-workers` transfers are active. Completed or reused sources begin processing while other files download. A process pool decodes one source at a time, then encodes and validates up to `--processing-workers` hourly COGs concurrently. The coordinator alone publishes files and writes SQLite. The next month starts after the current month is published. The source budget reserves full file sizes before transfers start, including files retained from an interrupted run or for a later month. If a month cannot fit, the command stops before downloading it and reports the required size. Increase `--max-source-gb` or request fewer variables at a time.
 
-This budget limits staged NetCDF sources, not total disk use or RAM. Peak working space also includes one source's decoded selected arrays and a single staged GeoTIFF. One float32 global hourly field takes about 4.15 MB before compression. Decoded arrays use disk-backed memory mappings; their pages can occupy the operating system's file cache. Conversion reads native NetCDF blocks once and writes one observation at a time without loading a whole month into Python heap memory. Retained sources are released after their selected monthly work is published.
+This budget limits staged NetCDF sources, not total disk use or RAM. Peak working space also includes one source's decoded selected arrays and up to `--processing-workers` staged GeoTIFFs. Each encoding worker holds one hourly raster plus compression and validation buffers; increasing the worker count increases memory and disk demand. One float32 global hourly field takes about 4.15 MB before compression. Decoded arrays use disk-backed memory mappings; their pages can occupy the operating system's file cache. Conversion reads native NetCDF blocks once. Workers read individual hours from the decoded scratch file without copying a whole month into Python heap memory or through process queues. Use `--processing-workers 1` to limit encoding to one observation at a time while retaining overlap with downloads. Decoding precedes encoding for each source, so CPU utilization can fall during decoding or storage waits. Retained sources are released after their selected monthly work is published.
 
 ## Variables and time semantics
 
@@ -77,7 +78,7 @@ Original source attributes, including upstream precision-processing metadata, re
 
 ## Stop, resume, and refresh
 
-Press Ctrl+C to stop. Transfers stop between received chunks and retain partial bytes. An idle network read times out after 30 seconds. Run the same ordinary `pull` command to resume. SQLite supplies recorded paths and selections, completed downloads are reused directly, and partial downloads resume from their saved byte position. Transient transfer failures allow up to three attempts with backoff. Requests are pinned to the discovered source identity so bytes from different versions cannot be combined.
+Press Ctrl+C to stop. No new processing jobs are scheduled; active workers finish before scratch inputs are released. Transfers stop between received chunks and retain partial bytes. An idle network read times out after 30 seconds. Run the same ordinary `pull` command to resume. SQLite supplies recorded paths and selections, completed downloads are reused directly, and partial downloads resume from their saved byte position. Transient transfer failures allow up to three attempts with backoff. Requests are pinned to the discovered source identity so bytes from different versions cannot be combined.
 
 Each observation commits independently. Failed conversion or publication retains its source files, and a restart skips completed observations, rebuilds incomplete files, or finishes a validated publication. NetCDF inputs are removed only after all their selected hours are published and recorded in SQLite. Completed ordinary repeats require no source access.
 
