@@ -10,11 +10,12 @@ import sqlite3
 from pathlib import Path
 
 from era5_pull_pipeline.catalog import (
-    archive_session, delete_ingested_netcdf_files, get_published_hours, group_hour_intervals,
+    archive_session, delete_ingested_netcdf_files, get_published_hours, get_staging_dir, group_hour_intervals,
     prepare_observation, publish_observation, remove_published_source_hours,
 )
 from era5_pull_pipeline.conversion import write_observation_cog
 from era5_pull_pipeline.ncar_conversion import read_ncar_netcdf_arrays
+from era5_pull_pipeline.staging import copy_local_cogs, get_source_path
 
 
 def ingest_ncar(
@@ -102,7 +103,8 @@ def ingest_ncar_month(
 
     # A fixed scratch file bounds abandoned decoded storage after a hard stop.
     # The next source truncates it; the ExitStack closes mappings before unlink.
-    scratch = archive / "staging" / "decoded"
+    local_root = get_staging_dir(db)
+    scratch = (local_root or archive) / "staging" / "decoded"
     scratch.mkdir(parents=True, exist_ok=True)
     for source_id, hours in selected.items():
         record = sources[source_id]
@@ -112,7 +114,7 @@ def ingest_ncar_month(
         try:
             with ExitStack() as resources:
                 arrays, report = read_ncar_netcdf_arrays(
-                    archive / record["path"], source_id, record["variable"],
+                    get_source_path(archive, local_root, record), source_id, record["variable"],
                     hours, scratch, resources,
                 )
                 with db:
@@ -126,6 +128,8 @@ def ingest_ncar_month(
                     raster = write_observation_cog(
                         arrays[field["variable"]][index], field, attributes, report["grid"], staged,
                     )
+                    if local_root is not None:
+                        copy_local_cogs(local_root, archive, [staged])
                     publish_observation(db, archive, publication, raster)
                     if on_published is not None:
                         on_published()
@@ -174,8 +178,9 @@ def select_ncar_source_hours(
     # A newer provider object wins if a correction was downloaded before
     # its older pending selection was ingested.
     records = db.execute(
-        """SELECT f.*, s.start_time, s.end_time FROM source_files f
+        """SELECT f.*, s.start_time, s.end_time, l.path AS local_path FROM source_files f
            JOIN source_selections s ON s.source_id = f.id
+           LEFT JOIN local_files l ON l.kind='source' AND l.id=f.id
            WHERE s.start_time <= ? AND s.end_time >= ?
            ORDER BY f.last_modified DESC, f.created_at DESC""",
         (end.isoformat(), start.isoformat()),

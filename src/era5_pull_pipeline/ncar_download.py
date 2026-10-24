@@ -14,7 +14,8 @@ from types import TracebackType
 import requests
 from tqdm import tqdm
 
-from era5_pull_pipeline.catalog import archive_session, register_sources
+from era5_pull_pipeline.catalog import archive_session, get_staging_dir, register_sources
+from era5_pull_pipeline.staging import get_source_path
 from era5_pull_pipeline.ncar import BUCKET_URL, SourceFile, discover_files
 
 TRANSFER_ATTEMPTS = 3
@@ -127,7 +128,7 @@ class NcarDownloadPool:
 
     def __init__(
         self, record_downloads: Callable[[list[str]], Future[None] | None], sources: Sequence[SourceFile],
-        rows: Sequence[sqlite3.Row], download_workers: int, archive: Path,
+        rows: Sequence[sqlite3.Row], download_workers: int, archive: Path, *, staging_dir: Path | None = None,
     ) -> None:
         """Prepare transfers for registered sources and reuse completed downloads.
 
@@ -136,12 +137,14 @@ class NcarDownloadPool:
             sources: Provider objects in the same order as their catalog rows.
             rows: Registered paths and completion state.
             download_workers: Maximum simultaneous transfers.
-            archive: Root of the cataloged paths.
+            archive: Root of archive-side source paths.
+            staging_dir: Configured local source root, when present.
         """
         self.record_downloads = record_downloads
         self.unrecorded: list[str] = []
         self.recording: dict[Future[None], list[str]] = {}
         self.archive = archive
+        self.staging_dir = staging_dir
         self.workers = download_workers
         self.ready: list[str] = []
         self.remaining: deque[tuple[SourceFile, sqlite3.Row]] = deque()
@@ -181,7 +184,7 @@ class NcarDownloadPool:
         if self.remaining:
             source, row = self.remaining.popleft()
             future = self.executor.submit(
-                download_file, source, self.archive / row["path"],
+                download_file, source, get_source_path(self.archive, self.staging_dir, row),
                 stop_event=self.stop_event, position=position,
             )
             self.active[future] = (row, position)
@@ -329,7 +332,7 @@ def download_registered_sources(
         future.set_result(None)
         return future
 
-    with NcarDownloadPool(record, sources, rows, download_workers, archive) as downloads:
+    with NcarDownloadPool(record, sources, rows, download_workers, archive, staging_dir=get_staging_dir(db)) as downloads:
         while downloads.has_pending:
             wait(downloads.pending, return_when=FIRST_COMPLETED)
             downloads.record_completed()
@@ -374,6 +377,6 @@ def download_ncar(
         with archive_session(archive) as db:
             rows = register_sources(db, archive, sources, start, end)
             download_registered_sources(db, sources, rows, download_workers, archive=archive)
-            completed = [archive / row["path"] for row in rows]
+            completed = [get_source_path(archive, get_staging_dir(db), row) for row in rows]
         print(f"Retained {len(completed)} NetCDF files; catalog: {archive / 'catalog.sqlite'}", flush=True)
         return completed

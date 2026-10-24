@@ -63,6 +63,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Maximum simultaneous native-chunk decoding/encoding jobs (default: 4).",
     )
     pull.add_argument(
+        "--staging-dir", type=Path,
+        help="Local directory for new downloads and COG conversion; remembered for resume. Omit to reuse configured staging.",
+    )
+    pull.add_argument(
+        "--upload-workers", type=int, default=2,
+        help="Maximum simultaneous COG batch uploads from local staging (default: 2).",
+    )
+    pull.add_argument(
         "--max-source-gb", type=float, default=16,
         help="Maximum reserved NetCDF source bytes in decimal GB (default: 16); conversion needs additional space.",
     )
@@ -92,6 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.start_date, args.end_date, args.variables, args.archive,
                 download_workers=args.download_workers,
                 processing_workers=args.processing_workers,
+                staging_dir=args.staging_dir, upload_workers=args.upload_workers,
                 max_source_gb=args.max_source_gb, max_decoded_gb=args.max_decoded_gb, refresh=args.refresh,
             )
         elif args.command == "download-ncar":

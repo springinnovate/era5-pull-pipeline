@@ -15,7 +15,7 @@ from typing import Any
 import requests
 
 from era5_pull_pipeline.catalog import (
-    delete_ingested_netcdf_files, get_published_hours,
+    delete_ingested_netcdf_files, get_published_hours, get_staging_dir,
     prepare_observations, publish_observations, register_sources, remove_published_source_hours,
 )
 from era5_pull_pipeline.ncar import SourceFile, discover_files
@@ -23,6 +23,7 @@ from era5_pull_pipeline.ncar_conversion import NcarChunk, plan_ncar_chunk_jobs, 
 from era5_pull_pipeline.ncar_download import NcarDownloadPool, record_download_completions
 from era5_pull_pipeline.publication import PublicationWorker
 from era5_pull_pipeline.ncar_ingest import ingest_ncar_month, select_ncar_source_hours
+from era5_pull_pipeline.staging import copy_local_cogs, get_source_path
 
 
 def _ignore_worker_interrupt() -> None:
@@ -74,11 +75,12 @@ def download_and_ingest_month(
     publisher: PublicationWorker, archive: Path, year: int, month: int,
     sources: Sequence[SourceFile], rows: Sequence[sqlite3.Row],
     executor: ProcessPoolExecutor, *, downloads: NcarDownloadPool,
+    uploads: ThreadPoolExecutor, upload_workers: int,
     processing_workers: int, max_decoded_gb: float,
     selected_hours: set[tuple[str, int]], refresh: bool,
     on_published: Callable[[], None], poll_prefetch: Callable[[], Future[Any] | None],
 ) -> Path:
-    """Overlap downloads, native-chunk conversion, and bounded batch publication.
+    """Overlap downloads, native-chunk conversion, uploads, and batch publication.
 
     Processing reservations end when encoding finishes. A separate allowance of
     twice the process count bounds native batches from submission through durable
@@ -93,6 +95,8 @@ def download_and_ingest_month(
         rows: Registered source rows in the same order as sources.
         executor: Spawned process pool owned by this invocation.
         downloads: Transfer pool retained across monthly processing boundaries.
+        uploads: Separate pool copying validated COGs to the archive.
+        upload_workers: Maximum concurrent native-batch uploads.
         processing_workers: Maximum outstanding metadata or chunk jobs.
         max_decoded_gb: Maximum reserved decoded chunk bytes in decimal GB.
         selected_hours: Exact source variable and Unix-hour selection.
@@ -123,6 +127,8 @@ def download_and_ingest_month(
     reports: dict[str, dict[str, Any]] = {}
     active: dict[Future[Any], tuple[str, NcarChunk, list[str]]] = {}
     encoded: deque[tuple[str, NcarChunk, list[tuple[str, dict[str, Any]]]]] = deque()
+    uploading: dict[Future[Any], tuple[str, NcarChunk, list[tuple[str, dict[str, Any]]]]] = {}
+    uploaded: deque[tuple[str, NcarChunk, list[tuple[str, dict[str, Any]]]]] = deque()
     publishing: dict[Future[Any], tuple[str, NcarChunk]] = {}
     reserved = 0
     limit = int(max_decoded_gb * 1_000_000_000)
@@ -141,7 +147,7 @@ def download_and_ingest_month(
             print(f"Published {records[source_id]['variable']}: {published[source_id]}/{len(selected[source_id])} observations.", flush=True)
 
     try:
-        while waiting or ready or planning or unprepared or preparing or chunks or active or encoded or publishing:
+        while waiting or ready or planning or unprepared or preparing or chunks or active or encoded or uploading or uploaded or publishing:
             available = downloads.ready + downloads.record_completed()
             downloads.ready.clear()
             for source_id in available:
@@ -182,22 +188,39 @@ def download_and_ingest_month(
                     break
                 unprepared.popleft()
                 preparing[future] = source_id, jobs
-            while encoded:
-                source_id, chunk, observations = encoded[0]
-                future = publisher.try_submit(publish_observations, archive, observations)
+            for future, batch in list(uploading.items()):
+                if future.done():
+                    future.result()
+                    uploaded.append(batch)
+                    del uploading[future]
+            while encoded and len(uploading) < upload_workers:
+                source_id, chunk, observations = encoded.popleft()
+                if downloads.staging_dir is None:
+                    uploaded.append((source_id, chunk, observations))
+                else:
+                    paths = [preparations[source_id][field["valid_time"]][1] for field in chunk.fields]
+                    future = uploads.submit(copy_local_cogs, downloads.staging_dir, archive, paths,
+                                            stop_event=downloads.stop_event)
+                    uploading[future] = source_id, chunk, observations
+            while uploaded:
+                source_id, chunk, observations = uploaded[0]
+                if downloads.staging_dir is None:
+                    future = publisher.try_submit(publish_observations, archive, observations)
+                else:
+                    future = publisher.try_submit(publish_observations, archive, observations, files_flushed=True)
                 if future is None:
                     break
-                encoded.popleft()
+                uploaded.popleft()
                 publishing[future] = source_id, chunk
             while ready and len(planning) + len(active) < processing_workers:
                 source_id = ready.popleft()
                 record = records[source_id]
-                future = executor.submit(plan_ncar_chunk_jobs, archive / record["path"], source_id,
+                future = executor.submit(plan_ncar_chunk_jobs, get_source_path(archive, downloads.staging_dir, record), source_id,
                                          record["variable"], selected[source_id])
                 planning[future] = source_id
             for _ in range(len(chunks)):
                 if (len(planning) + len(active) >= processing_workers
-                        or len(active) + len(encoded) + len(publishing) >= 2 * processing_workers):
+                        or len(active) + len(encoded) + len(uploading) + len(uploaded) + len(publishing) >= 2 * processing_workers):
                     break
                 source_id, chunk = chunks.popleft()
                 if reserved + chunk.decoded_bytes > limit:
@@ -206,13 +229,13 @@ def download_and_ingest_month(
                 report = reports[source_id]
                 prepared = [preparations[source_id][field["valid_time"]] for field in chunk.fields]
                 future = executor.submit(
-                    write_ncar_chunk_cogs, archive / records[source_id]["path"], chunk,
+                    write_ncar_chunk_cogs, get_source_path(archive, downloads.staging_dir, records[source_id]), chunk,
                     report["variables"][chunk.fields[0]["variable"]], report["grid"],
                     [path for _, path in prepared],
                 )
                 active[future] = source_id, chunk, [identifier for identifier, _ in prepared]
                 reserved += chunk.decoded_bytes
-            pending = [*downloads.pending, *planning, *preparing, *active, *publishing]
+            pending = [*downloads.pending, *planning, *preparing, *active, *uploading, *publishing]
             if prefetch is not None:
                 pending.append(prefetch)
             # A full publication queue must not stop transfer completion handling.
@@ -222,6 +245,7 @@ def download_and_ingest_month(
         downloads.stop_event.set()
         publisher.cancel_pending()
         executor.shutdown(wait=True, cancel_futures=True)
+        uploads.shutdown(wait=True, cancel_futures=True)
         publisher.drain()
         # A publication already executing can commit during shutdown. Count it
         # without replacing the original failure with another failed request.
@@ -242,6 +266,8 @@ def pull_range(
     *,
     download_workers: int = 2,
     processing_workers: int = 4,
+    staging_dir: Path | None = None,
+    upload_workers: int = 2,
     max_source_gb: float = 16,
     max_decoded_gb: float = 2,
     refresh: bool = False,
@@ -260,6 +286,8 @@ def pull_range(
         archive: Directory containing the catalog and observation files.
         download_workers: Maximum simultaneous file transfers.
         processing_workers: Maximum worker processes and outstanding native-chunk jobs.
+        staging_dir: Local temporary root to remember; omit to reuse configured storage.
+        upload_workers: Maximum simultaneous native-batch uploads from local staging.
         max_source_gb: Maximum reserved NetCDF source bytes in decimal GB.
         max_decoded_gb: Maximum decoded chunk-array bytes in decimal GB.
         refresh: Retrieve current sources and replace selected stored fields.
@@ -276,8 +304,8 @@ def pull_range(
     """
     if end < start:
         raise ValueError("The end date must be on or after the start date.")
-    if download_workers < 1 or processing_workers < 1 or max_source_gb <= 0 or max_decoded_gb <= 0:
-        raise ValueError("Download workers, processing workers, source and decoded budgets must be positive.")
+    if download_workers < 1 or processing_workers < 1 or upload_workers < 1 or max_source_gb <= 0 or max_decoded_gb <= 0:
+        raise ValueError("Download workers, processing workers, upload workers, source and decoded budgets must be positive.")
     variables = sorted(set(variables))
     summary = dict(completed=0, skipped=0, unavailable=0, failed=0,
                    pending=((end - start).days + 1) * 24 * len(variables))
@@ -292,13 +320,13 @@ def pull_range(
         active_hours -= 1
 
     try:
-        with PublicationWorker(archive, processing_workers) as publisher, requests.Session() as session, ProcessPoolExecutor(
+        with PublicationWorker(archive, processing_workers, staging_dir=staging_dir) as publisher, requests.Session() as session, ProcessPoolExecutor(
             max_workers=processing_workers, mp_context=get_context("spawn"),
             initializer=_ignore_worker_interrupt,
         ) as executor, NcarDownloadPool(
             lambda identifiers: publisher.try_submit(record_download_completions, identifiers),
-            [], [], download_workers, archive,
-        ) as downloads, ThreadPoolExecutor(max_workers=1) as inventory_pool:
+            [], [], download_workers, archive, staging_dir=publisher.call(get_staging_dir),
+        ) as downloads, ThreadPoolExecutor(max_workers=upload_workers) as uploads, ThreadPoolExecutor(max_workers=1) as inventory_pool:
             inventory_cache: dict[tuple[int, int], list[SourceFile]] = {}
             prefetch_cursor = start
             prefetch: Future[Any] | None = None
@@ -424,7 +452,7 @@ def pull_range(
                     poll_prefetch()
                 result = download_and_ingest_month(
                     publisher, archive, cursor.year, cursor.month, required_sources, rows, executor,
-                    downloads=downloads, processing_workers=processing_workers, max_decoded_gb=max_decoded_gb,
+                    downloads=downloads, uploads=uploads, upload_workers=upload_workers, processing_workers=processing_workers, max_decoded_gb=max_decoded_gb,
                     selected_hours=set(owners), refresh=refresh,
                     on_published=record_completed_observation, poll_prefetch=poll_prefetch,
                 )
@@ -435,7 +463,7 @@ def pull_range(
         summary["failed"] += active_hours
         summary["pending"] -= active_hours
         print(f"Stopped while {activity}. Run the same command to resume; "
-              "published observations and unfinished downloads remain in the archive.", flush=True)
+              "published observations and retained inputs remain at their cataloged paths.", flush=True)
         raise
     finally:
         print("Summary: " + ", ".join(f"{key}={value}" for key, value in summary.items()), flush=True)
