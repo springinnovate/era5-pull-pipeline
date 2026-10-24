@@ -274,3 +274,130 @@ def test_register_sources_records_only_missing_variable_hours(tmp_path: Path) ->
             ((start + timedelta(hours=first)).isoformat(), (start + timedelta(hours=last)).isoformat())
             for first, last in [(0, 1), (3, 3), (5, 5)]
         ]
+
+
+@pytest.mark.parametrize("boundary", ["flush", "ready", "install", "coverage"])
+def test_batch_publication_recovers_each_durability_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str,
+) -> None:
+    """Retain all source inputs and recover mixed installed/staged batch files."""
+    with catalog.archive_session(tmp_path) as db:
+        batch = [_stage(db, tmp_path, hour=hour) for hour in range(3)]
+        install = catalog._install_observation
+        installations = 0
+
+        def interrupted_install(source: Path, destination: Path) -> None:
+            """Fail after installing one file, leaving remaining ready files staged."""
+            nonlocal installations
+            installations += 1
+            if installations == 2:
+                raise OSError("batch interrupted")
+            install(source, destination)
+
+        def failed_flush(descriptor: int) -> None:
+            """Simulate durable file flushing failing before any ready commit."""
+            raise OSError("batch interrupted")
+
+        with monkeypatch.context() as patch:
+            if boundary == "install":
+                patch.setattr(catalog, "_install_observation", interrupted_install)
+            elif boundary == "flush":
+                patch.setattr(catalog.os, "fsync", failed_flush)
+            elif boundary == "ready":
+                db.execute("CREATE TEMP TRIGGER fail_ready BEFORE UPDATE ON publications "
+                           "WHEN NEW.valid_time = -631148400 "
+                           "BEGIN SELECT RAISE(ABORT, 'batch interrupted'); END")
+            else:
+                db.execute("CREATE TEMP TRIGGER fail_coverage BEFORE INSERT ON coverage "
+                           "WHEN NEW.valid_time = -631148400 "
+                           "BEGIN SELECT RAISE(ABORT, 'batch interrupted'); END")
+            with pytest.raises((OSError, sqlite3.IntegrityError), match="batch interrupted"):
+                catalog.publish_observations(db, tmp_path, [(identifier, report) for identifier, _, _, report in batch])
+        assert all(source.exists() for _, _, source, _ in batch)
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+        expected = "preparing" if boundary in {"flush", "ready"} else "ready"
+        assert [row[0] for row in db.execute("SELECT status FROM publications")] == [expected] * 3
+        if boundary == "install":
+            assert sum(stage.exists() for _, stage, _, _ in batch) == 2
+    with catalog.archive_session(tmp_path) as db:
+        if boundary in {"flush", "ready"}:
+            catalog.publish_observations(db, tmp_path, [(identifier, report) for identifier, _, _, report in batch])
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 3
+        assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] == 0
+        assert all(source.exists() for _, _, source, _ in batch)
+
+
+def test_source_preparation_and_batch_publication_use_three_commits(tmp_path: Path) -> None:
+    """Keep the durable transaction count independent of observations in a batch."""
+    with catalog.archive_session(tmp_path) as db:
+        original = [_stage(db, tmp_path, hour=hour) for hour in range(6)]
+        rows = db.execute("SELECT field_json,attributes_json FROM publications ORDER BY valid_time").fetchall()
+        fields = [json.loads(row["field_json"]) for row in rows]
+        attributes = json.loads(rows[0]["attributes_json"])
+        payloads = [staged.read_bytes() for _, staged, _, _ in original]
+        statements: list[str] = []
+        db.set_trace_callback(statements.append)
+        prepared = catalog.prepare_observations(db, tmp_path, fields, attributes)
+        assert statements.count("COMMIT") == 1
+        for (_, staged), payload in zip(prepared, payloads, strict=True):
+            staged.write_bytes(payload)
+        catalog.publish_observations(db, tmp_path, [
+            (identifier, original[index][3]) for index, (identifier, _) in enumerate(prepared)
+        ])
+        assert statements.count("COMMIT") == 3
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 6
+
+
+@pytest.mark.parametrize("failed_commit", [1, 2])
+def test_batch_commit_failure_keeps_durable_recovery_state(tmp_path: Path, failed_commit: int) -> None:
+    """Roll back a denied ready or coverage commit without losing source inputs."""
+    with catalog.archive_session(tmp_path) as db:
+        batch = [_stage(db, tmp_path, hour=hour) for hour in range(3)]
+        commits = 0
+
+        def deny_commit(action: int, first: str | None, second: str | None,
+                        database: str | None, trigger: str | None) -> int:
+            """Reject the selected real SQLite COMMIT at the authorization boundary."""
+            nonlocal commits
+            if action == sqlite3.SQLITE_TRANSACTION and first == "COMMIT":
+                commits += 1
+                if commits == failed_commit:
+                    return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        db.set_authorizer(deny_commit)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            catalog.publish_observations(db, tmp_path, [(identifier, report) for identifier, _, _, report in batch])
+        db.set_authorizer(None)
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+        expected = "preparing" if failed_commit == 1 else "ready"
+        assert [row[0] for row in db.execute("SELECT status FROM publications")] == [expected] * 3
+        assert all(source.exists() for _, _, source, _ in batch)
+    with catalog.archive_session(tmp_path) as db:
+        if failed_commit == 1:
+            catalog.publish_observations(db, tmp_path, [(identifier, report) for identifier, _, _, report in batch])
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 3
+
+
+def test_later_batch_does_not_acknowledge_an_interrupted_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leave failed ready entries for restart while acknowledging queued successes."""
+    with catalog.archive_session(tmp_path) as db:
+        first = _stage(db, tmp_path, hour=0)
+        second = _stage(db, tmp_path, hour=1)
+
+        def interrupted_install(source: Path, destination: Path) -> None:
+            """Leave the first batch ready but uninstalled."""
+            raise OSError("installation interrupted")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(catalog, "_install_observation", interrupted_install)
+            with pytest.raises(OSError, match="installation interrupted"):
+                catalog.publish_observations(db, tmp_path, [(first[0], first[3])])
+        catalog.publish_observations(db, tmp_path, [(second[0], second[3])])
+        assert first[1].exists()
+        assert db.execute("SELECT id FROM publications").fetchone()[0] == first[0]
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+    with catalog.archive_session(tmp_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 2

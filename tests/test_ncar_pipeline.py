@@ -203,13 +203,13 @@ def test_year_boundary_reuses_forecast_file_and_completed_repeat_is_offline(
     source_after_december: list[Path] = []
 
     def inspect_published_month(
-        db: sqlite3.Connection, destination: Path, year: int, month: int,
+        db: pipeline.PublicationWorker, destination: Path, year: int, month: int,
         *args: Any, **kwargs: Any,
-    ) -> tuple[Path, Future[list[SourceFile]] | None]:
+    ) -> Path:
         """Check the shared source immediately after December publication."""
         result = ingest(db, destination, year, month, *args, **kwargs)
         if (year, month) == (1999, 12):
-            source = db.execute("SELECT path FROM source_files WHERE object_key = ?", (shared.key,)).fetchone()
+            source = db.call(lambda connection: connection.execute("SELECT path FROM source_files WHERE object_key = ?", (shared.key,)).fetchone())
             source_after_december.append((destination / source["path"]))
             assert source_after_december[0].exists()
         return result
@@ -303,7 +303,7 @@ def test_refresh_requires_complete_selected_availability_before_downloading(
 
 
 @pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
-@pytest.mark.parametrize("completed_january_hours", [0, 2])
+@pytest.mark.parametrize("completed_january_hours", [0, 6])
 def test_failed_second_month_resumes_recorded_download_without_inventory(
     tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str], failure: type[BaseException], completed_january_hours: int,
@@ -312,20 +312,20 @@ def test_failed_second_month_resumes_recorded_download_without_inventory(
     archive = tmp_path / "archive"
     files.add_file("2t", "1999-12-31T00", "1999-12-31T23")
     files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
-    publish = pipeline.publish_observation
+    publish = pipeline.publish_observations
 
     def fail_january(
-        db: sqlite3.Connection, destination: Path, revision: str, report: dict[str, Any],
-    ) -> Path:
+        db: sqlite3.Connection, destination: Path, observations: list[tuple[str, dict[str, Any]]],
+    ) -> list[Path]:
         """Fail at January's publication boundary after decoding has completed."""
-        valid_time = db.execute("SELECT valid_time FROM publications WHERE id = ?", (revision,)).fetchone()[0]
+        valid_time = db.execute("SELECT valid_time FROM publications WHERE id = ?", (observations[0][0],)).fetchone()[0]
         completed = db.execute("SELECT COUNT(*) FROM observations WHERE valid_time >= 946684800").fetchone()[0]
         if valid_time >= 946684800 and completed == completed_january_hours:
             raise failure("January publication interrupted")
-        return publish(db, destination, revision, report)
+        return publish(db, destination, observations)
 
     with monkeypatch.context() as patch:
-        patch.setattr(pipeline, "publish_observation", fail_january)
+        patch.setattr(pipeline, "publish_observations", fail_january)
         with pytest.raises(failure, match="January publication interrupted"):
             pipeline.pull_range(date(1999, 12, 31), date(2000, 1, 1), ["2t"], archive)
     output = capsys.readouterr().out
@@ -427,9 +427,10 @@ def test_publication_overlaps_downloads_with_bounded_workers(
     encode_count = 0
     owner = get_ident()
     writer_threads: set[int] = set()
+    catalog_threads: set[int] = set()
     write = pipeline.write_ncar_chunk_cogs
-    publish = pipeline.publish_observation
-    prepare = pipeline.prepare_observation
+    publish = pipeline.publish_observations
+    prepare = pipeline.prepare_observations
 
     def transfer(source: SourceFile, target: Path, **kwargs: Any) -> None:
         """Hold the second transfer until the first source has a published COG."""
@@ -457,26 +458,26 @@ def test_publication_overlaps_downloads_with_bounded_workers(
             with lock:
                 active -= 1
 
-    def prepare_on_owner(db: sqlite3.Connection, *args: Any) -> tuple[str, Path]:
-        """Keep the journal and all queued observations within the worker bound."""
-        assert get_ident() == owner
-        result = prepare(db, *args)
-        assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] <= workers * 6
-        return result
+    def prepare_on_owner(db: sqlite3.Connection, *args: Any) -> list[tuple[str, Path]]:
+        """Prepare source journals on the dedicated catalog owner."""
+        assert get_ident() != owner
+        catalog_threads.add(get_ident())
+        return prepare(db, *args)
 
-    def publish_on_owner(db: sqlite3.Connection, *args: Any) -> Path:
+    def publish_on_owner(db: sqlite3.Connection, *args: Any) -> list[Path]:
         """Require a real durable observation before releasing the pending transfer."""
-        assert get_ident() == owner
+        assert get_ident() != owner
+        catalog_threads.add(get_ident())
         assert slow_download.wait(10)
-        assert len(list((archive / "staging" / "observations").glob("*.tif"))) <= workers * 6
+        assert len(list((archive / "staging" / "observations").glob("*.tif"))) <= 2 * workers * 6
         result = publish(db, *args)
         first_publication.set()
         return result
 
     monkeypatch.setattr(ncar_download, "download_file", transfer)
     monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
-    monkeypatch.setattr(pipeline, "prepare_observation", prepare_on_owner)
-    monkeypatch.setattr(pipeline, "publish_observation", publish_on_owner)
+    monkeypatch.setattr(pipeline, "prepare_observations", prepare_on_owner)
+    monkeypatch.setattr(pipeline, "publish_observations", publish_on_owner)
     result = pipeline.pull_range(
         date(2000, 1, 1), date(2000, 1, 1), ["2t", "10u"], archive,
         download_workers=1, processing_workers=workers,
@@ -484,6 +485,7 @@ def test_publication_overlaps_downloads_with_bounded_workers(
     )
     assert result["completed"] == 48
     assert peak == workers and len(writer_threads) == workers
+    assert len(catalog_threads) == 1 and not catalog_threads & writer_threads
     assert not (archive / "staging" / "decoded" / "values.bin").exists()
 
 
@@ -526,14 +528,14 @@ def test_processing_failure_stops_downloads_and_waits_for_chunk_readers(
         reader_finished.set()
         return result
 
-    def fail_publication(*args: Any) -> Path:
+    def fail_publication(*args: Any) -> list[Path]:
         """Interrupt installation of a validated output."""
         raise failure("publication interrupted")
 
     with monkeypatch.context() as patch:
         patch.setattr(ncar_download, "download_file", transfer)
         patch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
-        patch.setattr(pipeline, "publish_observation", fail_publication)
+        patch.setattr(pipeline, "publish_observations", fail_publication)
         with pytest.raises(failure, match="publication interrupted"):
             pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t", "10u"], archive,
                                 download_workers=1, processing_workers=2)
@@ -603,14 +605,25 @@ def test_cog_worker_failure_keeps_committed_hours_and_source_for_resume(
     archive = tmp_path / "archive"
     files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
     write = pipeline.write_ncar_chunk_cogs
+    committed = Event()
+    publish = pipeline.publish_observations
+
+    def publish_first(*args: Any) -> list[Path]:
+        """Acknowledge the first durable batch before injecting a later failure."""
+        result = publish(*args)
+        committed.set()
+        return result
+
 
     def fail_second_chunk(*args: Any) -> list[dict[str, Any]]:
         """Fail an output write after one durably published native chunk."""
         if args[1].fields[0]["valid_time"] == 946684800 + 6 * 3600:
+            assert committed.wait(10)
             raise OSError("COG storage unavailable")
         return write(*args)
 
     with monkeypatch.context() as patch:
+        patch.setattr(pipeline, "publish_observations", publish_first)
         patch.setattr(pipeline, "write_ncar_chunk_cogs", fail_second_chunk)
         with pytest.raises(OSError, match="COG storage unavailable"):
             pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t"], archive,
@@ -667,7 +680,7 @@ def test_next_month_prefetch_overlaps_processing_only_within_source_budget(
                 assert prefetched.wait(10), "next-month downloads waited for processing"
         return write(*args)
 
-    def month_finished(db: sqlite3.Connection, target: Path, year: int, month: int, *args: Any, **kwargs: Any) -> tuple[Path, Future[list[SourceFile]] | None]:
+    def month_finished(db: pipeline.PublicationWorker, target: Path, year: int, month: int, *args: Any, **kwargs: Any) -> Path:
         """Observe the durable month boundary before the next month starts."""
         result = ingest(db, target, year, month, *args, **kwargs)
         if month == 1:
@@ -741,7 +754,7 @@ def test_prefetched_sources_survive_interrupted_current_month(
     files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
     february = files.add_file("2t", "2000-02-01T00", "2000-02-01T23")
     prefetched = Event()
-    publish = pipeline.publish_observation
+    publish = pipeline.publish_observations
     count = 0
 
     def transfer(source: SourceFile, target: Path, **kwargs: Any) -> None:
@@ -750,25 +763,25 @@ def test_prefetched_sources_survive_interrupted_current_month(
         if source.key == february.key:
             prefetched.set()
 
-    def interrupt(db: sqlite3.Connection, *args: Any) -> Path:
-        """Fail after three committed observations and a completed prefetch."""
+    def interrupt(db: sqlite3.Connection, *args: Any) -> list[Path]:
+        """Fail after one committed chunk and a completed prefetch."""
         nonlocal count
         count += 1
-        if count == 4:
+        if count >= 2:
             assert prefetched.wait(10)
             raise KeyboardInterrupt("stop current month")
         return publish(db, *args)
 
     with monkeypatch.context() as patch:
         patch.setattr(ncar_download, "download_file", transfer)
-        patch.setattr(pipeline, "publish_observation", interrupt)
+        patch.setattr(pipeline, "publish_observations", interrupt)
         with pytest.raises(KeyboardInterrupt, match="stop current month"):
             pipeline.pull_range(date(2000, 1, 1), date(2000, 2, 1), ["2t"], archive)
     with catalog.archive_session(archive) as db:
         row = db.execute("SELECT path,downloaded_at FROM source_files WHERE object_key=?", (february.key,)).fetchone()
         assert row["downloaded_at"] is not None and (archive / row["path"]).exists()
     result = pipeline.pull_range(date(2000, 1, 1), date(2000, 2, 1), ["2t"], archive)
-    assert result["completed"] == 45 and result["skipped"] == 3
+    assert result["completed"] == 42 and result["skipped"] == 6
     assert files.downloaded.count((february.key, february.etag)) == 1
 
 
@@ -824,7 +837,7 @@ def test_prefetch_transfer_continues_across_publication_month_boundary(
             assert not stop_event.is_set(), "transfer was stopped at the month boundary"
         files.transfer(source, target, **kwargs)
 
-    def finished(db: sqlite3.Connection, archive: Path, year: int, month: int, *args: Any, **kwargs: Any) -> tuple[Path, Future[list[SourceFile]] | None]:
+    def finished(db: pipeline.PublicationWorker, archive: Path, year: int, month: int, *args: Any, **kwargs: Any) -> Path:
         """Signal the published month without requiring future transfers to finish."""
         result = ingest(db, archive, year, month, *args, **kwargs)
         if month == 1:
@@ -884,7 +897,7 @@ def test_refresh_does_not_prefetch_an_incomplete_future_selection(
     prefetch = pipeline._prefetch_month_sources
     write = pipeline.write_ncar_chunk_cogs
 
-    def inspect_prefetch(*args: Any, **kwargs: Any) -> bool:
+    def inspect_prefetch(*args: Any, **kwargs: Any) -> tuple[list[SourceFile], list[sqlite3.Row], bool]:
         """Allow current work to finish after future source admission is evaluated."""
         result = prefetch(*args, **kwargs)
         prefetch_checked.set()
@@ -901,3 +914,65 @@ def test_refresh_does_not_prefetch_an_incomplete_future_selection(
         pipeline.pull_range(date(2000, 1, 31), date(2000, 2, 1), ["2t"], tmp_path / "archive",
                             refresh=True, processing_workers=2)
     assert files.downloaded == [(january.key, january.etag)]
+
+
+def test_blocked_publication_keeps_decoding_and_transfer_refills_bounded(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Continue conversion and transfers while the writer fills its bounded queue."""
+    archive = tmp_path / "archive"
+    files.add_file("2t", "2000-01-01T00", "2000-01-02T23")
+    files.add_file("10u", "2000-01-01T00", "2000-01-01T23")
+    files.add_file("10u", "2000-01-02T00", "2000-01-02T23")
+    publication_started = Event()
+    four_encoded = Event()
+    last_download = Event()
+    checked = Event()
+    lock = Lock()
+    encoded = transfers = 0
+    encode = pipeline.write_ncar_chunk_cogs
+    publish = pipeline.publish_observations
+
+    def transfer(source: SourceFile, target: Path, **kwargs: Any) -> None:
+        """Require both later transfers to refill while publication is blocked."""
+        nonlocal transfers
+        transfers += 1
+        if transfers > 1:
+            assert publication_started.wait(10)
+        files.transfer(source, target, **kwargs)
+        if transfers == 3:
+            last_download.set()
+
+    def write(*args: Any) -> list[dict[str, Any]]:
+        """Signal that four batches encoded with only one chunk's decoded memory."""
+        nonlocal encoded
+        result = encode(*args)
+        with lock:
+            encoded += 1
+            if encoded == 4:
+                four_encoded.set()
+        return result
+
+    def blocked_publish(db: sqlite3.Connection, *args: Any) -> list[Path]:
+        """Hold final installation until independent stages progress to their bounds."""
+        if not checked.is_set():
+            publication_started.set()
+            assert four_encoded.wait(10), "decoding slots waited for publication"
+            assert last_download.wait(10), "download slots waited for catalog commits"
+            Event().wait(0.15)  # Give scheduling an opportunity to exceed the bound.
+            assert encoded == 4
+            assert len(list((archive / "staging/observations").glob("*.tif"))) == 24
+            assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+            assert db.execute("SELECT SUM(size) FROM source_files WHERE removed_at IS NULL").fetchone()[0] <= sum(s.size for s in files.sources)
+            checked.set()
+        return publish(db, *args)
+
+    monkeypatch.setattr(ncar_download, "download_file", transfer)
+    monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", write)
+    monkeypatch.setattr(pipeline, "publish_observations", blocked_publish)
+    result = pipeline.pull_range(
+        date(2000, 1, 1), date(2000, 1, 2), ["2t", "10u"], archive,
+        download_workers=1, processing_workers=2, max_decoded_gb=6 * 3 * 4 * 4 / 1e9,
+        max_source_gb=sum(source.size for source in files.sources) / 1e9,
+    )
+    assert checked.is_set() and result["completed"] == 96
