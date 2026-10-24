@@ -192,7 +192,7 @@ def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
 
     Raises:
         portalocker.exceptions.LockException: Another writer holds the archive.
-        ValueError: The archive contains a Zarr catalog and needs separate conversion.
+        ValueError: The archive contains an incompatible catalog.
         Exception: Catalog or publication recovery errors propagate.
     """
     archive.mkdir(parents=True, exist_ok=True)
@@ -202,8 +202,8 @@ def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
             coverage_columns = {row["name"] for row in db.execute("PRAGMA table_info(coverage)")}
             if coverage_columns and "path" not in coverage_columns:
                 raise ValueError(
-                    f"The archive at {archive} is not a COG catalog. Convert it with "
-                    "python scripts/convert_zarr_archive.py --source OLD --archive NEW."
+                    f"The archive at {archive} is not a COG catalog. "
+                    "Use an existing COG archive or choose a new archive directory."
                 )
             db.execute("PRAGMA foreign_keys = ON")
             db.execute("PRAGMA synchronous = FULL")
