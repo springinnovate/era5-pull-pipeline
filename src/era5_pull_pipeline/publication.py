@@ -32,14 +32,16 @@ class PublicationWorker:
     Operations return only after their catalog/file contract has completed.
     """
 
-    def __init__(self, archive: Path, capacity: int) -> None:
+    def __init__(self, archive: Path, capacity: int, *, staging_dir: Path | None = None) -> None:
         """Configure an archive writer with a bounded request queue.
 
         Args:
             archive: Archive whose lock and connection this worker owns.
             capacity: Maximum waiting requests, excluding the executing request.
+            staging_dir: Local storage root to configure or reuse on this archive.
         """
         self.archive = archive
+        self.staging_dir = staging_dir
         self.requests: Queue[_CatalogRequest | None] = Queue(maxsize=capacity)
         self.started: Future[None] = Future()
         self.error: BaseException | None = None
@@ -48,7 +50,7 @@ class PublicationWorker:
     def _run(self) -> None:
         """Execute catalog requests under the archive's single writer lock."""
         try:
-            with archive_session(self.archive) as db:
+            with archive_session(self.archive, staging_dir=self.staging_dir) as db:
                 self.started.set_result(None)
                 while True:
                     request = self.requests.get()

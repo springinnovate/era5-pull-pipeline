@@ -19,6 +19,7 @@ from archive_assertions import read_raster_values
 
 from era5_pull_pipeline import catalog, conversion, ncar_download, pipeline
 from era5_pull_pipeline.ncar import SourceFile
+from era5_pull_pipeline.staging import get_source_path
 
 
 @dataclass
@@ -156,7 +157,7 @@ class NcarFiles:
             if row["downloaded_at"] is not None:
                 continue
             identity = (source.key, source.etag)
-            target = (archive / row["path"])
+            target = get_source_path(archive, catalog.get_staging_dir(db), row)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(self.payloads[identity], target)
             with db:
@@ -252,8 +253,9 @@ def test_availability_is_per_variable_and_missing_hours_are_reconsidered(
     np.testing.assert_array_equal(dataset["10_metre_u_wind_component"][24:], np.float32(6))
 
 
+@pytest.mark.parametrize("local_staging", [False, True])
 def test_add_variable_then_refresh_across_months_preserves_unselected_pending_work(
-    tmp_path: Path, files: NcarFiles,
+    tmp_path: Path, files: NcarFiles, local_staging: bool,
 ) -> None:
     """Refresh temperature while preserving published and separately staged wind."""
     archive = tmp_path / "archive"
@@ -261,7 +263,7 @@ def test_add_variable_then_refresh_across_months_preserves_unselected_pending_wo
         files.add_file("2t", f"{day}T00", f"{day}T23")
         files.add_file("10u", f"{day}T00", f"{day}T23", value=5)
     first, last = date(1999, 12, 31), date(2000, 1, 1)
-    pipeline.pull_range(first, last, ["2t"], archive)
+    pipeline.pull_range(first, last, ["2t"], archive, staging_dir=tmp_path / "ssd" if local_staging else None)
     added = pipeline.pull_range(first, last, ["10u"], archive)
     assert added["completed"] == 48
     for day in ("1999-12-31", "2000-01-01"):
@@ -270,7 +272,7 @@ def test_add_variable_then_refresh_across_months_preserves_unselected_pending_wo
     with catalog.archive_session(archive) as db:
         rows = catalog.register_sources(db, archive, [pending_wind], last, last)
         files.download(db, [pending_wind], rows, archive=archive)
-        wind_id, wind_path = rows[0]["id"], (archive / rows[0]["path"])
+        wind_id, wind_path = rows[0]["id"], ((catalog.get_staging_dir(db) or archive) / rows[0]["path"])
     refreshed = pipeline.pull_range(first, last, ["2t"], archive, refresh=True)
     assert refreshed == {"completed": 48, "skipped": 0, "unavailable": 0, "failed": 0, "pending": 0}
     for year, month in ((1999, 12), (2000, 1)):
@@ -640,9 +642,10 @@ def test_cog_worker_failure_keeps_committed_hours_and_source_for_resume(
     assert before == {path: path.stat().st_mtime_ns for path in before}
 
 
+@pytest.mark.parametrize("local_staging", [False, True])
 @pytest.mark.parametrize("fits", [True, False])
 def test_next_month_prefetch_overlaps_processing_only_within_source_budget(
-    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch, fits: bool,
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch, fits: bool, local_staging: bool,
 ) -> None:
     """Prefetch while January processes, or wait for its source bytes to be freed."""
     archive = tmp_path / "archive"
@@ -691,7 +694,8 @@ def test_next_month_prefetch_overlaps_processing_only_within_source_budget(
     monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
     monkeypatch.setattr(pipeline, "download_and_ingest_month", month_finished)
     result = pipeline.pull_range(date(2000, 1, 1), date(2000, 2, 1), ["2t"], archive,
-                                 download_workers=1, processing_workers=2, max_source_gb=budget / 1e9)
+                                 download_workers=1, processing_workers=2, max_source_gb=budget / 1e9,
+                                 staging_dir=tmp_path / "ssd" if local_staging else None)
     assert result["completed"] == 48
     assert prefetched.is_set()
     assert files.downloaded.count((february.key, february.etag)) == 1

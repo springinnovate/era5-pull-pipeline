@@ -21,9 +21,10 @@ from era5_pull_pipeline.ncar import SourceFile
 HTTP_REQUEST = requests.Session.request
 
 
+@pytest.mark.parametrize("local_staging", [False, True])
 @pytest.mark.parametrize("workers,missing_hour", [(1, False), (2, False), (2, True)])
 def test_spawned_pull_resumes_http_and_preserves_precision(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int, missing_hour: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int, missing_hour: bool, local_staging: bool,
 ) -> None:
     """Resume real source bytes and preserve exact float64 pixels across processes."""
     source_path = tmp_path / "source.nc"
@@ -54,9 +55,9 @@ def test_spawned_pull_resumes_http_and_preserves_precision(
         datetime(2000, 1, 1, 1, tzinfo=UTC),
     )
     archive = tmp_path / "archive"
-    with catalog.archive_session(archive) as db:
+    with catalog.archive_session(archive, staging_dir=tmp_path / "local" if local_staging else None) as db:
         row = catalog.register_sources(db, archive, [source], date(2000, 1, 1), date(2000, 1, 1))[0]
-        retained = archive / row["path"]
+        retained = (tmp_path / "local" if local_staging else archive) / row["path"]
         retained.parent.mkdir(parents=True, exist_ok=True)
         retained.write_bytes(source_path.read_bytes()[:17])
     requests_seen: list[tuple[str | None, str | None]] = []

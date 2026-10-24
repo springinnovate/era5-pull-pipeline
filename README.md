@@ -35,6 +35,8 @@ To add wind for those dates, run the same command with `--variables 10u 10v`. Ex
 | `--archive` | Directory containing dataset.yaml, the catalog, staging, and GeoTIFFs; defaults to `archive`. |
 | `--download-workers` | Maximum simultaneous file transfers; defaults to 2. |
 | `--processing-workers` | Maximum simultaneous native-chunk decoding/encoding jobs; defaults to 4. |
+| `--staging-dir` | Local directory for new downloads and COG conversion. Remembered for subsequent commands; without a configured directory, staging stays in the archive. |
+| `--upload-workers` | Maximum simultaneous COG batch uploads from local staging; defaults to 2. |
 | `--max-decoded-gb` | Maximum reserved decoded chunk arrays in decimal GB; defaults to 2. Encoding buffers and process overhead need additional memory. |
 | `--max-source-gb` | Maximum reserved NetCDF source bytes in decimal GB; defaults to 16. Conversion requires additional space. |
 | `--refresh` | Retrieve current sources and replace selected stored fields. |
@@ -55,11 +57,23 @@ NCAR updates monthly and typically trails real time by about 3–4 months. Avail
 
 The workflow processes one month at a time and prefetches future source files while the current month is processing. Lookahead advances month by month until the source budget fills or an unavailable month is reached. At most `--download-workers` transfers are active across current and prefetched months. Each new file reserves its full size before transfer, including partial and retained sources. Prefetch uses only spare `--max-source-gb` capacity; files that do not fit wait until current-month sources are released. If the required current month cannot fit, the command reports the required size before starting its new transfers. Increase `--max-source-gb` or select fewer variables.
 
-Completed or reused sources are divided at their native NetCDF temporal chunk boundaries. Separate processes decode and encode those chunks concurrently, including multiple chunks from the same source. A job reads its native chunks once, keeps its decoded arrays in memory, and writes validated hourly COGs. There is no full-month decoding barrier or decoded scratch file in `pull`. Decoding, encoding, downloads, and future-month availability lookup can overlap. A dedicated publication thread owns the archive writer lock, SQLite connection, and final file installation. It runs alongside the coordinator, downloads, and decoding processes.
+Completed or reused sources are divided at their native NetCDF temporal chunk boundaries. Separate processes decode and encode those chunks concurrently, including multiple chunks from the same source. A job reads its native chunks once, keeps its decoded arrays in memory, and writes validated hourly COGs. There is no full-month decoding barrier or decoded scratch file in `pull`. Decoding, encoding, downloads, local-to-archive uploads, and future-month availability lookup can overlap. A dedicated publication thread owns the archive writer lock, SQLite connection, and final file installation. It runs alongside the coordinator, downloads, and decoding processes.
 
-`--processing-workers` bounds active decoding/encoding jobs, and `--max-decoded-gb` bounds their combined decoded-array reservations. Those reservations are released when encoding finishes. A separate limit of twice the processing worker count bounds native COG batches from job submission through durable publication, and the catalog request queue holds at most one request per processing worker. When publication falls behind, these limits pause new encoding while transfer slots continue to refill within the source budget. Common analysis chunks contain 27 hours (about 112 MB decoded at float32); forecast chunks contain 12 hours (about 50 MB). Each job additionally needs compression, validation, and library buffers and may stage one COG per selected hour in its native chunk. These limits bound work independently of the total requested date range. If one native chunk cannot fit, increase `--max-decoded-gb`; the completed source is retained for retry. A 2 GB decoded budget can accommodate sixteen of those analysis chunks, excluding the additional encoding/process memory.
+`--processing-workers` bounds active decoding/encoding jobs, and `--max-decoded-gb` bounds their combined decoded-array reservations. Those reservations are released when encoding finishes. A separate limit of twice the processing worker count bounds native COG batches from job submission through durable publication, including queued and active uploads, and the catalog request queue holds at most one request per processing worker. When uploads or publication fall behind, these limits pause new encoding while transfer slots continue to refill within the source budget. Common analysis chunks contain 27 hours (about 112 MB decoded at float32); forecast chunks contain 12 hours (about 50 MB). Each job additionally needs compression, validation, and library buffers and may stage one COG per selected hour in its native chunk. These limits bound work independently of the total requested date range. If one native chunk cannot fit, increase `--max-decoded-gb`; the completed source is retained for retry. A 2 GB decoded budget can accommodate sixteen of those analysis chunks, excluding the additional encoding/process memory.
 
 The source budget limits staged NetCDF bytes, not the published archive or processing memory. Use `--processing-workers 1` to run one native chunk job at a time while retaining download overlap and bounded prefetch. More workers can increase CPU use and storage contention; compare the publication rate when choosing a count. Retained source inputs are released after their selected monthly work is published, except files still supplying a later selected month.
+
+## Local staging for a network archive
+
+Choose a directory on a local SSD with enough free space for retained source files and bounded COG batches:
+
+```powershell
+python -m era5_pull_pipeline pull --start-date 2000-01-01 --variables 2t 2d 10u 10v sp ssrd strd mtpr --archive "Z:/wwf-resilience-platform/era5-cog" --staging-dir "D:/era5-staging/era5-cog" --download-workers 2 --processing-workers 16 --upload-workers 2 --max-source-gb 32
+```
+
+New NetCDF downloads go to the local directory. Process workers decode them and create, reopen, and validate each COG locally. Upload workers copy finished files to archive-side staging and flush them before the publication worker installs them and records coverage. Downloads and conversion continue during uploads until their resource limits fill. Uploads add a bounded copy buffer per worker; local COG storage is covered by the same limit of twice the processing worker count in native batches. Allow space beyond `--max-source-gb` for these outputs. Published files and the catalog remain in the archive.
+
+The catalog remembers the absolute local directory, so later commands can omit `--staging-dir`. Existing retained downloads remain at their recorded archive paths and are reused there; new downloads use the local directory. Both locations count toward the same source budget. Each staging directory belongs to one running writer and must be outside the archive. Choose another directory only after its cataloged local work has finished. Keep the local directory available when resuming unfinished work.
 
 ## Variables and time semantics
 
@@ -83,9 +97,9 @@ Original source attributes, including upstream precision-processing metadata, re
 
 ## Stop, resume, and refresh
 
-Press Ctrl+C to stop. No new processing jobs are scheduled; active workers finish before input files are released. Transfers stop between received chunks and retain partial bytes. An idle network read times out after 30 seconds. Run the same ordinary `pull` command to resume. SQLite supplies recorded paths and selections, completed downloads are reused directly, and partial downloads resume from their saved byte position. Transient transfer failures allow up to three attempts with backoff. Requests are pinned to the discovered source identity so bytes from different versions cannot be combined.
+Press Ctrl+C to stop. No new processing jobs are scheduled; active workers finish before input files are released. Downloads stop between received chunks and retain partial bytes. Local COG uploads stop between copy blocks; partial uploads stay unpublished. An idle network read times out after 30 seconds. Run the same ordinary `pull` command to resume. SQLite supplies recorded paths and selections, completed downloads are reused directly, and partial downloads resume from their saved byte position. Transient transfer failures allow up to three attempts with backoff. Requests are pinned to the discovered source identity so bytes from different versions cannot be combined.
 
-The pull command prepares a source's selected observations in one transaction, then publishes each completed native chunk as a batch: one transaction records the validated files as ready, and another records coverage after installation. Files are flushed before the ready commit. A batch is acknowledged only after its coverage commit; an interrupted installation can recover a mix of staged and already installed files. Failed conversion or publication retains its source files, and a restart skips completed observations, rebuilds incomplete files, or finishes a validated publication. NetCDF inputs are removed only after all their selected hours are published and recorded in SQLite. Completed ordinary repeats require no source access.
+The pull command prepares a source's selected observations in one transaction, then publishes each completed native chunk as a batch: one transaction records the validated files as ready, and another records coverage after installation. Files are flushed before the ready commit. A batch is acknowledged only after its coverage commit; an interrupted installation can recover a mix of staged and already installed files. Failed conversion or publication retains its source files, and a restart skips completed observations, rebuilds incomplete files, or finishes a validated publication. NetCDF inputs are removed only after all their selected hours are published and recorded in SQLite. Completed ordinary repeats require no source access. With local staging, startup finishes ready archive publications, then removes cataloged uncommitted local COGs and partial uploads so they can be rebuilt from retained NetCDF inputs. It does not redownload completed inputs.
 
 Use `--refresh` to check current source identities and replace selected stored hours:
 
@@ -129,7 +143,7 @@ source:
   catalog: catalog.sqlite
 ```
 
-`source.format: temporal_cog` declares a temporal raster archive located through the SQLite `observations` view. All cataloged paths, including retained NetCDF inputs, are relative to the archive root and use `/` separators. Move the complete archive, including its catalog and staging directory, without rewriting paths.
+`source.format: temporal_cog` declares a temporal raster archive located through the SQLite `observations` view. Published paths and archive-side staging paths are relative to the archive root and use `/` separators. Local source and COG paths are relative to the separately configured local directory; its absolute location is an operational setting in the catalog. A completed archive can move without rewriting its observation paths. To resume unfinished work after moving an archive, preserve both its archive-side staging and its configured local directory.
 
 Consumers query `observations`; they do not need to infer metadata from filenames or source parameter codes:
 
@@ -196,7 +210,7 @@ python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 20
 python -m era5_pull_pipeline ingest-ncar --archive downloads/local-ncar --year 2000 --month 1
 ```
 
-`download-ncar` retains all selected files under `staging/ncar/` and records selected hours in SQLite. It supports `--download-workers` but does not impose the bulk workflow's source budget; use `pull` for long backfills. `ingest-ncar` publishes pending selections for one month without network access, using the serial offline ingestion path and disk-backed decoded scratch arrays. Add `--refresh` to ingestion to replace their stored values.
+`download-ncar` retains all selected files under `staging/ncar/` and records selected hours in SQLite. Both standalone commands honor a local staging directory previously configured by `pull`. It supports `--download-workers` but does not impose the bulk workflow's source budget; use `pull` for long backfills. `ingest-ncar` publishes pending selections for one month without network access, using the serial offline ingestion path and disk-backed decoded scratch arrays. Add `--refresh` to ingestion to replace their stored values.
 
 ## Tests
 
@@ -207,4 +221,4 @@ python -m pip install -e ".[test]"
 python -m pytest -q --tb=short
 ```
 
-Tests use local NetCDF fixtures, real SQLite/COG files, the included global sample, and a local HTTP server. They exercise exact pixel/NoData preservation, georeferencing, time semantics, byte-range resume, concurrency, month boundaries, selected refresh, publication recovery, source cleanup, relocation, and resource limits without contacting external services.
+Tests use local NetCDF fixtures, real SQLite/COG files, the included global sample, and a local HTTP server. They exercise exact pixel/NoData preservation, georeferencing, time semantics, byte-range resume, concurrency, month boundaries, selected refresh, publication recovery, local upload interruption and backpressure, source cleanup, relocation, and resource limits without contacting external services.
