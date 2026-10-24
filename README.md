@@ -171,41 +171,6 @@ with rasterio.open(archive / row[0]) as raster:
 
 One writer owns the archive. Consumers follow **update → refresh → calculate**: finish the producer update, refresh their observation listing, then calculate while source files remain unchanged. Each COG is finished, read back, and validated before publication. A durable SQLite journal bridges file installation and coverage recording so interrupted publication can finish on restart. Observations awaiting that commit are excluded from the public view. There are no historical raster copies or concurrent-reader snapshots.
 
-## Convert an existing Zarr archive and restart
-
-The [one-time converter](scripts/convert_zarr_archive.py) copies the current published observations into a **separate** COG archive. It reads only cataloged coverage, preserves source values and time semantics, and copies pending selections and any retained or partial NetCDF downloads. It leaves the original archive unchanged. Conversion needs room for the COG archive, retained NetCDF copies, and one variable/month of decoded scratch data (about 3.1 GB for 744 float32 global hours).
-
-The converter uses four worker processes by default to encode and validate separate COGs. `--workers` sets the maximum number of observations in flight; each worker receives one hourly raster while the coordinator owns SQLite and publication. Use `--workers 1` for serial conversion. On a 24-core machine, start with `--workers 8`, then compare against 16 using the publication rate. Zarr reads, network storage, and catalog commits can limit the benefit of additional workers.
-
-Progress displays cover source metadata import, retained-file copying, spatial-shard reads, and COG publication, with counts, elapsed time, and rates.
-
-1. Leave the existing download running until you are ready to convert. Stop it with Ctrl+C and wait for it to exit. Keep the old archive stopped throughout conversion, including between interrupted converter runs. If its catalog has a validated but unfinished publication, the converter asks you to run the old pipeline once to recover it before retrying.
-2. Check out this code and install the optional conversion dependency in your environment:
-
-   ```powershell
-   python -m pip install -e ".[convert]"
-   ```
-
-3. Run from the repository directory, using a new sibling destination:
-
-   ```powershell
-   python scripts/convert_zarr_archive.py --source Z:/wwf-resilience-platform/era5-ncar --archive Z:/wwf-resilience-platform/era5-cog --workers 8
-   ```
-
-   Keep the existing `era5-ncar` directory available for current readers. If conversion stops, rerun the same command: the destination catalog skips completed TIFFs and partial NetCDF copies continue from their saved byte position. Do not run `pull` against the destination until conversion reports completion. The new producer rejects a Zarr catalog rather than modifying it in place.
-
-   To change the worker count or update a running converter, press Ctrl+C and wait for it to exit before restarting with the same paths. Active workers finish before their decoded input is released; completed cataloged observations are reused, and unfinished publications are recovered or rebuilt.
-
-4. Inspect the new archive with the query above, setting `archive` to the COG destination. Then restart downloading with the same date range and variables:
-
-   ```powershell
-   python -m era5_pull_pipeline pull --start-date 2000-01-01 --variables 2t 2d 10u 10v sp ssrd strd mtpr --archive Z:/wwf-resilience-platform/era5-cog --max-source-gb 32
-   ```
-
-   Converted observations are skipped; pending inputs resume and new results are COGs. Use `--start-date 1950-01-01` instead to fill the full historical range. No `--refresh` is needed for this format change.
-
-5. Switch consumers to `era5-cog/dataset.yaml` after they support the `temporal_cog` contract and pass their integration checks. Keep the original archive until that cutover is verified. The converter and its optional Zarr dependency are separate from the producer and can be removed after the one-time transfer.
-
 ## Representative sample
 
 [examples/era5-cog-sample.zip](examples/era5-cog-sample.zip) contains a ready-to-read `era5-cog-sample/` archive: the descriptor, SQLite catalog, and six real global rasters for temperature, accumulated solar radiation, and mean precipitation rate at **1999-12-31 23:00 UTC** and **2000-01-01 00:00 UTC**. It has no pending downloads and uses the same output contract as a full archive.
@@ -238,8 +203,8 @@ python -m era5_pull_pipeline ingest-ncar --archive downloads/local-ncar --year 2
 Install the optional test dependencies and run:
 
 ```powershell
-python -m pip install -e ".[test,convert]"
+python -m pip install -e ".[test]"
 python -m pytest -q --tb=short
 ```
 
-Tests use local NetCDF fixtures, real SQLite/COG files, the included global sample, and a local HTTP server. Converter tests additionally use Zarr fixtures. They exercise exact pixel/NoData preservation, georeferencing, time semantics, byte-range resume, concurrency, month boundaries, selected refresh, publication recovery, source cleanup, relocation, conversion restart, and resource limits without contacting external services.
+Tests use local NetCDF fixtures, real SQLite/COG files, the included global sample, and a local HTTP server. They exercise exact pixel/NoData preservation, georeferencing, time semantics, byte-range resume, concurrency, month boundaries, selected refresh, publication recovery, source cleanup, relocation, and resource limits without contacting external services.

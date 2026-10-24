@@ -220,8 +220,8 @@ def test_only_one_writer_holds_archive(tmp_path: Path) -> None:
         assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
 
 
-def test_zarr_catalog_rejection_leaves_existing_archive_unchanged(tmp_path: Path) -> None:
-    """Reject a Zarr archive before changing schema, source files or metadata."""
+def test_incompatible_catalog_rejection_leaves_existing_archive_unchanged(tmp_path: Path) -> None:
+    """Reject an incompatible catalog before changing schema, source files or metadata."""
     database = tmp_path / "catalog.sqlite"
     source = tmp_path / "pending.nc"
     source.write_bytes(b"retained NetCDF download")
@@ -234,7 +234,7 @@ def test_zarr_catalog_rejection_leaves_existing_archive_unchanged(tmp_path: Path
         with db:
             db.execute("INSERT INTO source_files VALUES (?, ?)", ("source", str(source)))
     before = database.read_bytes()
-    with pytest.raises(ValueError, match="not a COG catalog.*convert_zarr_archive.py"):
+    with pytest.raises(ValueError, match="not a COG catalog.*Use an existing COG archive or choose a new archive directory"):
         with catalog.archive_session(tmp_path):
             pytest.fail("The old archive must not be opened as a COG archive.")
     assert database.read_bytes() == before
