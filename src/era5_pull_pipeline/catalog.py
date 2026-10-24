@@ -127,28 +127,34 @@ def _install_observation(source: Path, destination: Path) -> None:
                 os.close(descriptor)
 
 
-def _recover_publications(db: sqlite3.Connection, archive: Path) -> None:
-    """Finish validated COG publications after file or catalog interruption.
+def _recover_publications(
+    db: sqlite3.Connection, archive: Path, identifiers: Sequence[str] | None = None,
+) -> None:
+    """Finish validated COG publications in one coverage transaction after interruption.
 
     Args:
         db: Catalog connection with exclusive writer ownership.
         archive: Archive containing the journaled relative paths.
+        identifiers: Completed batch to install; None recovers every ready entry.
 
     Raises:
         Exception: File installation or catalog errors propagate; the ready
             journal entry remains for the next writer to finish.
     """
-    for publication in db.execute(
-        "SELECT * FROM publications WHERE status = 'ready'"
-    ).fetchall():
+    query = "SELECT * FROM publications WHERE status = 'ready'"
+    if identifiers is not None:
+        query += " AND id IN (" + ",".join("?" for _ in identifiers) + ")"
+    publications = db.execute(query, identifiers or []).fetchall()
+    for publication in publications:
         staged = archive / publication["staged_path"]
         final = archive / publication["final_path"]
         if staged.exists():
             _install_observation(staged, final)
         elif not final.is_file():
             raise FileNotFoundError(f"The journaled observation is missing: {final}")
-        field = json.loads(publication["field_json"])
-        with db:
+    with db:
+        for publication in publications:
+            field = json.loads(publication["field_json"])
             db.execute(
                 """INSERT INTO variables VALUES (?, ?)
                    ON CONFLICT (name) DO UPDATE SET attributes_json = excluded.attributes_json""",
@@ -238,30 +244,61 @@ def prepare_observation(
     Raises:
         Exception: Filesystem or catalog errors propagate.
     """
-    previous = db.execute(
-        "SELECT * FROM publications WHERE variable = ? AND valid_time = ?",
-        (field["variable"], field["valid_time"]),
-    ).fetchone()
-    if previous is not None:
-        # archive_session finishes every ready entry before accepting new work.
-        (archive / previous["staged_path"]).unlink(missing_ok=True)
-        with db:
-            db.execute("DELETE FROM publications WHERE id = ?", (previous["id"],))
-    timestamp = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=field["valid_time"])
-    variable = field["variable"]
-    final = Path(f"{timestamp:%Y/%m}") / variable / f"{variable}_{timestamp:%Y%m%dT%H%M%SZ}.tif"
-    identifier = uuid4().hex
-    staged = Path("staging") / "observations" / f"{identifier}.tif"
-    (archive / staged).parent.mkdir(parents=True, exist_ok=True)
+    return prepare_observations(db, archive, [field], attributes)[0]
+
+
+def prepare_observations(
+    db: sqlite3.Connection, archive: Path, fields: Sequence[dict[str, Any]],
+    attributes: dict[str, Any],
+) -> list[tuple[str, Path]]:
+    """Journal a source's selected observation conversions in one transaction.
+
+    Each preparation has its own staged path and recovery state. Abandoned
+    preparations for these observations are replaced together before encoding.
+
+    Args:
+        db: Connection owned by the archive writer.
+        archive: Archive receiving the staged COGs.
+        fields: Selected observations for one variable, in output order.
+        attributes: Variable metadata shared by these observations.
+
+    Returns:
+        Publication identities and staging paths in the same order as fields.
+
+    Raises:
+        Exception: Staging cleanup or catalog preparation fails.
+    """
+    if not fields:
+        return []
+    previous = {row["valid_time"]: row for row in db.execute(
+        "SELECT * FROM publications WHERE variable=? AND valid_time BETWEEN ? AND ?",
+        (fields[0]["variable"], min(f["valid_time"] for f in fields), max(f["valid_time"] for f in fields)),
+    ).fetchall()}
+    (archive / "staging" / "observations").mkdir(parents=True, exist_ok=True)
+    replaced = []
+    rows = []
+    prepared = []
+    for field in fields:
+        if field["valid_time"] in previous:
+            old = previous[field["valid_time"]]
+            (archive / old["staged_path"]).unlink(missing_ok=True)
+            replaced.append((old["id"],))
+        timestamp = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=field["valid_time"])
+        variable = field["variable"]
+        final = Path(f"{timestamp:%Y/%m}") / variable / f"{variable}_{timestamp:%Y%m%dT%H%M%SZ}.tif"
+        identifier = uuid4().hex
+        staged = Path("staging") / "observations" / f"{identifier}.tif"
+        rows.append((identifier, variable, field["valid_time"], staged.as_posix(), final.as_posix(),
+                     json.dumps(field), json.dumps(attributes)))
+        prepared.append((identifier, archive / staged))
     with db:
-        db.execute(
+        db.executemany("DELETE FROM publications WHERE id=?", replaced)
+        db.executemany(
             """INSERT INTO publications
                (id, variable, valid_time, status, staged_path, final_path, field_json, attributes_json)
-               VALUES (?, ?, ?, 'preparing', ?, ?, ?, ?)""",
-            (identifier, variable, field["valid_time"], staged.as_posix(), final.as_posix(),
-             json.dumps(field), json.dumps(attributes)),
+               VALUES (?, ?, ?, 'preparing', ?, ?, ?, ?)""", rows,
         )
-    return identifier, archive / staged
+    return prepared
 
 
 def publish_observation(
@@ -285,18 +322,49 @@ def publish_observation(
     Raises:
         Exception: File flushing, installation or catalog errors propagate.
     """
-    publication = db.execute(
-        "SELECT * FROM publications WHERE id = ?", (publication_id,)
-    ).fetchone()
-    with (archive / publication["staged_path"]).open("r+b") as stream:
-        os.fsync(stream.fileno())
+    return publish_observations(db, archive, [(publication_id, raster_report)])[0]
+
+
+def publish_observations(
+    db: sqlite3.Connection, archive: Path,
+    observations: Sequence[tuple[str, dict[str, Any]]],
+) -> list[Path]:
+    """Durably publish a completed COG batch with two catalog transactions.
+
+    Flush every validated file before committing its ready journal entry.
+    Install the files, then record their coverage together. An interruption
+    between these steps leaves ready entries recoverable even when some files
+    are already installed. Acknowledgement follows the final coverage commit.
+
+    Args:
+        db: Connection owned by the archive writer.
+        archive: Archive holding journaled staged and final paths.
+        observations: Publication identities and validated raster reports.
+
+    Returns:
+        Published paths in the same order as observations.
+
+    Raises:
+        Exception: Flush, installation, or catalog errors propagate with the
+            source inputs and journal available for recovery.
+    """
+    if not observations:
+        return []
+    identifiers = [identifier for identifier, _ in observations]
+    placeholders = ','.join('?' for _ in identifiers)
+    publications = {row["id"]: row for row in db.execute(
+        f"SELECT * FROM publications WHERE id IN ({placeholders})", identifiers,
+    ).fetchall()}
+    for identifier in identifiers:
+        with (archive / publications[identifier]["staged_path"]).open("r+b") as stream:
+            os.fsync(stream.fileno())
     with db:
-        db.execute(
-            "UPDATE publications SET status = 'ready', raster_json = ? WHERE id = ?",
-            (json.dumps(raster_report), publication_id),
+        db.executemany(
+            "UPDATE publications SET status='ready', raster_json=? WHERE id=?",
+            [(json.dumps(report), identifier) for identifier, report in observations],
         )
-    _recover_publications(db, archive)
-    return archive / publication["final_path"]
+    _recover_publications(db, archive, identifiers)
+    return [archive / publications[identifier]["final_path"] for identifier in identifiers]
 
 
 def get_published_hours(

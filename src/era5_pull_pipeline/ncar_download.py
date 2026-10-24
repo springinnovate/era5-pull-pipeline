@@ -1,7 +1,7 @@
 """Download NCAR source files with catalog-owned selection and completion state."""
 
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError, FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import UTC, date, datetime
 import os
@@ -126,19 +126,21 @@ class NcarDownloadPool:
     """Keep bounded transfers running while the coordinator processes completions."""
 
     def __init__(
-        self, db: sqlite3.Connection, sources: Sequence[SourceFile],
+        self, record_downloads: Callable[[list[str]], Future[None] | None], sources: Sequence[SourceFile],
         rows: Sequence[sqlite3.Row], download_workers: int, archive: Path,
     ) -> None:
         """Prepare transfers for registered sources and reuse completed downloads.
 
         Args:
-            db: Catalog connection owned exclusively by the calling thread.
+            record_downloads: Queue completion recording; return None when full.
             sources: Provider objects in the same order as their catalog rows.
             rows: Registered paths and completion state.
             download_workers: Maximum simultaneous transfers.
             archive: Root of the cataloged paths.
         """
-        self.db = db
+        self.record_downloads = record_downloads
+        self.unrecorded: list[str] = []
+        self.recording: dict[Future[None], list[str]] = {}
         self.archive = archive
         self.workers = download_workers
         self.ready: list[str] = []
@@ -202,33 +204,47 @@ class NcarDownloadPool:
             raise
         return self
 
+    @property
+    def pending(self) -> list[Future[None]]:
+        """Return transfers and catalog acknowledgements that can wake scheduling."""
+        return [*self.active, *self.recording]
+
+    @property
+    def has_pending(self) -> bool:
+        """Report transfers or completions still waiting for catalog capacity."""
+        return bool(self.active or self.recording or self.unrecorded)
+
     def record_completed(self) -> list[str]:
-        """Record finished downloads and refill free transfer slots.
+        """Refill transfers immediately and expose sources after catalog acknowledgement.
 
         Returns:
-            Source IDs whose complete bytes are now recorded in SQLite.
+            Source IDs whose complete bytes are durably recorded in SQLite.
 
         Raises:
             Exception: Transfer or catalog failures propagate to the coordinator.
         """
-        completed = []
         positions = []
         for future, (row, position) in list(self.active.items()):
             if not future.done():
                 continue
             future.result()
-            retrieved_at = datetime.now(UTC).isoformat()
-            with self.db:
-                self.db.execute(
-                    "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
-                    (retrieved_at, retrieved_at, row["id"]),
-                )
+            self.unrecorded.append(row["id"])
             del self.active[future]
-            self.queued.remove(row["id"])
-            completed.append(row["id"])
             positions.append(position)
         for position in positions:
             self._submit_next(position)
+        if self.unrecorded:
+            future = self.record_downloads(self.unrecorded)
+            if future is not None:
+                self.recording[future] = self.unrecorded
+                self.unrecorded = []
+        completed = []
+        for future, identifiers in list(self.recording.items()):
+            if future.done():
+                future.result()
+                completed.extend(identifiers)
+                self.queued.difference_update(identifiers)
+                del self.recording[future]
         return completed
 
     def __exit__(
@@ -247,23 +263,39 @@ class NcarDownloadPool:
         """
         self.stop_event.set()
         self.executor.shutdown(wait=True, cancel_futures=True)
-        retrieved_at = datetime.now(UTC).isoformat()
-        completed = [
-            (retrieved_at, retrieved_at, row["id"])
-            for future, (row, _) in self.active.items()
+        completed = self.unrecorded + [
+            row["id"] for future, (row, _) in self.active.items()
             if not future.cancelled() and future.exception() is None
         ]
-        if completed:
-            try:
-                with self.db:
-                    self.db.executemany(
-                        "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
-                        completed,
-                    )
-            except sqlite3.Error as catalog_error:
-                if exc is None:
-                    raise
-                exc.add_note(f"Could not record completed downloads: {catalog_error}")
+        try:
+            for future, identifiers in self.recording.items():
+                if future.cancelled():
+                    completed.extend(identifiers)
+                else:
+                    future.result()
+            if completed:
+                while (future := self.record_downloads(completed)) is None:
+                    time.sleep(0.01)
+                future.result()
+        except Exception as catalog_error:
+            if exc is None:
+                raise
+            exc.add_note(f"Could not record completed downloads: {catalog_error}")
+
+
+def record_download_completions(db: sqlite3.Connection, identifiers: list[str]) -> None:
+    """Record successful source transfers in one durable transaction.
+
+    Args:
+        db: Connection owned by the archive writer.
+        identifiers: Sources whose full bytes have been received and flushed.
+    """
+    retrieved_at = datetime.now(UTC).isoformat()
+    with db:
+        db.executemany(
+            "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
+            [(retrieved_at, retrieved_at, identifier) for identifier in identifiers],
+        )
 
 
 def download_registered_sources(
@@ -283,9 +315,23 @@ def download_registered_sources(
         Exception: Transfer and catalog errors propagate after workers stop.
         KeyboardInterrupt: An interrupted run stops its active transfers.
     """
-    with NcarDownloadPool(db, sources, rows, download_workers, archive) as downloads:
-        while downloads.active:
-            wait(downloads.active, return_when=FIRST_COMPLETED)
+    def record(identifiers: list[str]) -> Future[None]:
+        """Record transfers on the standalone command's owning thread.
+
+        Args:
+            identifiers: Successfully flushed sources.
+
+        Returns:
+            An already acknowledged completion future.
+        """
+        record_download_completions(db, identifiers)
+        future: Future[None] = Future()
+        future.set_result(None)
+        return future
+
+    with NcarDownloadPool(record, sources, rows, download_workers, archive) as downloads:
+        while downloads.has_pending:
+            wait(downloads.pending, return_when=FIRST_COMPLETED)
             downloads.record_completed()
 
 
