@@ -50,7 +50,7 @@ def test_register_source_before_download(tmp_path: Path, source: SourceFile) -> 
 
     with catalog.archive_session(archive) as db:
         saved = db.execute("SELECT * FROM source_files").fetchone()
-        assert dict(saved) == dict(row)
+        assert {**dict(saved), "local_path": None} == dict(row)
         selection = db.execute("SELECT * FROM source_selections").fetchone()
         assert dict(selection) == {
             "source_id": row["id"],

@@ -24,7 +24,7 @@ def test_pull_selection_and_limits(monkeypatch: pytest.MonkeyPatch, refresh: boo
     assert cli.main(args) == 0
     pull.assert_called_once_with(
         date(1999, 12, 31), date(2000, 1, 2), ["2t", "ssrd", "mtpr"], Path("archive"),
-        download_workers=1, processing_workers=3, max_source_gb=8, max_decoded_gb=2, refresh=refresh,
+        download_workers=1, processing_workers=3, staging_dir=None, upload_workers=2, max_source_gb=8, max_decoded_gb=2, refresh=refresh,
     )
 
 
@@ -80,3 +80,13 @@ def test_failures_keep_original_details(monkeypatch: pytest.MonkeyPatch) -> None
     with pytest.raises(RuntimeError) as caught:
         cli.main(["pull", "--start-date", "2000-01-01", "--variables", "2t"])
     assert caught.value is failure
+
+
+def test_local_staging_and_upload_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pass the local storage and bounded upload settings to pull."""
+    pull = Mock()
+    monkeypatch.setattr(cli, "pull_range", pull)
+    assert cli.main(["pull", "--start-date", "2000-01-01", "--variables", "2t",
+                     "--staging-dir", "local-cache", "--upload-workers", "3"]) == 0
+    assert pull.call_args.kwargs["staging_dir"] == Path("local-cache")
+    assert pull.call_args.kwargs["upload_workers"] == 3

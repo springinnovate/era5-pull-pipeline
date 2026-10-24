@@ -2,7 +2,7 @@
 
 from calendar import monthrange
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 import json
 import os
@@ -17,6 +17,16 @@ import portalocker
 from era5_pull_pipeline.ncar import SourceFile
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS staging_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    directory TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS local_files (
+    kind TEXT NOT NULL CHECK (kind IN ('source', 'cog')),
+    id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    PRIMARY KEY (kind, id)
+);
 CREATE TABLE IF NOT EXISTS source_files (
     id TEXT PRIMARY KEY,
     object_key TEXT NOT NULL,
@@ -152,6 +162,14 @@ def _recover_publications(
             _install_observation(staged, final)
         elif not final.is_file():
             raise FileNotFoundError(f"The journaled observation is missing: {final}")
+    local_root = get_staging_dir(db)
+    # Archive bytes and their ready journal are already durable. Remove the
+    # local copy before coverage commits, so cleanup remains recoverable.
+    for publication in publications:
+        local = db.execute("SELECT path FROM local_files WHERE kind='cog' AND id=?",
+                           (publication["id"],)).fetchone()
+        if local is not None:
+            (local_root / local["path"]).unlink(missing_ok=True)
     with db:
         for publication in publications:
             field = json.loads(publication["field_json"])
@@ -181,10 +199,44 @@ def _recover_publications(
                 ),
             )
             db.execute("DELETE FROM publications WHERE id = ?", (publication["id"],))
+            db.execute("DELETE FROM local_files WHERE kind='cog' AND id=?", (publication["id"],))
+
+
+def get_staging_dir(db: sqlite3.Connection) -> Path | None:
+    """Read the archive's configured local staging directory.
+
+    Args:
+        db: Connection owned by the archive writer.
+
+    Returns:
+        The remembered absolute directory, or None for archive-side staging.
+    """
+    row = db.execute("SELECT directory FROM staging_config WHERE id=1").fetchone()
+    return None if row is None else Path(row["directory"])
+
+
+def _discard_unpublished_local_cogs(db: sqlite3.Connection, archive: Path, local_root: Path) -> None:
+    """Remove uncommitted local outputs and partial uploads before rebuilding them.
+
+    Args:
+        db: Catalog after recovery of every ready publication.
+        archive: Root of journaled upload destinations.
+        local_root: Root of cataloged local COG paths.
+
+    Raises:
+        OSError: Cleanup fails; recorded inputs and unfinished work remain.
+    """
+    rows = db.execute("SELECT id,path FROM local_files WHERE kind='cog'").fetchall()
+    for row in rows:
+        (local_root / row["path"]).unlink(missing_ok=True)
+        (archive / row["path"]).unlink(missing_ok=True)
+    with db:
+        db.executemany("DELETE FROM publications WHERE id=?", [(row["id"],) for row in rows])
+        db.executemany("DELETE FROM local_files WHERE kind='cog' AND id=?", [(row["id"],) for row in rows])
 
 
 @contextmanager
-def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
+def archive_session(archive: Path, *, staging_dir: Path | None = None) -> Iterator[sqlite3.Connection]:
     """Open the catalog with one writer and finish interrupted publications.
 
     Consumers refresh their catalog after updates and hold source files unchanged
@@ -192,18 +244,20 @@ def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
 
     Args:
         archive: Archive directory to create or extend.
+        staging_dir: Optional local directory to remember for new temporary files.
 
     Yields:
         A catalog connection protected from other pipeline writers.
 
     Raises:
-        portalocker.exceptions.LockException: Another writer holds the archive.
-        ValueError: The archive contains an incompatible catalog.
+        portalocker.exceptions.LockException: Another writer holds the archive or local directory.
+        ValueError: The catalog is incompatible, the local root overlaps the archive,
+            or a different local root still has unfinished files.
         Exception: Catalog or publication recovery errors propagate.
     """
     archive.mkdir(parents=True, exist_ok=True)
     with portalocker.Lock(archive / ".writer.lock", "a", timeout=0):
-        with closing(sqlite3.connect(archive / "catalog.sqlite")) as db:
+        with closing(sqlite3.connect(archive / "catalog.sqlite")) as db, ExitStack() as resources:
             db.row_factory = sqlite3.Row
             coverage_columns = {row["name"] for row in db.execute("PRAGMA table_info(coverage)")}
             if coverage_columns and "path" not in coverage_columns:
@@ -214,7 +268,25 @@ def archive_session(archive: Path) -> Iterator[sqlite3.Connection]:
             db.execute("PRAGMA foreign_keys = ON")
             db.execute("PRAGMA synchronous = FULL")
             db.executescript(SCHEMA)
+            local_root = get_staging_dir(db)
+            if staging_dir is not None:
+                requested = staging_dir.expanduser().resolve()
+                if requested.is_relative_to(archive.resolve()):
+                    raise ValueError("Choose --staging-dir outside the archive directory.")
+                if local_root is not None and requested != local_root and db.execute(
+                    "SELECT 1 FROM local_files LIMIT 1"
+                ).fetchone() is not None:
+                    raise ValueError(f"Local files remain in {local_root}. Resume with that staging directory before changing it.")
+                local_root = requested
+            if local_root is not None:
+                local_root.mkdir(parents=True, exist_ok=True)
+                resources.enter_context(portalocker.Lock(local_root / ".writer.lock", "a", timeout=0))
+                with db:
+                    db.execute("INSERT INTO staging_config VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET directory=excluded.directory",
+                               (str(local_root),))
             _recover_publications(db, archive)
+            if local_root is not None:
+                _discard_unpublished_local_cogs(db, archive, local_root)
             delete_ingested_netcdf_files(db, archive)
             descriptor = archive / "dataset.yaml"
             if not descriptor.exists():
@@ -263,7 +335,9 @@ def prepare_observations(
         attributes: Variable metadata shared by these observations.
 
     Returns:
-        Publication identities and staging paths in the same order as fields.
+        Publication identities and conversion paths in the same order as fields.
+        Local paths must be uploaded before publication; their relative paths
+        match the archive-side journal destinations.
 
     Raises:
         Exception: Staging cleanup or catalog preparation fails.
@@ -274,7 +348,9 @@ def prepare_observations(
         "SELECT * FROM publications WHERE variable=? AND valid_time BETWEEN ? AND ?",
         (fields[0]["variable"], min(f["valid_time"] for f in fields), max(f["valid_time"] for f in fields)),
     ).fetchall()}
-    (archive / "staging" / "observations").mkdir(parents=True, exist_ok=True)
+    local_root = get_staging_dir(db)
+    output_root = local_root or archive
+    (output_root / "staging" / "observations").mkdir(parents=True, exist_ok=True)
     replaced = []
     rows = []
     prepared = []
@@ -282,6 +358,8 @@ def prepare_observations(
         if field["valid_time"] in previous:
             old = previous[field["valid_time"]]
             (archive / old["staged_path"]).unlink(missing_ok=True)
+            if local_root is not None:
+                (local_root / old["staged_path"]).unlink(missing_ok=True)
             replaced.append((old["id"],))
         timestamp = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=field["valid_time"])
         variable = field["variable"]
@@ -290,14 +368,18 @@ def prepare_observations(
         staged = Path("staging") / "observations" / f"{identifier}.tif"
         rows.append((identifier, variable, field["valid_time"], staged.as_posix(), final.as_posix(),
                      json.dumps(field), json.dumps(attributes)))
-        prepared.append((identifier, archive / staged))
+        prepared.append((identifier, output_root / staged))
     with db:
         db.executemany("DELETE FROM publications WHERE id=?", replaced)
+        db.executemany("DELETE FROM local_files WHERE kind='cog' AND id=?", replaced)
         db.executemany(
             """INSERT INTO publications
                (id, variable, valid_time, status, staged_path, final_path, field_json, attributes_json)
                VALUES (?, ?, ?, 'preparing', ?, ?, ?, ?)""", rows,
         )
+        if local_root is not None:
+            db.executemany("INSERT INTO local_files VALUES ('cog', ?, ?)",
+                           [(row[0], row[3]) for row in rows])
     return prepared
 
 
@@ -327,7 +409,7 @@ def publish_observation(
 
 def publish_observations(
     db: sqlite3.Connection, archive: Path,
-    observations: Sequence[tuple[str, dict[str, Any]]],
+    observations: Sequence[tuple[str, dict[str, Any]]], *, files_flushed: bool = False,
 ) -> list[Path]:
     """Durably publish a completed COG batch with two catalog transactions.
 
@@ -340,6 +422,7 @@ def publish_observations(
         db: Connection owned by the archive writer.
         archive: Archive holding journaled staged and final paths.
         observations: Publication identities and validated raster reports.
+        files_flushed: Upload workers already flushed these archive-side files.
 
     Returns:
         Published paths in the same order as observations.
@@ -355,9 +438,10 @@ def publish_observations(
     publications = {row["id"]: row for row in db.execute(
         f"SELECT * FROM publications WHERE id IN ({placeholders})", identifiers,
     ).fetchall()}
-    for identifier in identifiers:
-        with (archive / publications[identifier]["staged_path"]).open("r+b") as stream:
-            os.fsync(stream.fileno())
+    if not files_flushed:
+        for identifier in identifiers:
+            with (archive / publications[identifier]["staged_path"]).open("r+b") as stream:
+                os.fsync(stream.fileno())
     with db:
         db.executemany(
             "UPDATE publications SET status='ready', raster_json=? WHERE id=?",
@@ -452,14 +536,17 @@ def delete_ingested_netcdf_files(db: sqlite3.Connection, archive: Path) -> None:
     Raises:
         sqlite3.Error: Reading source state or recording removal fails.
     """
+    local_root = get_staging_dir(db)
     for source in db.execute(
-        """SELECT id, path FROM source_files f
+        """SELECT f.id, f.path, l.path AS local_path FROM source_files f
+           LEFT JOIN local_files l ON l.kind='source' AND l.id=f.id
            WHERE removed_at IS NULL AND NOT EXISTS (
                SELECT 1 FROM source_selections s WHERE s.source_id = f.id
            )"""
     ).fetchall():
         try:
-            (archive / source["path"]).unlink(missing_ok=True)
+            target = local_root / source["local_path"] if source["local_path"] is not None else archive / source["path"]
+            target.unlink(missing_ok=True)
         except OSError as exc:
             warnings.warn(
                 f"Published data are available; source cleanup remains pending: {exc}",
@@ -472,6 +559,7 @@ def delete_ingested_netcdf_files(db: sqlite3.Connection, archive: Path) -> None:
                     "UPDATE source_files SET downloaded_at = NULL, removed_at = ? WHERE id = ?",
                     (datetime.now(UTC).isoformat(), source["id"]),
                 )
+                db.execute("DELETE FROM local_files WHERE kind='source' AND id=?", (source["id"],))
 
 
 def group_hour_intervals(hours: Iterable[int]) -> list[tuple[int, int]]:
@@ -518,7 +606,8 @@ def register_sources(
             None selects every available hour.
 
     Returns:
-        Source catalog rows in discovery order, including download completion.
+        Source catalog rows in discovery order, including download completion
+        and the nullable local_path relative to the configured local root.
 
     Raises:
         sqlite3.Error: Reading or recording source files fails.
@@ -526,6 +615,7 @@ def register_sources(
     selected_start = datetime.combine(start, time.min, tzinfo=UTC)
     selected_end = datetime.combine(end, time(23), tzinfo=UTC)
     rows = []
+    local_root = get_staging_dir(db)
     with db:
         for source in sources:
             row = db.execute(
@@ -548,11 +638,16 @@ def register_sources(
                         path.relative_to(archive).as_posix(), datetime.now(UTC).isoformat(),
                     ),
                 )
+                if local_root is not None:
+                    db.execute("INSERT INTO local_files VALUES ('source', ?, ?)",
+                               (identifier, path.relative_to(archive).as_posix()))
                 row = db.execute(
                     "SELECT * FROM source_files WHERE id = ?", (identifier,)
                 ).fetchone()
             elif row["removed_at"] is not None:
                 db.execute("UPDATE source_files SET removed_at = NULL WHERE id = ?", (row["id"],))
+                if local_root is not None:
+                    db.execute("INSERT INTO local_files VALUES ('source', ?, ?)", (row["id"], row["path"]))
                 row = db.execute("SELECT * FROM source_files WHERE id = ?", (row["id"],)).fetchone()
             first = int(max(selected_start, source.valid_start).timestamp())
             last = int(min(selected_end, source.valid_end).timestamp())
@@ -569,5 +664,8 @@ def register_sources(
                     for first, last in intervals
                 ],
             )
-            rows.append(row)
+            rows.append(db.execute(
+                "SELECT f.*, l.path AS local_path FROM source_files f LEFT JOIN local_files l "
+                "ON l.kind='source' AND l.id=f.id WHERE f.id=?", (row["id"],),
+            ).fetchone())
     return rows
