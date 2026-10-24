@@ -110,3 +110,33 @@ def write_observation_cog(
         "block_shape": [512, 512], "compression": "DEFLATE",
         "overview_resampling": "nearest", "overviews": overviews,
     }
+
+
+def write_decoded_observation_cog(
+    decoded_path: Path, index: int, field: dict[str, Any],
+    attributes: dict[str, Any], grid: dict[str, Any], path: Path,
+) -> dict[str, Any]:
+    """Read one decoded hour from scratch storage and write its validated COG.
+
+    Each process reads only its hourly raster; month-sized arrays never travel
+    through the process pool's serialization queue.
+
+    Args:
+        decoded_path: Completed values.bin containing one source's selected hours.
+        index: Hour's row in the decoded array and ordered metadata report.
+        field: Observation timestamps and source identity.
+        attributes: Variable name, units, and decoded data type.
+        grid: Source grid coordinates and dimensions.
+        path: Journaled staging path owned by this observation.
+
+    Returns:
+        Validated raster metadata for the coordinator's publication transaction.
+
+    Raises:
+        Exception: Scratch reads, COG writes, and validation failures propagate.
+    """
+    dtype = np.dtype(attributes["source_dtype"])
+    count = int(np.prod(grid["shape"]))
+    with decoded_path.open("rb") as stream:
+        values = np.fromfile(stream, dtype=dtype, count=count, offset=index * count * dtype.itemsize)
+    return write_observation_cog(values.reshape(grid["shape"]), field, attributes, grid, path)

@@ -1,11 +1,13 @@
 """Exercise bulk NCAR scheduling through real NetCDF, COG, and SQLite files."""
 
 from collections.abc import Sequence
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 import shutil
 import sqlite3
+from threading import Barrier, Event, Lock, get_ident
 from typing import Any
 
 import numpy as np
@@ -15,7 +17,7 @@ import xarray as xr
 
 from archive_assertions import read_raster_values
 
-from era5_pull_pipeline import catalog, conversion, ncar_ingest, pipeline
+from era5_pull_pipeline import catalog, conversion, ncar_download, pipeline
 from era5_pull_pipeline.ncar import SourceFile
 
 
@@ -124,6 +126,19 @@ class NcarFiles:
             if source.variable in variables and source.valid_start <= last and source.valid_end >= first
         ], key=lambda source: (source.valid_start, source.variable))
 
+    def transfer(self, source: SourceFile, target: Path, **kwargs: Any) -> None:
+        """Copy one fixture input at the transfer boundary.
+
+        Args:
+            source: Provider object selected for transfer.
+            target: Registered destination path.
+            **kwargs: Transfer cancellation and progress parameters.
+        """
+        identity = source.key, source.etag
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.payloads[identity], target)
+        self.downloaded.append(identity)
+
     def download(
         self, db: sqlite3.Connection, sources: Sequence[SourceFile],
         rows: Sequence[sqlite3.Row], download_workers: int = 2, *, archive: Path,
@@ -167,7 +182,13 @@ def files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> NcarFiles:
     monkeypatch.setattr(conversion, "GLOBAL_LONGITUDES", np.array([0.0, 0.25, 0.5, 0.75]))
     fixture = NcarFiles(tmp_path / "provider")
     monkeypatch.setattr(pipeline, "discover_files", fixture.discover)
-    monkeypatch.setattr(pipeline, "download_registered_sources", fixture.download)
+    monkeypatch.setattr(ncar_download, "download_file", fixture.transfer)
+
+    def controlled_pool(*, max_workers: int, **kwargs: Any) -> ThreadPoolExecutor:
+        """Retain small-grid fixtures and fault hooks across worker calls."""
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    monkeypatch.setattr(pipeline, "ProcessPoolExecutor", controlled_pool)
     return fixture
 
 
@@ -178,22 +199,22 @@ def test_year_boundary_reuses_forecast_file_and_completed_repeat_is_offline(
     archive = tmp_path / "archive"
     shared = files.add_file("mtpr", "1999-12-30T18", "1999-12-31T18", value=0.1)
     following = files.add_file("mtpr", "2000-01-01T06", "2000-01-01T18", value=0.2)
-    ingest = pipeline.ingest_ncar_month
+    ingest = pipeline.download_and_ingest_month
     source_after_december: list[Path] = []
 
     def inspect_published_month(
         db: sqlite3.Connection, destination: Path, year: int, month: int,
-        **kwargs: Any,
+        *args: Any, **kwargs: Any,
     ) -> Path:
         """Check the shared source immediately after December publication."""
-        result = ingest(db, destination, year, month, **kwargs)
+        result = ingest(db, destination, year, month, *args, **kwargs)
         if (year, month) == (1999, 12):
             source = db.execute("SELECT path FROM source_files WHERE object_key = ?", (shared.key,)).fetchone()
             source_after_december.append((destination / source["path"]))
             assert source_after_december[0].exists()
         return result
 
-    monkeypatch.setattr(pipeline, "ingest_ncar_month", inspect_published_month)
+    monkeypatch.setattr(pipeline, "download_and_ingest_month", inspect_published_month)
     result = pipeline.pull_range(date(1999, 12, 31), date(2000, 1, 1), ["mtpr"], archive)
     assert result == {"completed": 48, "skipped": 0, "unavailable": 0, "failed": 0, "pending": 0}
     assert files.downloaded == [(shared.key, shared.etag), (following.key, following.etag)]
@@ -291,18 +312,20 @@ def test_failed_second_month_resumes_recorded_download_without_inventory(
     archive = tmp_path / "archive"
     files.add_file("2t", "1999-12-31T00", "1999-12-31T23")
     files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
-    publish = ncar_ingest.publish_observation
+    publish = pipeline.publish_observation
 
     def fail_january(
         db: sqlite3.Connection, destination: Path, revision: str, report: dict[str, Any],
     ) -> Path:
         """Fail at January's publication boundary after decoding has completed."""
-        if db.execute("SELECT valid_time FROM publications WHERE id = ?", (revision,)).fetchone()[0] == 946684800 + completed_january_hours * 3600:
+        valid_time = db.execute("SELECT valid_time FROM publications WHERE id = ?", (revision,)).fetchone()[0]
+        completed = db.execute("SELECT COUNT(*) FROM observations WHERE valid_time >= 946684800").fetchone()[0]
+        if valid_time >= 946684800 and completed == completed_january_hours:
             raise failure("January publication interrupted")
         return publish(db, destination, revision, report)
 
     with monkeypatch.context() as patch:
-        patch.setattr(ncar_ingest, "publish_observation", fail_january)
+        patch.setattr(pipeline, "publish_observation", fail_january)
         with pytest.raises(failure, match="January publication interrupted"):
             pipeline.pull_range(date(1999, 12, 31), date(2000, 1, 1), ["2t"], archive)
     output = capsys.readouterr().out
@@ -385,3 +408,217 @@ def test_shared_source_is_not_retained_for_already_published_next_month(
         assert row["downloaded_at"] is None
         assert not (archive / row["path"]).exists()
         assert db.execute("SELECT COUNT(*) FROM source_selections").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_publication_overlaps_downloads_with_bounded_workers(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch, workers: int,
+) -> None:
+    """Publish while another transfer is blocked and bound concurrent COG work."""
+    archive = tmp_path / "archive"
+    files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
+    files.add_file("10u", "2000-01-01T00", "2000-01-01T23")
+    first_publication = Event()
+    slow_download = Event()
+    worker_barrier = Barrier(workers)
+    lock = Lock()
+    active = peak = 0
+    transfer_count = 0
+    owner = get_ident()
+    writer_threads: set[int] = set()
+    write = pipeline.write_decoded_observation_cog
+    publish = pipeline.publish_observation
+    prepare = pipeline.prepare_observation
+
+    def transfer(source: SourceFile, target: Path, **kwargs: Any) -> None:
+        """Hold the second transfer until the first source has a published COG."""
+        nonlocal transfer_count
+        transfer_count += 1
+        if transfer_count == 2:
+            slow_download.set()
+            assert first_publication.wait(10), "processing waited for all downloads"
+        files.transfer(source, target, **kwargs)
+
+    def encode(*args: Any) -> dict[str, Any]:
+        """Synchronize the first jobs so concurrency and its limit are observable."""
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            writer_threads.add(get_ident())
+        try:
+            if args[1] < workers:
+                worker_barrier.wait(timeout=10)
+            return write(*args)
+        finally:
+            with lock:
+                active -= 1
+
+    def prepare_on_owner(db: sqlite3.Connection, *args: Any) -> tuple[str, Path]:
+        """Keep the journal and all queued observations within the worker bound."""
+        assert get_ident() == owner
+        result = prepare(db, *args)
+        assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] <= workers
+        return result
+
+    def publish_on_owner(db: sqlite3.Connection, *args: Any) -> Path:
+        """Require a real durable observation before releasing the pending transfer."""
+        assert get_ident() == owner
+        assert slow_download.wait(10)
+        assert len(list((archive / "staging" / "observations").glob("*.tif"))) <= workers
+        result = publish(db, *args)
+        first_publication.set()
+        return result
+
+    monkeypatch.setattr(ncar_download, "download_file", transfer)
+    monkeypatch.setattr(pipeline, "write_decoded_observation_cog", encode)
+    monkeypatch.setattr(pipeline, "prepare_observation", prepare_on_owner)
+    monkeypatch.setattr(pipeline, "publish_observation", publish_on_owner)
+    result = pipeline.pull_range(
+        date(2000, 1, 1), date(2000, 1, 1), ["2t", "10u"], archive,
+        download_workers=1, processing_workers=workers,
+        max_source_gb=sum(source.size for source in files.sources) / 10**9,
+    )
+    assert result["completed"] == 48
+    assert peak == workers and len(writer_threads) == workers
+    assert not (archive / "staging" / "decoded" / "values.bin").exists()
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_processing_failure_stops_downloads_and_waits_for_scratch_readers(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
+    failure: type[BaseException],
+) -> None:
+    """Retain sources and wait for active readers before cleaning failed work."""
+    archive = tmp_path / "archive"
+    files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
+    files.add_file("10u", "2000-01-01T00", "2000-01-01T23")
+    reader_started = Event()
+    download_stopped = Event()
+    reader_finished = Event()
+    write = pipeline.write_decoded_observation_cog
+    calls: list[SourceFile] = []
+
+    def transfer(source: SourceFile, target: Path, *, stop_event: Event, **kwargs: Any) -> None:
+        """Keep a partial source downloading until publication fails."""
+        calls.append(source)
+        if len(calls) == 1:
+            files.transfer(source, target, **kwargs)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(files.payloads[source.key, source.etag].read_bytes()[:17])
+            assert stop_event.wait(10)
+            download_stopped.set()
+            raise CancelledError()
+
+    def encode(*args: Any) -> dict[str, Any]:
+        """Keep one worker reading scratch during the coordinator's shutdown."""
+        if args[1] == 0:
+            assert reader_started.wait(10)
+            return write(*args)
+        reader_started.set()
+        assert download_stopped.wait(10)
+        assert args[0].exists(), "scratch deleted while a worker still needed it"
+        result = write(*args)
+        reader_finished.set()
+        return result
+
+    def fail_publication(*args: Any) -> Path:
+        """Interrupt installation of a validated output."""
+        raise failure("publication interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ncar_download, "download_file", transfer)
+        patch.setattr(pipeline, "write_decoded_observation_cog", encode)
+        patch.setattr(pipeline, "publish_observation", fail_publication)
+        with pytest.raises(failure, match="publication interrupted"):
+            pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t", "10u"], archive,
+                                download_workers=1, processing_workers=2)
+    assert download_stopped.is_set() and reader_finished.is_set()
+    assert not (archive / "staging" / "decoded" / "values.bin").exists()
+    with catalog.archive_session(archive) as db:
+        rows = db.execute("SELECT * FROM source_files ORDER BY downloaded_at DESC").fetchall()
+        assert rows[0]["downloaded_at"] is not None
+        assert rows[1]["downloaded_at"] is None
+        assert (archive / rows[1]["path"]).stat().st_size == 17
+        assert all((archive / row["path"]).exists() for row in rows)
+    resumed = pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t", "10u"], archive,
+                                  processing_workers=2)
+    assert resumed["completed"] == 48
+    assert len(files.downloaded) == 2  # Completed source reused, partial source retried.
+
+
+@pytest.mark.parametrize("workers", [0, -1])
+def test_processing_worker_limit_rejected_before_archive_changes(tmp_path: Path, workers: int) -> None:
+    """Reject an unusable pool size before starting any work."""
+    archive = tmp_path / "archive"
+    with pytest.raises(ValueError, match="processing workers"):
+        pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t"], archive,
+                            processing_workers=workers)
+    assert not archive.exists()
+
+
+def test_download_slots_refill_during_netcdf_decoding(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep transferring new inputs while a worker is busy decoding a source."""
+    files.add_file("10u", "2000-01-01T00", "2000-01-01T23")
+    files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
+    files.add_file("2t", "2000-01-02T00", "2000-01-02T23")
+    decoding = Event()
+    last_download = Event()
+    decode = pipeline.decode_ncar_source
+    calls = 0
+
+    def transfer(source: SourceFile, target: Path, **kwargs: Any) -> None:
+        """Require the first decode to be active before finishing later transfers."""
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            assert decoding.wait(10)
+        files.transfer(source, target, **kwargs)
+        if calls == 3:
+            last_download.set()
+
+    def decode_after_downloads(*args: Any) -> dict[str, Any]:
+        """Wait for a refilled download slot before releasing the decoder."""
+        decoding.set()
+        assert last_download.wait(10), "downloads were not refilled during decoding"
+        return decode(*args)
+
+    monkeypatch.setattr(ncar_download, "download_file", transfer)
+    monkeypatch.setattr(pipeline, "decode_ncar_source", decode_after_downloads)
+    result = pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 2), ["2t", "10u"],
+                                 tmp_path / "archive", download_workers=1, processing_workers=2)
+    assert result["completed"] == 72 and calls == 3
+
+
+def test_cog_worker_failure_keeps_committed_hours_and_source_for_resume(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume remaining observations after a worker fails to write its COG."""
+    archive = tmp_path / "archive"
+    files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
+    write = pipeline.write_decoded_observation_cog
+
+    def fail_third(*args: Any) -> dict[str, Any]:
+        """Fail an output write after two durably published observations."""
+        if args[1] == 2:
+            raise OSError("COG storage unavailable")
+        return write(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pipeline, "write_decoded_observation_cog", fail_third)
+        with pytest.raises(OSError, match="COG storage unavailable"):
+            pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t"], archive,
+                                processing_workers=1)
+    before = {path: path.stat().st_mtime_ns for path in archive.glob("2000/01/*/*.tif")}
+    assert len(before) == 2
+    with catalog.archive_session(archive) as db:
+        source = db.execute("SELECT * FROM source_files").fetchone()
+        assert source["downloaded_at"] is not None and (archive / source["path"]).exists()
+    result = pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t"], archive,
+                                 processing_workers=2)
+    assert result["completed"] == 22 and result["skipped"] == 2
+    assert len(files.downloaded) == 1
+    assert before == {path: path.stat().st_mtime_ns for path in before}

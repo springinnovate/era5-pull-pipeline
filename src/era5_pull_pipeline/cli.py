@@ -59,6 +59,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             help="Maximum simultaneous file transfers (default: 2).",
         )
     pull.add_argument(
+        "--processing-workers", type=int, default=4,
+        help="Maximum worker processes and in-flight COG observations (default: 4).",
+    )
+    pull.add_argument(
         "--max-source-gb", type=float, default=16,
         help="Maximum reserved NetCDF source bytes in decimal GB (default: 16); conversion needs additional space.",
     )
@@ -83,6 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pull_range(
                 args.start_date, args.end_date, args.variables, args.archive,
                 download_workers=args.download_workers,
+                processing_workers=args.processing_workers,
                 max_source_gb=args.max_source_gb, refresh=args.refresh,
             )
         elif args.command == "download-ncar":
