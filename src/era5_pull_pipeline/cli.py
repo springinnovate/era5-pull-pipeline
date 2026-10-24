@@ -60,11 +60,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     pull.add_argument(
         "--processing-workers", type=int, default=4,
-        help="Maximum worker processes and in-flight COG observations (default: 4).",
+        help="Maximum simultaneous native-chunk decoding/encoding jobs (default: 4).",
     )
     pull.add_argument(
         "--max-source-gb", type=float, default=16,
         help="Maximum reserved NetCDF source bytes in decimal GB (default: 16); conversion needs additional space.",
+    )
+    pull.add_argument(
+        "--max-decoded-gb", type=float, default=2,
+        help="Maximum reserved decoded chunk arrays in decimal GB (default: 2); encoding buffers need additional memory.",
     )
     download.add_argument(
         "--dry-run", action="store_true",
@@ -88,7 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.start_date, args.end_date, args.variables, args.archive,
                 download_workers=args.download_workers,
                 processing_workers=args.processing_workers,
-                max_source_gb=args.max_source_gb, refresh=args.refresh,
+                max_source_gb=args.max_source_gb, max_decoded_gb=args.max_decoded_gb, refresh=args.refresh,
             )
         elif args.command == "download-ncar":
             download_ncar(

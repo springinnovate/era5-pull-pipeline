@@ -34,13 +34,14 @@ To add wind for those dates, run the same command with `--variables 10u 10v`. Ex
 | `--variables` | One or more NCAR short variable names; required. |
 | `--archive` | Directory containing dataset.yaml, the catalog, staging, and GeoTIFFs; defaults to `archive`. |
 | `--download-workers` | Maximum simultaneous file transfers; defaults to 2. |
-| `--processing-workers` | Maximum worker processes and in-flight COG observations; defaults to 4. |
+| `--processing-workers` | Maximum simultaneous native-chunk decoding/encoding jobs; defaults to 4. |
+| `--max-decoded-gb` | Maximum reserved decoded chunk arrays in decimal GB; defaults to 2. Encoding buffers and process overhead need additional memory. |
 | `--max-source-gb` | Maximum reserved NetCDF source bytes in decimal GB; defaults to 16. Conversion requires additional space. |
 | `--refresh` | Retrieve current sources and replace selected stored fields. |
 
 NCAR packages analysis fields as one variable per month, and radiation and precipitation in roughly half-month files. Selecting a single day still downloads whole source files; only selected hours become GeoTIFFs. A forecast file can supply hours on both sides of a month boundary and is downloaded once, then retained until both selected months are published.
 
-Transfers show bytes, speed, elapsed time, and estimated remaining transfer time. Month messages identify availability lookup, overlapping download/processing, source decoding, and publication. There is no overall backfill completion estimate.
+Transfers show bytes, speed, elapsed time, and estimated remaining transfer time. Month messages identify availability lookup, overlapping download/processing, independent native decoding chunks, and publication. There is no overall backfill completion estimate.
 
 ## Backfill from 1950
 
@@ -52,9 +53,13 @@ python -m era5_pull_pipeline pull --start-date 1950-01-01 --variables 2t 2d 10u 
 
 NCAR updates monthly and typically trails real time by about 3–4 months. Availability is checked separately for each variable. Unavailable hours remain absent from coverage and are checked again on subsequent runs, so the same command extends the archive as NCAR adds data. An explicit `--end-date` limits the requested interval.
 
-The workflow schedules one month at a time. At most `--download-workers` transfers are active. Completed or reused sources begin processing while other files download. A process pool decodes one source at a time, then encodes and validates up to `--processing-workers` hourly COGs concurrently. The coordinator alone publishes files and writes SQLite. The next month starts after the current month is published. The source budget reserves full file sizes before transfers start, including files retained from an interrupted run or for a later month. If a month cannot fit, the command stops before downloading it and reports the required size. Increase `--max-source-gb` or request fewer variables at a time.
+The workflow processes one month at a time and prefetches future source files while the current month is processing. Lookahead advances month by month until the source budget fills or an unavailable month is reached. At most `--download-workers` transfers are active across current and prefetched months. Each new file reserves its full size before transfer, including partial and retained sources. Prefetch uses only spare `--max-source-gb` capacity; files that do not fit wait until current-month sources are released. If the required current month cannot fit, the command reports the required size before starting its new transfers. Increase `--max-source-gb` or select fewer variables.
 
-This budget limits staged NetCDF sources, not total disk use or RAM. Peak working space also includes one source's decoded selected arrays and up to `--processing-workers` staged GeoTIFFs. Each encoding worker holds one hourly raster plus compression and validation buffers; increasing the worker count increases memory and disk demand. One float32 global hourly field takes about 4.15 MB before compression. Decoded arrays use disk-backed memory mappings; their pages can occupy the operating system's file cache. Conversion reads native NetCDF blocks once. Workers read individual hours from the decoded scratch file without copying a whole month into Python heap memory or through process queues. Use `--processing-workers 1` to limit encoding to one observation at a time while retaining overlap with downloads. Decoding precedes encoding for each source, so CPU utilization can fall during decoding or storage waits. Retained sources are released after their selected monthly work is published.
+Completed or reused sources are divided at their native NetCDF temporal chunk boundaries. Separate processes decode and encode those chunks concurrently, including multiple chunks from the same source. A job reads its native chunks once, keeps its decoded arrays in memory, and writes validated hourly COGs. There is no full-month decoding barrier or decoded scratch file in `pull`. Decoding, encoding, downloads, and future-month availability lookup can overlap. Only final file publication and catalog updates belong to the single coordinator.
+
+`--processing-workers` bounds outstanding chunk jobs, including their staged COG batches, and `--max-decoded-gb` bounds their combined decoded-array reservations. Common analysis chunks contain 27 hours (about 112 MB decoded at float32); forecast chunks contain 12 hours (about 50 MB). Each job additionally needs compression, validation, and library buffers and may stage one COG per selected hour in its native chunk. These limits bound work independently of the total requested date range. If one native chunk cannot fit, increase `--max-decoded-gb`; the completed source is retained for retry. A 2 GB decoded budget can accommodate sixteen of those analysis chunks, excluding the additional encoding/process memory.
+
+The source budget limits staged NetCDF bytes, not the published archive or processing memory. Use `--processing-workers 1` to run one native chunk job at a time while retaining download overlap and bounded prefetch. More workers can increase CPU use and storage contention; compare the publication rate when choosing a count. Retained source inputs are released after their selected monthly work is published, except files still supplying a later selected month.
 
 ## Variables and time semantics
 
@@ -78,7 +83,7 @@ Original source attributes, including upstream precision-processing metadata, re
 
 ## Stop, resume, and refresh
 
-Press Ctrl+C to stop. No new processing jobs are scheduled; active workers finish before scratch inputs are released. Transfers stop between received chunks and retain partial bytes. An idle network read times out after 30 seconds. Run the same ordinary `pull` command to resume. SQLite supplies recorded paths and selections, completed downloads are reused directly, and partial downloads resume from their saved byte position. Transient transfer failures allow up to three attempts with backoff. Requests are pinned to the discovered source identity so bytes from different versions cannot be combined.
+Press Ctrl+C to stop. No new processing jobs are scheduled; active workers finish before input files are released. Transfers stop between received chunks and retain partial bytes. An idle network read times out after 30 seconds. Run the same ordinary `pull` command to resume. SQLite supplies recorded paths and selections, completed downloads are reused directly, and partial downloads resume from their saved byte position. Transient transfer failures allow up to three attempts with backoff. Requests are pinned to the discovered source identity so bytes from different versions cannot be combined.
 
 Each observation commits independently. Failed conversion or publication retains its source files, and a restart skips completed observations, rebuilds incomplete files, or finishes a validated publication. NetCDF inputs are removed only after all their selected hours are published and recorded in SQLite. Completed ordinary repeats require no source access.
 
@@ -226,7 +231,7 @@ python -m era5_pull_pipeline download-ncar --start-date 2000-01-01 --end-date 20
 python -m era5_pull_pipeline ingest-ncar --archive downloads/local-ncar --year 2000 --month 1
 ```
 
-`download-ncar` retains all selected files under `staging/ncar/` and records selected hours in SQLite. It supports `--download-workers` but does not impose the bulk workflow's source budget; use `pull` for long backfills. `ingest-ncar` publishes pending selections for one month without network access. Add `--refresh` to ingestion to replace their stored values.
+`download-ncar` retains all selected files under `staging/ncar/` and records selected hours in SQLite. It supports `--download-workers` but does not impose the bulk workflow's source budget; use `pull` for long backfills. `ingest-ncar` publishes pending selections for one month without network access, using the serial offline ingestion path and disk-backed decoded scratch arrays. Add `--refresh` to ingestion to replace their stored values.
 
 ## Tests
 

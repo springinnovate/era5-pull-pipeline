@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import product
 import mmap
@@ -68,65 +69,10 @@ def read_ncar_netcdf_arrays(
             hours, or does not contain the selected full global variable.
         Exception: NetCDF and filesystem failures propagate.
     """
-    requested = np.array(sorted(selected_times), dtype=np.int64)
-    month = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=int(requested[0]))
     with xr.open_dataset(path, engine="h5netcdf", decode_timedelta=False) as dataset:
-        if not (
-            np.array_equal(dataset.latitude.values, conversion.GLOBAL_LATITUDES)
-            and np.array_equal(dataset.longitude.values, conversion.GLOBAL_LONGITUDES)
-        ):
-            raise ValueError("NCAR fields must use the full global 0.25 degree grid.")
-        candidates = [
-            name for name, array in dataset.data_vars.items()
-            if array.attrs.get("short_name") == source_variable
-            and array.dims[-2:] == ("latitude", "longitude")
-        ]
-        if len(candidates) != 1:
-            raise ValueError(f"NCAR file does not contain one global {source_variable} variable.")
-        array = dataset[candidates[0]]
+        array, indices, report = _inspect_open_source(dataset, path, source_id, source_variable, selected_times)
         temporal_dimensions = array.dims[:-2]
-        forecast = temporal_dimensions == ("forecast_initial_time", "forecast_hour")
-        if forecast:
-            references = dataset.forecast_initial_time.values.astype("datetime64[s]").astype(np.int64)
-            # NCAR encodes lead times as integer hours with units="hour", which
-            # xarray does not automatically recognize as a timedelta unit.
-            leads = dataset.forecast_hour.values.astype("timedelta64[h]").astype("timedelta64[s]").astype(np.int64)
-            valid = references[:, None] + leads[None, :]
-            references = np.broadcast_to(references[:, None], valid.shape)
-            ends = np.broadcast_to(leads[None, :], valid.shape)
-            starts = ends - 3600
-            step_type = "avg" if ".meanflux." in path.name else "accum"
-        else:
-            if temporal_dimensions != ("time",):
-                raise ValueError(f"Unsupported NCAR time dimensions: {temporal_dimensions}.")
-            valid = dataset.time.values.astype("datetime64[s]").astype(np.int64)
-            references = valid
-            starts = ends = np.zeros(valid.shape, dtype=np.int64)
-            step_type = "instant"
-        flat_indices = np.flatnonzero(np.isin(valid, requested))
-        actual = valid.reshape(-1)[flat_indices]
-        if not np.array_equal(np.sort(actual), requested):
-            raise ValueError(f"NCAR {source_variable} does not contain each selected UTC hour exactly once.")
-        order = np.argsort(actual)
-        flat_indices = flat_indices[order]
-        indices = np.column_stack(np.unravel_index(flat_indices, valid.shape))
-        name = str(array.attrs["long_name"])
-        variable = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-        attributes = {
-            "name": name,
-            "short_name": source_variable,
-            "units": array.attrs["units"],
-            "source_variable": source_variable,
-            "source_dtype": str(array.dtype),
-            "step_type": step_type,
-            "step_units": "s",
-        }
-        attributes.update(_attributes_to_json_values({
-            key: value for key, value in array.attrs.items()
-            if key in {"ecmwf_local_table", "ecmwf_parameter", "number_of_significant_digits"}
-            or key.startswith("Quantize")
-        }))
-        shape = (len(requested), len(dataset.latitude), len(dataset.longitude))
+        shape = (len(indices), len(dataset.latitude), len(dataset.longitude))
         raw = resources.enter_context((scratch / "values.bin").open("w+b"))
         raw.truncate(int(np.prod(shape)) * array.dtype.itemsize)
         mapping = resources.enter_context(mmap.mmap(raw.fileno(), 0))
@@ -155,86 +101,218 @@ def read_ncar_netcdf_arrays(
                 lon = slice(longitude, min(longitude + chunks[-1], shape[2]))
                 block = array.isel(**temporal_slices, latitude=lat, longitude=lon).values
                 decoded[rows, lat, lon] = block[local_indices]
+        return {next(iter(report["variables"])): decoded}, report
 
-        fields = [
-            {
-                "variable": variable,
-                "source_variable": source_variable,
-                "source_file_id": source_id,
-                "valid_time": int(valid.reshape(-1)[index]),
-                "reference_time": (
-                    int(references.reshape(-1)[index]) if forecast else None
-                ),
-                "interval_start": int(references.reshape(-1)[index] + starts.reshape(-1)[index]),
-                "interval_end": int(references.reshape(-1)[index] + ends.reshape(-1)[index]),
-                "start_step": int(starts.reshape(-1)[index]) if forecast else None,
-                "end_step": int(ends.reshape(-1)[index]) if forecast else None,
-                "step_units": "s",
-                "step_type": step_type,
-            }
-            for index in flat_indices
-        ]
-        return {variable: decoded}, {
-            "year": month.year,
-            "month": month.month,
-            "grid": {
-                "type": "regular_ll",
-                "shape": list(shape[1:]),
-                "latitude_first": float(dataset.latitude.values[0]),
-                "latitude_last": float(dataset.latitude.values[-1]),
-                "longitude_first": float(dataset.longitude.values[0]),
-                "longitude_last": float(dataset.longitude.values[-1]),
-                "resolution": [0.25, 0.25],
-                "scanning_mode": 0,
-            },
-            "variables": {variable: attributes},
-            "fields": fields,
-            "source_attributes": {
-                "global": _attributes_to_json_values(dataset.attrs),
-                "variable": _attributes_to_json_values(array.attrs),
-                "coordinates": {
-                    key: _attributes_to_json_values(dataset[key].attrs)
-                    for key in (*temporal_dimensions, "latitude", "longitude")
-                },
-                "encoding": {
-                    key: {
-                        "dtype": str(dataset[key].encoding["dtype"]),
-                        **_attributes_to_json_values({
-                            name: value for name, value in dataset[key].encoding.items()
-                            if name in {"units", "calendar", "_FillValue", "missing_value", "scale_factor", "add_offset"}
-                        }),
-                    }
-                    for key in (candidates[0], *temporal_dimensions, "latitude", "longitude")
-                },
-            },
+
+def _inspect_open_source(
+    dataset: xr.Dataset, path: Path, source_id: str, source_variable: str,
+    selected_times: Sequence[int],
+) -> tuple[xr.DataArray, NDArray[np.int64], dict[str, Any]]:
+    """Check selected NetCDF coordinates and build observation metadata.
+
+    Args:
+        dataset: Open provider dataset with decoded coordinates.
+        path: Source filename identifying forecast interval semantics.
+        source_id: Catalog identity of the provider object.
+        source_variable: Requested NCAR short name.
+        selected_times: Requested UTC hours within one month.
+
+    Returns:
+        Source array, ordered temporal indices, and publication metadata.
+
+    Raises:
+        ValueError: The provider grid, variable, or selected hours are invalid.
+    """
+    requested = np.array(sorted(selected_times), dtype=np.int64)
+    month = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=int(requested[0]))
+    if not (
+        np.array_equal(dataset.latitude.values, conversion.GLOBAL_LATITUDES)
+        and np.array_equal(dataset.longitude.values, conversion.GLOBAL_LONGITUDES)
+    ):
+        raise ValueError("NCAR fields must use the full global 0.25 degree grid.")
+    candidates = [
+        name for name, array in dataset.data_vars.items()
+        if array.attrs.get("short_name") == source_variable
+        and array.dims[-2:] == ("latitude", "longitude")
+    ]
+    if len(candidates) != 1:
+        raise ValueError(f"NCAR file does not contain one global {source_variable} variable.")
+    array = dataset[candidates[0]]
+    temporal_dimensions = array.dims[:-2]
+    forecast = temporal_dimensions == ("forecast_initial_time", "forecast_hour")
+    if forecast:
+        references = dataset.forecast_initial_time.values.astype("datetime64[s]").astype(np.int64)
+        # NCAR encodes lead times as integer hours with units="hour", which
+        # xarray does not automatically recognize as a timedelta unit.
+        leads = dataset.forecast_hour.values.astype("timedelta64[h]").astype("timedelta64[s]").astype(np.int64)
+        valid = references[:, None] + leads[None, :]
+        references = np.broadcast_to(references[:, None], valid.shape)
+        ends = np.broadcast_to(leads[None, :], valid.shape)
+        starts = ends - 3600
+        step_type = "avg" if ".meanflux." in path.name else "accum"
+    else:
+        if temporal_dimensions != ("time",):
+            raise ValueError(f"Unsupported NCAR time dimensions: {temporal_dimensions}.")
+        valid = dataset.time.values.astype("datetime64[s]").astype(np.int64)
+        references = valid
+        starts = ends = np.zeros(valid.shape, dtype=np.int64)
+        step_type = "instant"
+    flat_indices = np.flatnonzero(np.isin(valid, requested))
+    actual = valid.reshape(-1)[flat_indices]
+    if not np.array_equal(np.sort(actual), requested):
+        raise ValueError(f"NCAR {source_variable} does not contain each selected UTC hour exactly once.")
+    order = np.argsort(actual)
+    flat_indices = flat_indices[order]
+    indices = np.column_stack(np.unravel_index(flat_indices, valid.shape))
+    name = str(array.attrs["long_name"])
+    variable = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    attributes = {
+        "name": name,
+        "short_name": source_variable,
+        "units": array.attrs["units"],
+        "source_variable": source_variable,
+        "source_dtype": str(array.dtype),
+        "step_type": step_type,
+        "step_units": "s",
+    }
+    attributes.update(_attributes_to_json_values({
+        key: value for key, value in array.attrs.items()
+        if key in {"ecmwf_local_table", "ecmwf_parameter", "number_of_significant_digits"}
+        or key.startswith("Quantize")
+    }))
+    shape = (len(requested), len(dataset.latitude), len(dataset.longitude))
+    fields = [
+        {
+            "variable": variable,
+            "source_variable": source_variable,
+            "source_file_id": source_id,
+            "valid_time": int(valid.reshape(-1)[index]),
+            "reference_time": (
+                int(references.reshape(-1)[index]) if forecast else None
+            ),
+            "interval_start": int(references.reshape(-1)[index] + starts.reshape(-1)[index]),
+            "interval_end": int(references.reshape(-1)[index] + ends.reshape(-1)[index]),
+            "start_step": int(starts.reshape(-1)[index]) if forecast else None,
+            "end_step": int(ends.reshape(-1)[index]) if forecast else None,
+            "step_units": "s",
+            "step_type": step_type,
         }
+        for index in flat_indices
+    ]
+    return array, indices, {
+        "year": month.year,
+        "month": month.month,
+        "grid": {
+            "type": "regular_ll",
+            "shape": list(shape[1:]),
+            "latitude_first": float(dataset.latitude.values[0]),
+            "latitude_last": float(dataset.latitude.values[-1]),
+            "longitude_first": float(dataset.longitude.values[0]),
+            "longitude_last": float(dataset.longitude.values[-1]),
+            "resolution": [0.25, 0.25],
+            "scanning_mode": 0,
+        },
+        "variables": {variable: attributes},
+        "fields": fields,
+        "source_attributes": {
+            "global": _attributes_to_json_values(dataset.attrs),
+            "variable": _attributes_to_json_values(array.attrs),
+            "coordinates": {
+                key: _attributes_to_json_values(dataset[key].attrs)
+                for key in (*temporal_dimensions, "latitude", "longitude")
+            },
+            "encoding": {
+                key: {
+                    "dtype": str(dataset[key].encoding["dtype"]),
+                    **_attributes_to_json_values({
+                        name: value for name, value in dataset[key].encoding.items()
+                        if name in {"units", "calendar", "_FillValue", "missing_value", "scale_factor", "add_offset"}
+                    }),
+                }
+                for key in (candidates[0], *temporal_dimensions, "latitude", "longitude")
+            },
+        },
+    }
 
 
-def decode_ncar_source(
-    path: Path, source_id: str, source_variable: str,
-    selected_times: Sequence[int], scratch: Path,
-) -> dict[str, Any]:
-    """Decode one NCAR source into scratch storage for COG worker processes.
+@dataclass(frozen=True)
+class NcarChunk:
+    """Describe one native temporal chunk and its selected COG observations."""
 
-    Close the NetCDF and writable mapping before returning. The coordinator
-    retains values.bin until every observation worker has finished reading it.
+    variable: str
+    slices: dict[str, tuple[int, int]]
+    indices: list[tuple[int, ...]]
+    fields: list[dict[str, Any]]
+    decoded_bytes: int
+
+
+def plan_ncar_chunk_jobs(
+    path: Path, source_id: str, source_variable: str, selected_times: Sequence[int],
+) -> tuple[dict[str, Any], list[NcarChunk]]:
+    """Validate a source selection and divide it into independent decoding jobs.
+
+    Each job owns one native temporal chunk across the full spatial grid, so
+    worker processes do not repeatedly decompress overlapping native chunks.
+    No raster values are decoded during planning.
 
     Args:
         path: Complete cataloged NetCDF input.
         source_id: Catalog identity of the provider object.
         source_variable: Requested NCAR short name.
         selected_times: Selected Unix hours in one calendar month.
-        scratch: Directory containing the reusable values.bin file.
 
     Returns:
-        Source, variable, grid, and observation metadata for publication.
+        Source metadata and jobs with explicit decoded-array byte reservations.
 
     Raises:
-        Exception: NetCDF decoding and scratch-file errors propagate.
+        Exception: NetCDF metadata reads and selection validation failures propagate.
     """
-    with ExitStack() as resources:
-        arrays, report = read_ncar_netcdf_arrays(
-            path, source_id, source_variable, selected_times, scratch, resources,
-        )
-        del arrays
-    return report
+    with xr.open_dataset(path, engine="h5netcdf", decode_timedelta=False) as dataset:
+        array, indices, report = _inspect_open_source(dataset, path, source_id, source_variable, selected_times)
+        dimensions = array.dims[:-2]
+        sizes = array.encoding["chunksizes"][:len(dimensions)]
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for row, coordinate in enumerate(indices):
+            key = tuple(int(index) // size for index, size in zip(coordinate, sizes))
+            groups.setdefault(key, []).append(row)
+        jobs = []
+        for key, rows in groups.items():
+            slices = {
+                dimension: (index * size, min((index + 1) * size, array.sizes[dimension]))
+                for dimension, index, size in zip(dimensions, key, sizes)
+            }
+            local = [tuple(int(index) - first for index, (first, _) in zip(indices[row], slices.values())) for row in rows]
+            decoded_bytes = int(np.prod([last - first for first, last in slices.values()]))
+            decoded_bytes *= int(np.prod(report["grid"]["shape"])) * array.dtype.itemsize
+            jobs.append(NcarChunk(str(array.name), slices, local, [report["fields"][row] for row in rows], decoded_bytes))
+    return report, jobs
+
+
+def write_ncar_chunk_cogs(
+    path: Path, chunk: NcarChunk, attributes: dict[str, Any],
+    grid: dict[str, Any], staged: Sequence[Path],
+) -> list[dict[str, Any]]:
+    """Decode one native NetCDF time chunk and encode its selected hourly COGs.
+
+    Keep the decoded chunk in this worker's memory. Independent jobs can decode
+    and encode concurrently without creating a month-sized decoded scratch file.
+
+    Args:
+        path: Complete cataloged NetCDF input retained until publication succeeds.
+        chunk: Native chunk slices and selected observation indices.
+        attributes: Source variable metadata including units and decoded precision.
+        grid: Validated global grid description.
+        staged: Journaled COG staging paths, one for each selected observation.
+
+    Returns:
+        Validated raster reports in the same order as chunk.fields and staged.
+
+    Raises:
+        Exception: NetCDF reads, COG writes, and validation failures propagate.
+    """
+    with xr.open_dataset(path, engine="h5netcdf", decode_timedelta=False) as dataset:
+        values = dataset[chunk.variable].isel({name: slice(*bounds) for name, bounds in chunk.slices.items()}).values
+    return [
+        conversion.write_observation_cog(values[index], field, attributes, grid, target)
+        for index, field, target in zip(chunk.indices, chunk.fields, staged, strict=True)
+    ]

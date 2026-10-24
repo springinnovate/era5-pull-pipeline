@@ -1,7 +1,7 @@
 """Exercise bulk NCAR scheduling through real NetCDF, COG, and SQLite files."""
 
 from collections.abc import Sequence
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -205,7 +205,7 @@ def test_year_boundary_reuses_forecast_file_and_completed_repeat_is_offline(
     def inspect_published_month(
         db: sqlite3.Connection, destination: Path, year: int, month: int,
         *args: Any, **kwargs: Any,
-    ) -> Path:
+    ) -> tuple[Path, Future[list[SourceFile]] | None]:
         """Check the shared source immediately after December publication."""
         result = ingest(db, destination, year, month, *args, **kwargs)
         if (year, month) == (1999, 12):
@@ -424,9 +424,10 @@ def test_publication_overlaps_downloads_with_bounded_workers(
     lock = Lock()
     active = peak = 0
     transfer_count = 0
+    encode_count = 0
     owner = get_ident()
     writer_threads: set[int] = set()
-    write = pipeline.write_decoded_observation_cog
+    write = pipeline.write_ncar_chunk_cogs
     publish = pipeline.publish_observation
     prepare = pipeline.prepare_observation
 
@@ -439,15 +440,17 @@ def test_publication_overlaps_downloads_with_bounded_workers(
             assert first_publication.wait(10), "processing waited for all downloads"
         files.transfer(source, target, **kwargs)
 
-    def encode(*args: Any) -> dict[str, Any]:
+    def encode(*args: Any) -> list[dict[str, Any]]:
         """Synchronize the first jobs so concurrency and its limit are observable."""
-        nonlocal active, peak
+        nonlocal active, peak, encode_count
         with lock:
             active += 1
             peak = max(peak, active)
             writer_threads.add(get_ident())
+            encode_count += 1
+            ordinal = encode_count
         try:
-            if args[1] < workers:
+            if ordinal <= workers:
                 worker_barrier.wait(timeout=10)
             return write(*args)
         finally:
@@ -458,20 +461,20 @@ def test_publication_overlaps_downloads_with_bounded_workers(
         """Keep the journal and all queued observations within the worker bound."""
         assert get_ident() == owner
         result = prepare(db, *args)
-        assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] <= workers
+        assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] <= workers * 6
         return result
 
     def publish_on_owner(db: sqlite3.Connection, *args: Any) -> Path:
         """Require a real durable observation before releasing the pending transfer."""
         assert get_ident() == owner
         assert slow_download.wait(10)
-        assert len(list((archive / "staging" / "observations").glob("*.tif"))) <= workers
+        assert len(list((archive / "staging" / "observations").glob("*.tif"))) <= workers * 6
         result = publish(db, *args)
         first_publication.set()
         return result
 
     monkeypatch.setattr(ncar_download, "download_file", transfer)
-    monkeypatch.setattr(pipeline, "write_decoded_observation_cog", encode)
+    monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
     monkeypatch.setattr(pipeline, "prepare_observation", prepare_on_owner)
     monkeypatch.setattr(pipeline, "publish_observation", publish_on_owner)
     result = pipeline.pull_range(
@@ -485,18 +488,18 @@ def test_publication_overlaps_downloads_with_bounded_workers(
 
 
 @pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
-def test_processing_failure_stops_downloads_and_waits_for_scratch_readers(
+def test_processing_failure_stops_downloads_and_waits_for_chunk_readers(
     tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
     failure: type[BaseException],
 ) -> None:
-    """Retain sources and wait for active readers before cleaning failed work."""
+    """Retain sources and wait for active chunk readers before returning."""
     archive = tmp_path / "archive"
     files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
     files.add_file("10u", "2000-01-01T00", "2000-01-01T23")
     reader_started = Event()
     download_stopped = Event()
     reader_finished = Event()
-    write = pipeline.write_decoded_observation_cog
+    write = pipeline.write_ncar_chunk_cogs
     calls: list[SourceFile] = []
 
     def transfer(source: SourceFile, target: Path, *, stop_event: Event, **kwargs: Any) -> None:
@@ -511,14 +514,14 @@ def test_processing_failure_stops_downloads_and_waits_for_scratch_readers(
             download_stopped.set()
             raise CancelledError()
 
-    def encode(*args: Any) -> dict[str, Any]:
-        """Keep one worker reading scratch during the coordinator's shutdown."""
-        if args[1] == 0:
+    def encode(*args: Any) -> list[dict[str, Any]]:
+        """Keep one worker reading the source during the coordinator's shutdown."""
+        if args[1].fields[0]["valid_time"] == 946684800:
             assert reader_started.wait(10)
             return write(*args)
         reader_started.set()
         assert download_stopped.wait(10)
-        assert args[0].exists(), "scratch deleted while a worker still needed it"
+        assert args[0].exists(), "source deleted while a worker still needed it"
         result = write(*args)
         reader_finished.set()
         return result
@@ -529,7 +532,7 @@ def test_processing_failure_stops_downloads_and_waits_for_scratch_readers(
 
     with monkeypatch.context() as patch:
         patch.setattr(ncar_download, "download_file", transfer)
-        patch.setattr(pipeline, "write_decoded_observation_cog", encode)
+        patch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
         patch.setattr(pipeline, "publish_observation", fail_publication)
         with pytest.raises(failure, match="publication interrupted"):
             pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t", "10u"], archive,
@@ -567,7 +570,7 @@ def test_download_slots_refill_during_netcdf_decoding(
     files.add_file("2t", "2000-01-02T00", "2000-01-02T23")
     decoding = Event()
     last_download = Event()
-    decode = pipeline.decode_ncar_source
+    decode = pipeline.write_ncar_chunk_cogs
     calls = 0
 
     def transfer(source: SourceFile, target: Path, **kwargs: Any) -> None:
@@ -580,14 +583,14 @@ def test_download_slots_refill_during_netcdf_decoding(
         if calls == 3:
             last_download.set()
 
-    def decode_after_downloads(*args: Any) -> dict[str, Any]:
+    def decode_after_downloads(*args: Any) -> list[dict[str, Any]]:
         """Wait for a refilled download slot before releasing the decoder."""
         decoding.set()
         assert last_download.wait(10), "downloads were not refilled during decoding"
         return decode(*args)
 
     monkeypatch.setattr(ncar_download, "download_file", transfer)
-    monkeypatch.setattr(pipeline, "decode_ncar_source", decode_after_downloads)
+    monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", decode_after_downloads)
     result = pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 2), ["2t", "10u"],
                                  tmp_path / "archive", download_workers=1, processing_workers=2)
     assert result["completed"] == 72 and calls == 3
@@ -599,26 +602,302 @@ def test_cog_worker_failure_keeps_committed_hours_and_source_for_resume(
     """Resume remaining observations after a worker fails to write its COG."""
     archive = tmp_path / "archive"
     files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
-    write = pipeline.write_decoded_observation_cog
+    write = pipeline.write_ncar_chunk_cogs
 
-    def fail_third(*args: Any) -> dict[str, Any]:
-        """Fail an output write after two durably published observations."""
-        if args[1] == 2:
+    def fail_second_chunk(*args: Any) -> list[dict[str, Any]]:
+        """Fail an output write after one durably published native chunk."""
+        if args[1].fields[0]["valid_time"] == 946684800 + 6 * 3600:
             raise OSError("COG storage unavailable")
         return write(*args)
 
     with monkeypatch.context() as patch:
-        patch.setattr(pipeline, "write_decoded_observation_cog", fail_third)
+        patch.setattr(pipeline, "write_ncar_chunk_cogs", fail_second_chunk)
         with pytest.raises(OSError, match="COG storage unavailable"):
             pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t"], archive,
                                 processing_workers=1)
     before = {path: path.stat().st_mtime_ns for path in archive.glob("2000/01/*/*.tif")}
-    assert len(before) == 2
+    assert len(before) == 6
     with catalog.archive_session(archive) as db:
         source = db.execute("SELECT * FROM source_files").fetchone()
         assert source["downloaded_at"] is not None and (archive / source["path"]).exists()
     result = pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t"], archive,
                                  processing_workers=2)
-    assert result["completed"] == 22 and result["skipped"] == 2
+    assert result["completed"] == 18 and result["skipped"] == 6
     assert len(files.downloaded) == 1
     assert before == {path: path.stat().st_mtime_ns for path in before}
+
+
+@pytest.mark.parametrize("fits", [True, False])
+def test_next_month_prefetch_overlaps_processing_only_within_source_budget(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch, fits: bool,
+) -> None:
+    """Prefetch while January processes, or wait for its source bytes to be freed."""
+    archive = tmp_path / "archive"
+    january = files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
+    february = files.add_file("2t", "2000-02-01T00", "2000-02-01T23")
+    with catalog.archive_session(archive) as db:
+        rows = catalog.register_sources(db, archive, [january], date(2000, 1, 1), date(2000, 1, 1))
+        files.download(db, [january], rows, archive=archive)
+    processing = Event()
+    prefetched = Event()
+    january_done = Event()
+    write = pipeline.write_ncar_chunk_cogs
+    ingest = pipeline.download_and_ingest_month
+    budget = january.size + february.size - (0 if fits else 1)
+
+    def transfer(source: SourceFile, target: Path, **kwargs: Any) -> None:
+        """Require overlap when budgeted, and defer transfer when it would overflow."""
+        assert source.key == february.key
+        if fits:
+            assert processing.wait(10)
+            assert not january_done.is_set()
+        else:
+            assert january_done.is_set()
+        with sqlite3.connect(archive / "catalog.sqlite") as db:
+            reserved = db.execute("SELECT SUM(size) FROM source_files WHERE removed_at IS NULL").fetchone()[0]
+            assert reserved <= budget
+        files.transfer(source, target, **kwargs)
+        prefetched.set()
+
+    def encode(*args: Any) -> list[dict[str, Any]]:
+        """Keep January decoding alive until the budgeted next-month transfer finishes."""
+        if args[1].fields[0]["valid_time"] < 949363200:
+            processing.set()
+            if fits:
+                assert prefetched.wait(10), "next-month downloads waited for processing"
+        return write(*args)
+
+    def month_finished(db: sqlite3.Connection, target: Path, year: int, month: int, *args: Any, **kwargs: Any) -> tuple[Path, Future[list[SourceFile]] | None]:
+        """Observe the durable month boundary before the next month starts."""
+        result = ingest(db, target, year, month, *args, **kwargs)
+        if month == 1:
+            january_done.set()
+        return result
+
+    monkeypatch.setattr(ncar_download, "download_file", transfer)
+    monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
+    monkeypatch.setattr(pipeline, "download_and_ingest_month", month_finished)
+    result = pipeline.pull_range(date(2000, 1, 1), date(2000, 2, 1), ["2t"], archive,
+                                 download_workers=1, processing_workers=2, max_source_gb=budget / 1e9)
+    assert result["completed"] == 48
+    assert prefetched.is_set()
+    assert files.downloaded.count((february.key, february.etag)) == 1
+
+
+def test_decoded_byte_budget_limits_concurrent_native_chunks(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Limit decoded arrays by bytes even when more process slots are available."""
+    files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
+    write = pipeline.write_ncar_chunk_cogs
+    barrier = Barrier(2)
+    lock = Lock()
+    active = peak = calls = 0
+    byte_budget = 2 * 6 * 3 * 4 * 4  # Two six-hour float32 fixture chunks.
+
+    def encode(*args: Any) -> list[dict[str, Any]]:
+        """Measure the actual live decoded reservations at the worker boundary."""
+        nonlocal active, peak, calls
+        with lock:
+            active += args[1].decoded_bytes
+            peak = max(peak, active)
+            calls += 1
+            ordinal = calls
+        try:
+            assert active <= byte_budget
+            if ordinal <= 2:
+                barrier.wait(timeout=10)
+            return write(*args)
+        finally:
+            with lock:
+                active -= args[1].decoded_bytes
+
+    monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
+    result = pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t"], tmp_path / "archive",
+                                 processing_workers=4, max_decoded_gb=byte_budget / 1e9)
+    assert result["completed"] == 24 and calls == 4 and peak == byte_budget
+
+
+def test_chunk_larger_than_decoded_budget_retains_source_for_retry(tmp_path: Path, files: NcarFiles) -> None:
+    """Reject an undersized decoding budget before staging observations."""
+    archive = tmp_path / "archive"
+    files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
+    with pytest.raises(ValueError, match="increase --max-decoded-gb"):
+        pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t"], archive,
+                            max_decoded_gb=(6 * 3 * 4 * 4 - 1) / 1e9)
+    with catalog.archive_session(archive) as db:
+        assert db.execute("SELECT COUNT(*) FROM publications").fetchone()[0] == 0
+        row = db.execute("SELECT path,downloaded_at FROM source_files").fetchone()
+        assert row["downloaded_at"] and (archive / row["path"]).exists()
+    result = pipeline.pull_range(date(2000, 1, 1), date(2000, 1, 1), ["2t"], archive)
+    assert result["completed"] == 24 and len(files.downloaded) == 1
+
+
+def test_prefetched_sources_survive_interrupted_current_month(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse prefetched next-month bytes after current-month publication fails."""
+    archive = tmp_path / "archive"
+    files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
+    february = files.add_file("2t", "2000-02-01T00", "2000-02-01T23")
+    prefetched = Event()
+    publish = pipeline.publish_observation
+    count = 0
+
+    def transfer(source: SourceFile, target: Path, **kwargs: Any) -> None:
+        """Signal completion of next month's retained input."""
+        files.transfer(source, target, **kwargs)
+        if source.key == february.key:
+            prefetched.set()
+
+    def interrupt(db: sqlite3.Connection, *args: Any) -> Path:
+        """Fail after three committed observations and a completed prefetch."""
+        nonlocal count
+        count += 1
+        if count == 4:
+            assert prefetched.wait(10)
+            raise KeyboardInterrupt("stop current month")
+        return publish(db, *args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ncar_download, "download_file", transfer)
+        patch.setattr(pipeline, "publish_observation", interrupt)
+        with pytest.raises(KeyboardInterrupt, match="stop current month"):
+            pipeline.pull_range(date(2000, 1, 1), date(2000, 2, 1), ["2t"], archive)
+    with catalog.archive_session(archive) as db:
+        row = db.execute("SELECT path,downloaded_at FROM source_files WHERE object_key=?", (february.key,)).fetchone()
+        assert row["downloaded_at"] is not None and (archive / row["path"]).exists()
+    result = pipeline.pull_range(date(2000, 1, 1), date(2000, 2, 1), ["2t"], archive)
+    assert result["completed"] == 45 and result["skipped"] == 3
+    assert files.downloaded.count((february.key, february.etag)) == 1
+
+
+@pytest.mark.parametrize("february_complete", [False, True])
+def test_lookahead_fills_spare_budget_beyond_one_future_month(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch, february_complete: bool,
+) -> None:
+    """Download March during January processing, including past a completed month."""
+    archive = tmp_path / "archive"
+    for month in (1, 2, 3):
+        last_day = 29 if month == 2 and february_complete else 1
+        files.add_file("2t", f"2000-{month:02d}-01T00", f"2000-{month:02d}-{last_day:02d}T23")
+    if february_complete:
+        pipeline.pull_range(date(2000, 2, 1), date(2000, 2, 29), ["2t"], archive)
+    march_ready = Event()
+    write = pipeline.write_ncar_chunk_cogs
+
+    def transfer(source: SourceFile, target: Path, **kwargs: Any) -> None:
+        """Signal the second future month's successful transfer."""
+        files.transfer(source, target, **kwargs)
+        if source.valid_start.month == 3:
+            march_ready.set()
+
+    def encode(*args: Any) -> list[dict[str, Any]]:
+        """Keep current processing active while lookahead advances twice."""
+        if args[1].fields[0]["valid_time"] < 949363200:
+            assert march_ready.wait(10), "lookahead stopped at a fixed one-month barrier"
+        return write(*args)
+
+    monkeypatch.setattr(ncar_download, "download_file", transfer)
+    monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
+    result = pipeline.pull_range(date(2000, 1, 1), date(2000, 3, 1), ["2t"], archive,
+                                 processing_workers=2, max_source_gb=sum(source.size for source in files.sources) / 1e9)
+    assert march_ready.is_set() and result["completed"] == (48 if february_complete else 72)
+    assert len(files.downloaded) == 3
+
+
+def test_prefetch_transfer_continues_across_publication_month_boundary(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advance the processing month without stopping or waiting for its download."""
+    files.add_file("2t", "2000-01-01T00", "2000-01-01T23")
+    february = files.add_file("2t", "2000-02-01T00", "2000-02-01T23")
+    january_done = Event()
+    transfer_started = Event()
+    ingest = pipeline.download_and_ingest_month
+
+    def transfer(source: SourceFile, target: Path, *, stop_event: Event, **kwargs: Any) -> None:
+        """Hold February's active transfer through January's completion."""
+        if source.key == february.key:
+            transfer_started.set()
+            assert january_done.wait(10), "current month waited for a future transfer"
+            assert not stop_event.is_set(), "transfer was stopped at the month boundary"
+        files.transfer(source, target, **kwargs)
+
+    def finished(db: sqlite3.Connection, archive: Path, year: int, month: int, *args: Any, **kwargs: Any) -> tuple[Path, Future[list[SourceFile]] | None]:
+        """Signal the published month without requiring future transfers to finish."""
+        result = ingest(db, archive, year, month, *args, **kwargs)
+        if month == 1:
+            assert transfer_started.wait(10)
+            january_done.set()
+        return result
+
+    monkeypatch.setattr(ncar_download, "download_file", transfer)
+    monkeypatch.setattr(pipeline, "download_and_ingest_month", finished)
+    result = pipeline.pull_range(date(2000, 1, 1), date(2000, 2, 1), ["2t"], tmp_path / "archive",
+                                 processing_workers=2)
+    assert result["completed"] == 48
+    assert files.downloaded.count((february.key, february.etag)) == 1
+
+
+def test_future_inventory_does_not_hold_up_next_month_processing(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Process February while March's inventory remains blocked in another thread."""
+    for month in (1, 2, 3):
+        files.add_file("2t", f"2000-{month:02d}-01T00", f"2000-{month:02d}-01T23")
+    march_lookup = Event()
+    february_processing = Event()
+    write = pipeline.write_ncar_chunk_cogs
+
+    def discover(first: date, last: date, names: Sequence[str], session: requests.Session) -> list[SourceFile]:
+        """Hold the future lookup until the next month has actually started work."""
+        if first.month == 3:
+            march_lookup.set()
+            assert february_processing.wait(10), "future inventory blocked processing"
+        return files.discover(first, last, names, session)
+
+    def encode(*args: Any) -> list[dict[str, Any]]:
+        """Observe February decoding before permitting March availability to return."""
+        month = datetime.fromtimestamp(args[1].fields[0]["valid_time"], UTC).month
+        if month == 1:
+            assert march_lookup.wait(10)
+        elif month == 2:
+            february_processing.set()
+        return write(*args)
+
+    monkeypatch.setattr(pipeline, "discover_files", discover)
+    monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
+    result = pipeline.pull_range(date(2000, 1, 1), date(2000, 3, 1), ["2t"], tmp_path / "archive",
+                                 processing_workers=2)
+    assert result["completed"] == 72 and february_processing.is_set()
+    assert len(files.downloaded) == 3
+
+
+def test_refresh_does_not_prefetch_an_incomplete_future_selection(
+    tmp_path: Path, files: NcarFiles, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve refresh's complete-month availability check during lookahead."""
+    january = files.add_file("2t", "2000-01-31T00", "2000-01-31T23")
+    files.add_file("2t", "2000-02-01T00", "2000-02-01T22")
+    prefetch_checked = Event()
+    prefetch = pipeline._prefetch_month_sources
+    write = pipeline.write_ncar_chunk_cogs
+
+    def inspect_prefetch(*args: Any, **kwargs: Any) -> bool:
+        """Allow current work to finish after future source admission is evaluated."""
+        result = prefetch(*args, **kwargs)
+        prefetch_checked.set()
+        return result
+
+    def encode(*args: Any) -> list[dict[str, Any]]:
+        """Keep processing open until next-month prefetch has been considered."""
+        assert prefetch_checked.wait(10)
+        return write(*args)
+
+    monkeypatch.setattr(pipeline, "_prefetch_month_sources", inspect_prefetch)
+    monkeypatch.setattr(pipeline, "write_ncar_chunk_cogs", encode)
+    with pytest.raises(ValueError, match="refresh requires every selected hour"):
+        pipeline.pull_range(date(2000, 1, 31), date(2000, 2, 1), ["2t"], tmp_path / "archive",
+                            refresh=True, processing_workers=2)
+    assert files.downloaded == [(january.key, january.etag)]
