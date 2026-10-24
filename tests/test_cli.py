@@ -24,7 +24,7 @@ def test_pull_selection_and_limits(monkeypatch: pytest.MonkeyPatch, refresh: boo
     assert cli.main(args) == 0
     pull.assert_called_once_with(
         date(1999, 12, 31), date(2000, 1, 2), ["2t", "ssrd", "mtpr"], Path("archive"),
-        download_workers=1, processing_workers=3, max_source_gb=8, refresh=refresh,
+        download_workers=1, processing_workers=3, max_source_gb=8, max_decoded_gb=2, refresh=refresh,
     )
 
 

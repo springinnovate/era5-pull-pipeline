@@ -1,5 +1,6 @@
 """Download NCAR source files with catalog-owned selection and completion state."""
 
+from collections import deque
 from collections.abc import Sequence
 from concurrent.futures import CancelledError, FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import UTC, date, datetime
@@ -141,17 +142,33 @@ class NcarDownloadPool:
         self.archive = archive
         self.workers = download_workers
         self.ready: list[str] = []
-        pending = []
+        self.remaining: deque[tuple[SourceFile, sqlite3.Row]] = deque()
+        self.queued: set[str] = set()
+        self.started = False
+        self.stop_event = Event()
+        self.executor = ThreadPoolExecutor(max_workers=download_workers)
+        self.active: dict[Future[None], tuple[sqlite3.Row, int]] = {}
+        self.add_sources(sources, rows)
+
+    def add_sources(self, sources: Sequence[SourceFile], rows: Sequence[sqlite3.Row]) -> None:
+        """Queue newly budgeted sources without duplicating in-progress transfers.
+
+        Args:
+            sources: Provider objects already reserved by the coordinator.
+            rows: Catalog rows in the same order as sources.
+        """
         for source, row in zip(sources, rows, strict=True):
             if row["downloaded_at"] is not None:
                 print(f"Reusing completed source: {row['path']}", flush=True)
                 self.ready.append(row["id"])
-            else:
-                pending.append((source, row))
-        self.remaining = iter(pending)
-        self.stop_event = Event()
-        self.executor = ThreadPoolExecutor(max_workers=download_workers)
-        self.active: dict[Future[None], tuple[sqlite3.Row, int]] = {}
+            elif row["id"] not in self.queued:
+                self.remaining.append((source, row))
+                self.queued.add(row["id"])
+        if self.started:
+            occupied = {position for _, position in self.active.values()}
+            for position in range(self.workers):
+                if position not in occupied:
+                    self._submit_next(position)
 
     def _submit_next(self, position: int) -> None:
         """Fill a free transfer slot with the next registered source.
@@ -159,9 +176,8 @@ class NcarDownloadPool:
         Args:
             position: Progress display slot freed by a completed transfer.
         """
-        pending = next(self.remaining, None)
-        if pending is not None:
-            source, row = pending
+        if self.remaining:
+            source, row = self.remaining.popleft()
             future = self.executor.submit(
                 download_file, source, self.archive / row["path"],
                 stop_event=self.stop_event, position=position,
@@ -177,6 +193,7 @@ class NcarDownloadPool:
         Raises:
             Exception: Submission failures propagate after active transfers stop.
         """
+        self.started = True
         try:
             for position in range(self.workers):
                 self._submit_next(position)
@@ -207,6 +224,7 @@ class NcarDownloadPool:
                     (retrieved_at, retrieved_at, row["id"]),
                 )
             del self.active[future]
+            self.queued.remove(row["id"])
             completed.append(row["id"])
             positions.append(position)
         for position in positions:

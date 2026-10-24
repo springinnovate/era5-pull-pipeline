@@ -149,3 +149,30 @@ def test_regional_source_is_not_accepted_as_global(tmp_path: Path) -> None:
         ncar_conversion.read_ncar_netcdf_arrays(
             path, "regional-source", "2t", selected, tmp_path, resources,
         )
+
+
+@pytest.mark.parametrize("variable,collection", [("2t", "an"), ("ssrd", "accumu"), ("mtpr", "meanflux")])
+def test_native_chunk_jobs_preserve_selected_pixels_and_intervals(tmp_path: Path, variable: str, collection: str) -> None:
+    """Encode noncontiguous analysis and forecast hours through native chunk jobs."""
+    import rasterio
+    path = tmp_path / f"e5.oper.fc.sfc.{collection}.nc"
+    values = write_ncar_netcdf_fixture(path, variable)
+    hours = ["2000-01-01T00", "2000-01-01T03"]
+    selected = np.array(hours, dtype="datetime64[s]").astype(np.int64)
+    report, chunks = ncar_conversion.plan_ncar_chunk_jobs(path, "source", variable, selected)
+    assert len(chunks) == 2
+    assert sum(len(chunk.fields) for chunk in chunks) == 2
+    for chunk_index, chunk in enumerate(chunks):
+        targets = [tmp_path / f"{chunk_index}-{index}.tif" for index in range(len(chunk.fields))]
+        attributes = report["variables"][chunk.fields[0]["variable"]]
+        results = ncar_conversion.write_ncar_chunk_cogs(path, chunk, attributes, report["grid"], targets)
+        assert len(results) == len(targets)
+        for field, target in zip(chunk.fields, targets):
+            offset = (field["valid_time"] - int(selected[0])) // 3600
+            expected = values[offset] if variable == "2t" else values[0, offset + 5]
+            with rasterio.open(target) as raster:
+                np.testing.assert_array_equal(raster.read(1), expected)
+                assert raster.units[0] == attributes["units"]
+            assert field["interval_end"] == field["valid_time"]
+            assert field["interval_start"] == field["valid_time"] - (0 if variable == "2t" else 3600)
+    assert not (tmp_path / "values.bin").exists()
