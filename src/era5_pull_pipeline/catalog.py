@@ -2,6 +2,7 @@
 
 from calendar import monthrange
 from collections.abc import Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 import json
@@ -20,6 +21,7 @@ from era5_pull_pipeline.ncar import SourceFile
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 COMMIT_RETRY_DELAYS = (1, 2, 4)
+INSTALL_WORKERS = 8
 LOGGER = logging.getLogger(__name__)
 
 SCHEMA = """
@@ -163,16 +165,23 @@ def catalog_transaction(db: sqlite3.Connection) -> Iterator[None]:
 
 
 def _install_observation(source: Path, destination: Path) -> None:
-    """Replace an observation file and flush directory entries where supported.
+    """Install a ready observation or confirm its already installed recovery path.
+
+    The publication owner creates destination directories before scheduling file
+    work. Each ready journal entry may refer to a staged file or to its already
+    installed destination after an interrupted publication.
 
     Args:
         source: Complete, validated staged COG on the archive filesystem.
-        destination: Deterministic published observation path.
+        destination: Deterministic published path whose parent already exists.
 
     Raises:
-        OSError: Installing or flushing the file fails.
+        OSError: The journaled file is missing or installing/flushing it fails.
     """
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not source.exists():
+        if not destination.is_file():
+            raise FileNotFoundError(f"The journaled observation is missing: {destination}")
+        return
     os.replace(source, destination)
     if os.name != "nt":
         for directory in {source.parent, destination.parent}:
@@ -186,7 +195,11 @@ def _install_observation(source: Path, destination: Path) -> None:
 def _recover_publications(
     db: sqlite3.Connection, archive: Path, identifiers: Sequence[str] | None = None,
 ) -> None:
-    """Finish validated COG publications in one coverage transaction after interruption.
+    """Install ready COGs concurrently and record their coverage in one transaction.
+
+    At most eight file operations run together, after the ready journal commits.
+    All file workers settle before coverage recording or error propagation. The
+    calling publication owner performs every catalog operation and local cleanup.
 
     Args:
         db: Catalog connection with exclusive writer ownership.
@@ -197,55 +210,67 @@ def _recover_publications(
         Exception: File installation or catalog errors propagate; the ready
             journal entry remains for the next writer to finish.
     """
-    query = "SELECT * FROM publications WHERE status = 'ready'"
+    query = """SELECT p.*, l.path AS local_path FROM publications p
+               LEFT JOIN local_files l ON l.kind='cog' AND l.id=p.id
+               WHERE p.status = 'ready'"""
     if identifiers is not None:
-        query += " AND id IN (" + ",".join("?" for _ in identifiers) + ")"
+        query += " AND p.id IN (" + ",".join("?" for _ in identifiers) + ")"
     publications = db.execute(query, identifiers or []).fetchall()
-    for publication in publications:
-        staged = archive / publication["staged_path"]
-        final = archive / publication["final_path"]
-        if staged.exists():
-            _install_observation(staged, final)
-        elif not final.is_file():
-            raise FileNotFoundError(f"The journaled observation is missing: {final}")
+    if not publications:
+        return
+    staged = [archive / publication["staged_path"] for publication in publications]
+    destinations = [archive / publication["final_path"] for publication in publications]
+    for directory in {path.parent for path in destinations}:
+        directory.mkdir(parents=True, exist_ok=True)
+    if len(publications) == 1:
+        _install_observation(staged[0], destinations[0])
+    else:
+        with ThreadPoolExecutor(max_workers=INSTALL_WORKERS, thread_name_prefix="observation-install") as executor:
+            # Leaving this context waits for every started file operation, even
+            # if one fails, before another writer can recover the ready journal.
+            for _ in executor.map(_install_observation, staged, destinations):
+                pass
     local_root = get_staging_dir(db)
     # Archive bytes and their ready journal are already durable. Remove the
     # local copy before coverage commits, so cleanup remains recoverable.
     for publication in publications:
-        local = db.execute("SELECT path FROM local_files WHERE kind='cog' AND id=?",
-                           (publication["id"],)).fetchone()
-        if local is not None:
-            (local_root / local["path"]).unlink(missing_ok=True)
+        if publication["local_path"] is not None:
+            (local_root / publication["local_path"]).unlink(missing_ok=True)
+    variables = {}
+    coverage = []
+    for publication in publications:
+        field = json.loads(publication["field_json"])
+        variables[field["variable"]] = publication["attributes_json"]
+        coverage.append((
+            field["variable"], field["valid_time"], publication["final_path"],
+            field["reference_time"], field["interval_start"], field["interval_end"],
+            field["start_step"], field["end_step"], field["step_units"], field["step_type"],
+            field["source_file_id"], field["source_variable"], publication["raster_json"],
+        ))
+    completed = [(publication["id"],) for publication in publications]
     with catalog_transaction(db):
-        for publication in publications:
-            field = json.loads(publication["field_json"])
-            db.execute(
-                """INSERT INTO variables VALUES (?, ?)
-                   ON CONFLICT (name) DO UPDATE SET attributes_json = excluded.attributes_json""",
-                (field["variable"], publication["attributes_json"]),
-            )
-            db.execute(
-                """INSERT INTO coverage
-                   (variable, valid_time, path, reference_time, interval_start,
-                    interval_end, start_step, end_step, step_units, step_type,
-                    source_file_id, source_variable, raster_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT (variable, valid_time) DO UPDATE SET
-                    path = excluded.path, reference_time = excluded.reference_time,
-                    interval_start = excluded.interval_start, interval_end = excluded.interval_end,
-                    start_step = excluded.start_step, end_step = excluded.end_step,
-                    step_units = excluded.step_units, step_type = excluded.step_type,
-                    source_file_id = excluded.source_file_id,
-                    source_variable = excluded.source_variable, raster_json = excluded.raster_json""",
-                (
-                    field["variable"], field["valid_time"], publication["final_path"],
-                    field["reference_time"], field["interval_start"], field["interval_end"],
-                    field["start_step"], field["end_step"], field["step_units"], field["step_type"],
-                    field["source_file_id"], field["source_variable"], publication["raster_json"],
-                ),
-            )
-            db.execute("DELETE FROM publications WHERE id = ?", (publication["id"],))
-            db.execute("DELETE FROM local_files WHERE kind='cog' AND id=?", (publication["id"],))
+        db.executemany(
+            """INSERT INTO variables VALUES (?, ?)
+               ON CONFLICT (name) DO UPDATE SET attributes_json = excluded.attributes_json""",
+            variables.items(),
+        )
+        db.executemany(
+            """INSERT INTO coverage
+               (variable, valid_time, path, reference_time, interval_start,
+                interval_end, start_step, end_step, step_units, step_type,
+                source_file_id, source_variable, raster_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (variable, valid_time) DO UPDATE SET
+                path = excluded.path, reference_time = excluded.reference_time,
+                interval_start = excluded.interval_start, interval_end = excluded.interval_end,
+                start_step = excluded.start_step, end_step = excluded.end_step,
+                step_units = excluded.step_units, step_type = excluded.step_type,
+                source_file_id = excluded.source_file_id,
+                source_variable = excluded.source_variable, raster_json = excluded.raster_json""",
+            coverage,
+        )
+        db.executemany("DELETE FROM publications WHERE id = ?", completed)
+        db.executemany("DELETE FROM local_files WHERE kind='cog' AND id=?", completed)
 
 
 def get_staging_dir(db: sqlite3.Connection) -> Path | None:

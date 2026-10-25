@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 import rasterio
+from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 
 GLOBAL_LATITUDES = np.arange(90.0, -90.25, -0.25, dtype=np.float64)
@@ -25,6 +26,11 @@ def write_observation_cog(
     values or sample centers. Internal overviews use nearest-neighbor sampling;
     the full-resolution band retains the decoded source precision and NoData.
     The caller publishes the file only after this function returns successfully.
+    Encode one COG and its temporary overviews in memory, write its completed
+    bytes sequentially to staging, then validate the actual on-disk file. This
+    additional encoding buffer is released before the next observation. Metadata
+    and overviews are internal, so GDAL opens each self-contained COG without
+    scanning the staging directory for auxiliary files.
 
     Args:
         values: Decoded two-dimensional array in latitude, longitude order.
@@ -71,19 +77,22 @@ def write_observation_cog(
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(
-        path, "w", driver="COG", height=values.shape[0], width=values.shape[1],
-        count=1, dtype=values.dtype, crs="EPSG:4326", transform=transform,
-        nodata=nodata, compress="DEFLATE", blocksize=512,
-        predictor="FLOATING_POINT" if floating else "STANDARD",
-        overview_resampling="NEAREST",
-    ) as target:
-        target.write(reordered, 1)
-        target.set_band_unit(1, attributes["units"])
-        target.set_band_description(1, attributes["name"])
-        target.update_tags(**tags)
+    with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"), MemoryFile() as encoded:
+        with encoded.open(
+            driver="COG", height=values.shape[0], width=values.shape[1],
+            count=1, dtype=values.dtype, crs="EPSG:4326", transform=transform,
+            nodata=nodata, compress="DEFLATE", blocksize=512,
+            predictor="FLOATING_POINT" if floating else "STANDARD",
+            overview_resampling="NEAREST",
+        ) as target:
+            target.write(reordered, 1)
+            target.set_band_unit(1, attributes["units"])
+            target.set_band_description(1, attributes["name"])
+            target.update_tags(**tags)
+        with path.open("wb") as staged:
+            staged.write(encoded.getbuffer())
 
-    with rasterio.open(path) as actual:
+    with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"), rasterio.open(path) as actual:
         structure = actual.tags(ns="IMAGE_STRUCTURE")
         if (
             actual.count != 1 or actual.shape != values.shape
