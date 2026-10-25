@@ -2,14 +2,17 @@
 
 from calendar import monthrange
 from collections import Counter, deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 import json
 from multiprocessing import get_context
+import os
 from pathlib import Path
 import signal
 import sqlite3
+from threading import Lock
 from typing import Any
 
 import requests
@@ -24,6 +27,54 @@ from era5_pull_pipeline.ncar_download import NcarDownloadPool, record_download_c
 from era5_pull_pipeline.publication import PublicationWorker
 from era5_pull_pipeline.ncar_ingest import ingest_ncar_month, select_ncar_source_hours
 from era5_pull_pipeline.staging import copy_local_cogs, get_source_path
+
+
+WORKER_LIBRARY_THREAD_VARIABLES = (
+    "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+)
+_worker_library_thread_lock = Lock()
+_worker_library_thread_users = 0
+_worker_library_thread_environment: dict[str, str | None] = {}
+
+
+@contextmanager
+def _limit_worker_library_threads() -> Iterator[None]:
+    """Limit native library threads before spawned workers import NumPy.
+
+    Each processing job already owns a process. Limit its numerical libraries to
+    one thread before process creation; a worker initializer runs after Windows
+    has imported the main module and can be too late for these library settings.
+    Keep this scope open until the pool has stopped, then restore the parent's
+    original environment. Other children launched during the scope also inherit
+    these settings.
+
+    Concurrent scopes share the temporary environment until the last pool exits.
+    Only entry and exit are synchronized; independent archives run concurrently.
+
+    Yields:
+        None while new worker processes inherit bounded native-library pools.
+    """
+    global _worker_library_thread_users
+    with _worker_library_thread_lock:
+        if _worker_library_thread_users == 0:
+            _worker_library_thread_environment.update(
+                (name, os.environ.get(name)) for name in WORKER_LIBRARY_THREAD_VARIABLES
+            )
+            for name in WORKER_LIBRARY_THREAD_VARIABLES:
+                os.environ[name] = "1"
+        _worker_library_thread_users += 1
+    try:
+        yield
+    finally:
+        with _worker_library_thread_lock:
+            _worker_library_thread_users -= 1
+            if _worker_library_thread_users == 0:
+                for name, original in _worker_library_thread_environment.items():
+                    if original is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = original
+                _worker_library_thread_environment.clear()
 
 
 def _ignore_worker_interrupt() -> None:
@@ -324,7 +375,7 @@ def pull_range(
         active_hours -= 1
 
     try:
-        with PublicationWorker(archive, processing_workers, staging_dir=staging_dir) as publisher, requests.Session() as session, ProcessPoolExecutor(
+        with PublicationWorker(archive, processing_workers, staging_dir=staging_dir) as publisher, _limit_worker_library_threads(), requests.Session() as session, ProcessPoolExecutor(
             max_workers=processing_workers, mp_context=get_context("spawn"),
             initializer=_ignore_worker_interrupt,
         ) as executor, NcarDownloadPool(
