@@ -84,7 +84,9 @@ def download_and_ingest_month(
 
     Processing reservations end when encoding finishes. A separate allowance of
     twice the process count bounds native batches from submission through durable
-    publication acknowledgement, including files still being encoded.
+    publication acknowledgement, including files still being encoded. Completed
+    chunks accumulate while one publication request is pending; the next request
+    commits all ready chunks together without delaying an idle writer.
 
     Args:
         publisher: Sole catalog and final-file writer with a bounded request queue.
@@ -129,22 +131,23 @@ def download_and_ingest_month(
     encoded: deque[tuple[str, NcarChunk, list[tuple[str, dict[str, Any]]]]] = deque()
     uploading: dict[Future[Any], tuple[str, NcarChunk, list[tuple[str, dict[str, Any]]]]] = {}
     uploaded: deque[tuple[str, NcarChunk, list[tuple[str, dict[str, Any]]]]] = deque()
-    publishing: dict[Future[Any], tuple[str, NcarChunk]] = {}
+    publishing: dict[Future[Any], list[tuple[str, NcarChunk]]] = {}
     reserved = 0
     limit = int(max_decoded_gb * 1_000_000_000)
     published: Counter[str] = Counter()
 
     def acknowledge_publications() -> None:
         """Release staging capacity and count batches after their durable commits."""
-        for future, (source_id, chunk) in list(publishing.items()):
+        for future, batches in list(publishing.items()):
             if not future.done() or future.cancelled():
                 continue
             future.result()
             del publishing[future]
-            for _ in chunk.fields:
-                on_published()
-            published[source_id] += len(chunk.fields)
-            print(f"Published {records[source_id]['variable']}: {published[source_id]}/{len(selected[source_id])} observations.", flush=True)
+            for source_id, chunk in batches:
+                for _ in chunk.fields:
+                    on_published()
+                published[source_id] += len(chunk.fields)
+                print(f"Published {records[source_id]['variable']}: {published[source_id]}/{len(selected[source_id])} observations.", flush=True)
 
     try:
         while waiting or ready or planning or unprepared or preparing or chunks or active or encoded or uploading or uploaded or publishing:
@@ -202,25 +205,25 @@ def download_and_ingest_month(
                     future = uploads.submit(copy_local_cogs, downloads.staging_dir, archive, paths,
                                             stop_event=downloads.stop_event)
                     uploading[future] = source_id, chunk, observations
-            while uploaded:
-                source_id, chunk, observations = uploaded[0]
+            if uploaded and not publishing:
+                observations = [observation for _, _, batch in uploaded for observation in batch]
                 if downloads.staging_dir is None:
                     future = publisher.try_submit(publish_observations, archive, observations)
                 else:
                     future = publisher.try_submit(publish_observations, archive, observations, files_flushed=True)
-                if future is None:
-                    break
-                uploaded.popleft()
-                publishing[future] = source_id, chunk
+                if future is not None:
+                    publishing[future] = [(source_id, chunk) for source_id, chunk, _ in uploaded]
+                    uploaded.clear()
             while ready and len(planning) + len(active) < processing_workers:
                 source_id = ready.popleft()
                 record = records[source_id]
                 future = executor.submit(plan_ncar_chunk_jobs, get_source_path(archive, downloads.staging_dir, record), source_id,
                                          record["variable"], selected[source_id])
                 planning[future] = source_id
+            publishing_batches = sum(len(batches) for batches in publishing.values())
             for _ in range(len(chunks)):
                 if (len(planning) + len(active) >= processing_workers
-                        or len(active) + len(encoded) + len(uploading) + len(uploaded) + len(publishing) >= 2 * processing_workers):
+                        or len(active) + len(encoded) + len(uploading) + len(uploaded) + publishing_batches >= 2 * processing_workers):
                     break
                 source_id, chunk = chunks.popleft()
                 if reserved + chunk.decoded_bytes > limit:
@@ -249,10 +252,11 @@ def download_and_ingest_month(
         publisher.drain()
         # A publication already executing can commit during shutdown. Count it
         # without replacing the original failure with another failed request.
-        for future, (_, chunk) in publishing.items():
+        for future, batches in publishing.items():
             if not future.cancelled() and future.exception() is None:
-                for _ in chunk.fields:
-                    on_published()
+                for _, chunk in batches:
+                    for _ in chunk.fields:
+                        on_published()
         raise
     publisher.call(_finish_month_sources, archive, selections)
     return archive / f"{year:04d}" / f"{month:02d}"
