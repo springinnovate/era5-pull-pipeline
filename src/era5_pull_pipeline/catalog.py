@@ -5,9 +5,11 @@ from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
+from time import sleep
 from typing import Any
 from uuid import uuid4
 import warnings
@@ -15,6 +17,10 @@ import warnings
 import portalocker
 
 from era5_pull_pipeline.ncar import SourceFile
+
+SQLITE_BUSY_TIMEOUT_SECONDS = 10
+COMMIT_RETRY_DELAYS = (1, 2, 4)
+LOGGER = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS staging_config (
@@ -116,6 +122,46 @@ source:
 """
 
 
+@contextmanager
+def catalog_transaction(db: sqlite3.Connection) -> Iterator[None]:
+    """Commit catalog changes, retrying when another connection blocks COMMIT.
+
+    A busy COMMIT leaves SQLite's transaction active. Retry that commit without
+    repeating SQL statements, file installation, or source cleanup. The native
+    connection timeout applies to each attempt. Roll back on exhaustion, an
+    unrelated failure, or interruption, preserving durable publication journals.
+
+    Args:
+        db: Connection owned by the archive writer, using implicit transactions.
+
+    Yields:
+        Control to the caller's existing transaction body.
+
+    Raises:
+        BaseException: The original operation, commit, or interruption error
+            propagates after rollback. Only an active SQLITE_BUSY commit retries.
+    """
+    try:
+        yield
+        for attempt in range(len(COMMIT_RETRY_DELAYS) + 1):
+            try:
+                db.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                if (getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_BUSY
+                        or not db.in_transaction or attempt == len(COMMIT_RETRY_DELAYS)):
+                    raise
+                delay = COMMIT_RETRY_DELAYS[attempt]
+                LOGGER.warning(
+                    "Catalog commit is waiting for another database connection; retry %s/%s in %s seconds.",
+                    attempt + 1, len(COMMIT_RETRY_DELAYS), delay,
+                )
+                sleep(delay)
+    except BaseException:
+        db.rollback()
+        raise
+
+
 def _install_observation(source: Path, destination: Path) -> None:
     """Replace an observation file and flush directory entries where supported.
 
@@ -170,7 +216,7 @@ def _recover_publications(
                            (publication["id"],)).fetchone()
         if local is not None:
             (local_root / local["path"]).unlink(missing_ok=True)
-    with db:
+    with catalog_transaction(db):
         for publication in publications:
             field = json.loads(publication["field_json"])
             db.execute(
@@ -230,7 +276,7 @@ def _discard_unpublished_local_cogs(db: sqlite3.Connection, archive: Path, local
     for row in rows:
         (local_root / row["path"]).unlink(missing_ok=True)
         (archive / row["path"]).unlink(missing_ok=True)
-    with db:
+    with catalog_transaction(db):
         db.executemany("DELETE FROM publications WHERE id=?", [(row["id"],) for row in rows])
         db.executemany("DELETE FROM local_files WHERE kind='cog' AND id=?", [(row["id"],) for row in rows])
 
@@ -257,7 +303,7 @@ def archive_session(archive: Path, *, staging_dir: Path | None = None) -> Iterat
     """
     archive.mkdir(parents=True, exist_ok=True)
     with portalocker.Lock(archive / ".writer.lock", "a", timeout=0):
-        with closing(sqlite3.connect(archive / "catalog.sqlite")) as db, ExitStack() as resources:
+        with closing(sqlite3.connect(archive / "catalog.sqlite", timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as db, ExitStack() as resources:
             db.row_factory = sqlite3.Row
             coverage_columns = {row["name"] for row in db.execute("PRAGMA table_info(coverage)")}
             if coverage_columns and "path" not in coverage_columns:
@@ -281,7 +327,7 @@ def archive_session(archive: Path, *, staging_dir: Path | None = None) -> Iterat
             if local_root is not None:
                 local_root.mkdir(parents=True, exist_ok=True)
                 resources.enter_context(portalocker.Lock(local_root / ".writer.lock", "a", timeout=0))
-                with db:
+                with catalog_transaction(db):
                     db.execute("INSERT INTO staging_config VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET directory=excluded.directory",
                                (str(local_root),))
             _recover_publications(db, archive)
@@ -369,7 +415,7 @@ def prepare_observations(
         rows.append((identifier, variable, field["valid_time"], staged.as_posix(), final.as_posix(),
                      json.dumps(field), json.dumps(attributes)))
         prepared.append((identifier, output_root / staged))
-    with db:
+    with catalog_transaction(db):
         db.executemany("DELETE FROM publications WHERE id=?", replaced)
         db.executemany("DELETE FROM local_files WHERE kind='cog' AND id=?", replaced)
         db.executemany(
@@ -442,7 +488,7 @@ def publish_observations(
         for identifier in identifiers:
             with (archive / publications[identifier]["staged_path"]).open("r+b") as stream:
                 os.fsync(stream.fileno())
-    with db:
+    with catalog_transaction(db):
         db.executemany(
             "UPDATE publications SET status='ready', raster_json=? WHERE id=?",
             [(json.dumps(report), identifier) for identifier, report in observations],
@@ -554,7 +600,7 @@ def delete_ingested_netcdf_files(db: sqlite3.Connection, archive: Path) -> None:
                 stacklevel=2,
             )
         else:
-            with db:
+            with catalog_transaction(db):
                 db.execute(
                     "UPDATE source_files SET downloaded_at = NULL, removed_at = ? WHERE id = ?",
                     (datetime.now(UTC).isoformat(), source["id"]),
@@ -616,7 +662,7 @@ def register_sources(
     selected_end = datetime.combine(end, time(23), tzinfo=UTC)
     rows = []
     local_root = get_staging_dir(db)
-    with db:
+    with catalog_transaction(db):
         for source in sources:
             row = db.execute(
                 "SELECT * FROM source_files WHERE object_key = ? AND etag = ?",

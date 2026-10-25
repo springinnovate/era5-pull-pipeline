@@ -10,7 +10,7 @@ import sqlite3
 from pathlib import Path
 
 from era5_pull_pipeline.catalog import (
-    archive_session, delete_ingested_netcdf_files, get_published_hours, get_staging_dir, group_hour_intervals,
+    archive_session, catalog_transaction, delete_ingested_netcdf_files, get_published_hours, get_staging_dir, group_hour_intervals,
     prepare_observation, publish_observation, remove_published_source_hours,
 )
 from era5_pull_pipeline.conversion import write_observation_cog
@@ -95,7 +95,7 @@ def ingest_ncar_month(
     if not selected:
         if not get_published_hours(db, year, month):
             raise ValueError(f"No downloaded selections for {year:04d}-{month:02d}. Run download-ncar first.")
-        with db:
+        with catalog_transaction(db):
             remove_published_source_hours(db, selections)
         delete_ingested_netcdf_files(db, archive)
         print(f"{year:04d}-{month:02d}: selected hours are already published.", flush=True)
@@ -117,7 +117,7 @@ def ingest_ncar_month(
                     get_source_path(archive, local_root, record), source_id, record["variable"],
                     hours, scratch, resources,
                 )
-                with db:
+                with catalog_transaction(db):
                     db.execute(
                         "UPDATE source_files SET attributes_json = ? WHERE id = ?",
                         (json.dumps(report["source_attributes"]), source_id),
@@ -140,7 +140,7 @@ def ingest_ncar_month(
 
     # Source selections survive interruptions. A repeat skips published COGs,
     # finishes remaining hours, and then releases the matching source inputs.
-    with db:
+    with catalog_transaction(db):
         remove_published_source_hours(db, selections)
     delete_ingested_netcdf_files(db, archive)
     return destination

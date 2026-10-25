@@ -15,7 +15,7 @@ from typing import Any
 import requests
 
 from era5_pull_pipeline.catalog import (
-    delete_ingested_netcdf_files, get_published_hours, get_staging_dir,
+    catalog_transaction, delete_ingested_netcdf_files, get_published_hours, get_staging_dir,
     prepare_observations, publish_observations, register_sources, remove_published_source_hours,
 )
 from era5_pull_pipeline.ncar import SourceFile, discover_files
@@ -48,7 +48,7 @@ def _prepare_source_publications(
         Publication identities and paths indexed by valid UTC time.
     """
     fields = [field for job in jobs for field in job.fields]
-    with db:
+    with catalog_transaction(db):
         db.execute("UPDATE source_files SET attributes_json = ? WHERE id = ?",
                    (json.dumps(report["source_attributes"]), source_id))
         prepared = prepare_observations(db, archive, fields,
@@ -66,7 +66,7 @@ def _finish_month_sources(
         archive: Root of recorded source paths.
         selections: Current month's selected source intervals.
     """
-    with db:
+    with catalog_transaction(db):
         remove_published_source_hours(db, selections)
     delete_ingested_netcdf_files(db, archive)
 
