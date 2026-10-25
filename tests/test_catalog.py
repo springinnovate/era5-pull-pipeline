@@ -17,6 +17,7 @@ from rasterio.transform import from_origin
 
 from era5_pull_pipeline import catalog
 from era5_pull_pipeline.ncar import SourceFile
+from era5_pull_pipeline.staging import get_source_path
 
 
 def _stage(
@@ -38,7 +39,7 @@ def _stage(
         valid_end=datetime(1950, 1, 31, 23, tzinfo=UTC),
     )
     row = catalog.register_sources(db, archive, [source], timestamp.date(), timestamp.date())[0]
-    source_path = archive / row["path"]
+    source_path = get_source_path(archive, catalog.get_staging_dir(db), row)
     source_path.parent.mkdir(parents=True, exist_ok=True)
     source_path.write_bytes(b"source bytes")
     with db:

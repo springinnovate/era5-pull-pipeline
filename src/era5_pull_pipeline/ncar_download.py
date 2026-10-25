@@ -14,7 +14,7 @@ from types import TracebackType
 import requests
 from tqdm import tqdm
 
-from era5_pull_pipeline.catalog import archive_session, get_staging_dir, register_sources
+from era5_pull_pipeline.catalog import archive_session, catalog_transaction, get_staging_dir, register_sources
 from era5_pull_pipeline.staging import get_source_path
 from era5_pull_pipeline.ncar import BUCKET_URL, SourceFile, discover_files
 
@@ -294,7 +294,7 @@ def record_download_completions(db: sqlite3.Connection, identifiers: list[str]) 
         identifiers: Sources whose full bytes have been received and flushed.
     """
     retrieved_at = datetime.now(UTC).isoformat()
-    with db:
+    with catalog_transaction(db):
         db.executemany(
             "UPDATE source_files SET downloaded_at = ?, retrieved_at = ? WHERE id = ?",
             [(retrieved_at, retrieved_at, identifier) for identifier in identifiers],
