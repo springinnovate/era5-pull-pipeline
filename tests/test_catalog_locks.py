@@ -36,12 +36,10 @@ def test_reader_releases_blocked_publication_commit(
             reader.execute("BEGIN")
             reader.execute("SELECT status FROM publications").fetchall()
 
-        def install_and_hold(source: Path, destination: Path) -> None:
-            """Acquire the reader after ready commits and before coverage starts."""
+        def record_install(source: Path, destination: Path) -> None:
+            """Record completed file work without sharing a SQLite connection."""
             install(source, destination)
             installed.append(destination)
-            if boundary == "coverage" and len(installed) == len(batch):
-                hold_reader()
 
         def release_reader(delay: float) -> None:
             """Release contention only after COMMIT has actually returned busy."""
@@ -59,12 +57,19 @@ def test_reader_releases_blocked_publication_commit(
                     assert all(not stage.exists() for _, stage, _, _ in batch)
             reader.rollback()
 
-        monkeypatch.setattr(catalog, "_install_observation", install_and_hold)
+        monkeypatch.setattr(catalog, "_install_observation", record_install)
         monkeypatch.setattr(catalog, "sleep", release_reader)
         if boundary == "ready":
             hold_reader()
         statements: list[str] = []
-        db.set_trace_callback(statements.append)
+
+        def trace_transaction(sql: str) -> None:
+            """Acquire the independent reader on its owner thread before coverage."""
+            statements.append(sql)
+            if boundary == "coverage" and sql.startswith("BEGIN") and len(installed) == len(batch):
+                hold_reader()
+
+        db.set_trace_callback(trace_transaction)
         result = catalog.publish_observations(
             db, archive, [(identifier, report) for identifier, _, _, report in batch],
             files_flushed=local is not None,
@@ -107,11 +112,14 @@ def test_reader_outlasts_retries_and_publication_resumes(
             reader.execute("BEGIN")
             reader.execute("SELECT status FROM publications").fetchall()
 
-        def install_and_hold(source: Path, destination: Path) -> None:
-            """Block coverage only after the ready journal and files are durable."""
+        def record_install(source: Path, destination: Path) -> None:
+            """Record file installation while leaving SQLite on its owner thread."""
             install(source, destination)
             installed.append(destination)
-            if boundary == "coverage" and len(installed) == len(batch):
+
+        def trace_transaction(sql: str) -> None:
+            """Block coverage after the ready journal and files are durable."""
+            if boundary == "coverage" and sql.startswith("BEGIN") and len(installed) == len(batch):
                 hold_reader()
 
         def keep_reader(delay: float) -> None:
@@ -121,10 +129,11 @@ def test_reader_outlasts_retries_and_publication_resumes(
             assert all(source.exists() for _, _, source, _ in batch)
 
         with monkeypatch.context() as patch:
-            patch.setattr(catalog, "_install_observation", install_and_hold)
+            patch.setattr(catalog, "_install_observation", record_install)
             patch.setattr(catalog, "sleep", keep_reader)
             if boundary == "ready":
                 hold_reader()
+            db.set_trace_callback(trace_transaction)
             with pytest.raises(sqlite3.OperationalError, match="database is locked") as caught:
                 catalog.publish_observations(
                     db, archive, [(identifier, report) for identifier, _, _, report in batch],

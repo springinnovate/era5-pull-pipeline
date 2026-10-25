@@ -285,13 +285,10 @@ def test_batch_publication_recovers_each_durability_boundary(
     with catalog.archive_session(tmp_path) as db:
         batch = [_stage(db, tmp_path, hour=hour) for hour in range(3)]
         install = catalog._install_observation
-        installations = 0
 
         def interrupted_install(source: Path, destination: Path) -> None:
-            """Fail after installing one file, leaving remaining ready files staged."""
-            nonlocal installations
-            installations += 1
-            if installations == 2:
+            """Leave one ready file staged while other parallel installs finish."""
+            if source == batch[1][1]:
                 raise OSError("batch interrupted")
             install(source, destination)
 
@@ -319,7 +316,7 @@ def test_batch_publication_recovers_each_durability_boundary(
         expected = "preparing" if boundary in {"flush", "ready"} else "ready"
         assert [row[0] for row in db.execute("SELECT status FROM publications")] == [expected] * 3
         if boundary == "install":
-            assert sum(stage.exists() for _, stage, _, _ in batch) == 2
+            assert 0 < sum(stage.exists() for _, stage, _, _ in batch) < len(batch)
     with catalog.archive_session(tmp_path) as db:
         if boundary in {"flush", "ready"}:
             catalog.publish_observations(db, tmp_path, [(identifier, report) for identifier, _, _, report in batch])
