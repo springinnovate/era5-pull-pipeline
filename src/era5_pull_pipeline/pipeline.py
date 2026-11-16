@@ -326,6 +326,7 @@ def pull_range(
     max_source_gb: float = 16,
     max_decoded_gb: float = 2,
     refresh: bool = False,
+    selected_hours: set[tuple[str, int]] | None = None,
 ) -> dict[str, int]:
     """Download selected NCAR hours and publish hourly COG observations.
 
@@ -346,6 +347,9 @@ def pull_range(
         max_source_gb: Maximum reserved NetCDF source bytes in decimal GB.
         max_decoded_gb: Maximum decoded chunk-array bytes in decimal GB.
         refresh: Retrieve current sources and replace selected stored fields.
+        selected_hours: Optional exact variable/Unix-hour pairs within the dates
+            and variables. Daily orchestration uses this to include following
+            midnight without downloading or requiring other following-day hours.
 
     Returns:
         Counts of completed, skipped, unavailable, failed, and pending
@@ -362,8 +366,16 @@ def pull_range(
     if download_workers < 1 or processing_workers < 1 or upload_workers < 1 or max_source_gb <= 0 or max_decoded_gb <= 0:
         raise ValueError("Download workers, processing workers, upload workers, source and decoded budgets must be positive.")
     variables = sorted(set(variables))
+    if selected_hours is not None:
+        first = int(datetime.combine(start, time.min, UTC).timestamp())
+        stop = int(datetime.combine(end, time(23), UTC).timestamp())
+        if any(variable not in variables or not isinstance(hour, int)
+               or hour % 3600 != 0 or not first <= hour <= stop
+               for variable, hour in selected_hours):
+            raise ValueError("Selected hours must be whole UTC hours within the requested dates and variables.")
     summary = dict(completed=0, skipped=0, unavailable=0, failed=0,
-                   pending=((end - start).days + 1) * 24 * len(variables))
+                   pending=(len(selected_hours) if selected_hours is not None
+                            else ((end - start).days + 1) * 24 * len(variables)))
     active_hours = 0
     activity = "opening the archive"
 
@@ -397,7 +409,7 @@ def pull_range(
                     Selection, inventory, admitted sources and remaining capacity,
                     or None when every future selection is already published.
                 """
-                selection = publisher.call(_select_prefetch_month, first, end, variables, refresh)
+                selection = publisher.call(_select_prefetch_month, first, end, variables, refresh, selected_hours)
                 if selection is None:
                     return None
                 first, last, needed, names = selection
@@ -440,6 +452,8 @@ def pull_range(
                     (variable, hour) for variable in variables
                     for hour in range(first_hour, last_hour + 1, 3600)
                 }
+                if selected_hours is not None:
+                    requested &= selected_hours
                 published = publisher.call(get_published_hours, cursor.year, cursor.month)
                 needed = requested if refresh else requested - published
                 skipped = len(requested) - len(needed)
@@ -496,6 +510,7 @@ def pull_range(
                 rows, required_bytes = publisher.call(
                     _register_month_sources, archive, required_sources, cursor, last,
                     end, set(owners), refresh, max_source_gb,
+                    selected_hours,
                 )
                 print(f"{label}: {len(owners)} variable-hours to publish; {skipped} skipped; "
                       f"{len(required_sources)} source files; {required_bytes / 1_000_000_000:.3f} GB reserved.", flush=True)
@@ -648,6 +663,7 @@ def _register_month_sources(
     db: sqlite3.Connection, archive: Path, required_sources: Sequence[SourceFile],
     first: date, last: date, end: date, owners: set[tuple[str, int]],
     refresh: bool, max_source_gb: float,
+    selected_hours: set[tuple[str, int]] | None = None,
 ) -> tuple[list[sqlite3.Row], int]:
     """Reserve current inputs and the future selected hours in shared source files.
 
@@ -661,6 +677,7 @@ def _register_month_sources(
         owners: Required variable-hour pairs.
         refresh: Replace selected observations even when already published.
         max_source_gb: Full-size budget for all retained and reserved inputs.
+        selected_hours: Exact invocation selection, or None for every requested hour.
 
     Returns:
         Registered source rows and total reserved bytes.
@@ -694,7 +711,8 @@ def _register_month_sources(
             if month not in future_coverage:
                 future_coverage[month] = get_published_hours(db, *month)
             pair = source.variable, int(hour_time.timestamp())
-            if refresh or pair not in future_coverage[month]:
+            if ((selected_hours is None or pair in selected_hours)
+                    and (refresh or pair not in future_coverage[month])):
                 registered_hours.add(pair)
             hour_time += timedelta(hours=1)
     rows = register_sources(
@@ -706,6 +724,7 @@ def _register_month_sources(
 def _select_prefetch_month(
     db: sqlite3.Connection, first: date, end: date,
     variables: Sequence[str], refresh: bool,
+    selected_hours: set[tuple[str, int]] | None = None,
 ) -> tuple[date, date, set[tuple[str, int]], list[str]] | None:
     """Select the next incomplete month and variables needing provider inventory.
 
@@ -715,6 +734,7 @@ def _select_prefetch_month(
         end: Last requested date.
         variables: Requested provider variable names.
         refresh: Include already published observations for replacement.
+        selected_hours: Exact invocation selection, or None for every requested hour.
 
     Returns:
         Month interval, missing hours and undiscovered variables, or None.
@@ -724,6 +744,8 @@ def _select_prefetch_month(
         hours = {(name, hour) for name in variables for hour in range(
             int(datetime.combine(first, time.min, UTC).timestamp()),
             int(datetime.combine(last, time(23), UTC).timestamp()) + 1, 3600)}
+        if selected_hours is not None:
+            hours &= selected_hours
         needed = hours if refresh else hours - get_published_hours(db, first.year, first.month)
         if needed:
             _, known = _recorded_source_owners(db, first, last, needed, refresh)

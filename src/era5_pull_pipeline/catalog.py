@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 from time import sleep
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 import warnings
 
@@ -25,6 +25,10 @@ INSTALL_WORKERS = 8
 LOGGER = logging.getLogger(__name__)
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS archive_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    resolution TEXT NOT NULL CHECK (resolution IN ('hourly', 'daily'))
+);
 CREATE TABLE IF NOT EXISTS staging_config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     directory TEXT NOT NULL
@@ -73,12 +77,19 @@ CREATE TABLE IF NOT EXISTS coverage (
     end_step INTEGER,
     step_units TEXT NOT NULL,
     step_type TEXT NOT NULL,
-    source_file_id TEXT NOT NULL REFERENCES source_files(id),
+    source_file_id TEXT REFERENCES source_files(id),
     source_variable TEXT NOT NULL,
     raster_json TEXT NOT NULL,
     PRIMARY KEY (variable, valid_time)
 );
 CREATE INDEX IF NOT EXISTS coverage_time ON coverage (valid_time);
+CREATE TABLE IF NOT EXISTS derived_observations (
+    variable TEXT NOT NULL,
+    valid_time INTEGER NOT NULL,
+    provenance_json TEXT NOT NULL,
+    PRIMARY KEY (variable, valid_time),
+    FOREIGN KEY (variable, valid_time) REFERENCES coverage(variable, valid_time)
+);
 CREATE TABLE IF NOT EXISTS publications (
     id TEXT PRIMARY KEY,
     variable TEXT NOT NULL,
@@ -109,7 +120,7 @@ SELECT c.variable, c.valid_time, c.path,
        c.start_step, c.end_step, c.step_units,
        c.source_file_id, c.source_variable, f.object_key, f.etag, f.last_modified, f.retrieved_at
 FROM coverage c JOIN variables v ON v.name = c.variable
-JOIN source_files f ON f.id = c.source_file_id
+LEFT JOIN source_files f ON f.id = c.source_file_id
 WHERE NOT EXISTS (
     SELECT 1 FROM publications p WHERE p.variable = c.variable
     AND p.valid_time = c.valid_time AND p.status = 'ready'
@@ -118,6 +129,13 @@ WHERE NOT EXISTS (
 
 DATASET_YAML = """id: era5-ncar
 title: ERA5 hourly weather
+source:
+  format: temporal_cog
+  catalog: catalog.sqlite
+"""
+
+DAILY_DATASET_YAML = """id: era5-ncar-daily
+title: ERA5 daily weather
 source:
   format: temporal_cog
   catalog: catalog.sqlite
@@ -195,7 +213,7 @@ def _install_observation(source: Path, destination: Path) -> None:
 def _recover_publications(
     db: sqlite3.Connection, archive: Path, identifiers: Sequence[str] | None = None,
 ) -> None:
-    """Install ready COGs concurrently and record their coverage in one transaction.
+    """Install ready COGs and atomically record coverage and derived provenance.
 
     At most eight file operations run together, after the ready journal commits.
     All file workers settle before coverage recording or error propagation. The
@@ -238,6 +256,7 @@ def _recover_publications(
             (local_root / publication["local_path"]).unlink(missing_ok=True)
     variables = {}
     coverage = []
+    derived = []
     for publication in publications:
         field = json.loads(publication["field_json"])
         variables[field["variable"]] = publication["attributes_json"]
@@ -247,6 +266,8 @@ def _recover_publications(
             field["start_step"], field["end_step"], field["step_units"], field["step_type"],
             field["source_file_id"], field["source_variable"], publication["raster_json"],
         ))
+        if "derivation" in field:
+            derived.append((field["variable"], field["valid_time"], json.dumps(field["derivation"])))
     completed = [(publication["id"],) for publication in publications]
     with catalog_transaction(db):
         db.executemany(
@@ -269,6 +290,11 @@ def _recover_publications(
                 source_variable = excluded.source_variable, raster_json = excluded.raster_json""",
             coverage,
         )
+        db.executemany(
+            "DELETE FROM derived_observations WHERE variable=? AND valid_time=?",
+            [(row[0], row[1]) for row in coverage],
+        )
+        db.executemany("INSERT INTO derived_observations VALUES (?, ?, ?)", derived)
         db.executemany("DELETE FROM publications WHERE id = ?", completed)
         db.executemany("DELETE FROM local_files WHERE kind='cog' AND id=?", completed)
 
@@ -307,7 +333,10 @@ def _discard_unpublished_local_cogs(db: sqlite3.Connection, archive: Path, local
 
 
 @contextmanager
-def archive_session(archive: Path, *, staging_dir: Path | None = None) -> Iterator[sqlite3.Connection]:
+def archive_session(
+    archive: Path, *, staging_dir: Path | None = None,
+    resolution: Literal["hourly", "daily"] = "hourly",
+) -> Iterator[sqlite3.Connection]:
     """Open the catalog with one writer and finish interrupted publications.
 
     Consumers refresh their catalog after updates and hold source files unchanged
@@ -316,13 +345,15 @@ def archive_session(archive: Path, *, staging_dir: Path | None = None) -> Iterat
     Args:
         archive: Archive directory to create or extend.
         staging_dir: Optional local directory to remember for new temporary files.
+        resolution: Observation frequency for this archive. Hourly and daily
+            observations use separate catalogs and dataset identities.
 
     Yields:
         A catalog connection protected from other pipeline writers.
 
     Raises:
         portalocker.exceptions.LockException: Another writer holds the archive or local directory.
-        ValueError: The catalog is incompatible, the local root overlaps the archive,
+        ValueError: The catalog has a different resolution or is incompatible, the local root overlaps the archive,
             or a different local root still has unfinished files.
         Exception: Catalog or publication recovery errors propagate.
     """
@@ -336,9 +367,21 @@ def archive_session(archive: Path, *, staging_dir: Path | None = None) -> Iterat
                     f"The archive at {archive} is not a COG catalog. "
                     "Use an existing COG archive or choose a new archive directory."
                 )
+            has_config = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive_config'").fetchone() is not None
+            configured = db.execute("SELECT resolution FROM archive_config WHERE id=1").fetchone() if has_config else None
+            has_observations = bool(coverage_columns) and db.execute("SELECT 1 FROM coverage LIMIT 1").fetchone() is not None
+            has_publication_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='publications'").fetchone() is not None
+            has_pending_publications = has_publication_table and db.execute("SELECT 1 FROM publications LIMIT 1").fetchone() is not None
+            existing_resolution = configured["resolution"] if configured is not None else (
+                "hourly" if has_observations or has_pending_publications or (archive / "dataset.yaml").exists() else resolution
+            )
+            if existing_resolution != resolution:
+                raise ValueError(f"This is an {existing_resolution} archive. Choose a separate {resolution} archive directory.")
             db.execute("PRAGMA foreign_keys = ON")
             db.execute("PRAGMA synchronous = FULL")
             db.executescript(SCHEMA)
+            with catalog_transaction(db):
+                db.execute("INSERT OR IGNORE INTO archive_config VALUES (1, ?)", (resolution,))
             local_root = get_staging_dir(db)
             if staging_dir is not None:
                 requested = staging_dir.expanduser().resolve()
@@ -362,7 +405,7 @@ def archive_session(archive: Path, *, staging_dir: Path | None = None) -> Iterat
             descriptor = archive / "dataset.yaml"
             if not descriptor.exists():
                 staged_descriptor = archive / ".dataset.yaml.tmp"
-                staged_descriptor.write_text(DATASET_YAML, encoding="utf-8")
+                staged_descriptor.write_text(DAILY_DATASET_YAML if resolution == "daily" else DATASET_YAML, encoding="utf-8")
                 os.replace(staged_descriptor, descriptor)
             yield db
 

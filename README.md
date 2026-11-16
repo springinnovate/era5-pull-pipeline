@@ -1,6 +1,6 @@
 # ERA5 pull pipeline
 
-A Python command-line pipeline that downloads full global ERA5 rasters from [NCAR's public archive](https://registry.opendata.aws/nsf-ncar-era5/) and writes one tiled, losslessly compressed Cloud Optimized GeoTIFF (COG) per variable and observation timestamp. Each invocation fills a requested date range and set of variables, publishes the observations, and exits. Repeated runs skip stored hours and resume unfinished downloads. No account or access token is required.
+A Python command-line pipeline that downloads full global ERA5 rasters from [NCAR's public archive](https://registry.opendata.aws/nsf-ncar-era5/) and writes one tiled, losslessly compressed Cloud Optimized GeoTIFF (COG) per variable and observation timestamp. Each invocation fills a requested date range and set of variables, publishes the observations, and exits. Repeated runs skip stored observations and resume unfinished downloads. No account or access token is required.
 
 ## Installation
 
@@ -13,7 +13,41 @@ python -m venv .venv
 
 The examples below use `python` from the environment where the package is installed. On Windows, `.\.venv\Scripts\python.exe` selects the environment explicitly; on macOS or Linux, use `.venv/bin/python`. The installed `era5-pull` command is equivalent to `python -m era5_pull_pipeline`.
 
-## Download a date range
+## Daily archives
+
+Use a separate archive for daily products. To condense existing hourly COGs without changing the source archive:
+
+```powershell
+python -m era5_pull_pipeline aggregate-daily --start-date 2000-01-01 --end-date 2000-01-31 --variables 2t 2d 10u 10v sp ssrd strd mtpr --source-archive archive-hourly --archive archive-daily
+```
+
+For future downloads that publish daily products:
+
+```powershell
+python -m era5_pull_pipeline pull-daily --start-date 2000-02-01 --end-date 2000-02-29 --variables 2t 2d 10u 10v sp ssrd strd mtpr --archive archive-daily --work-dir daily-work
+```
+
+Both commands take inclusive UTC dates and NCAR short variable names. `--start-date` is required; `--end-date` defaults to today in UTC. There is no fixed download date. The output `--archive` is required, and hourly and daily observations must not share an archive. Repeat a command to skip published days; add `--refresh` to replace selected days while preserving other observations. Keep the original hourly archive until the daily output has been verified, then refresh the consuming application's catalog before calculating.
+
+| Variables | Daily product | Units |
+| --- | --- | --- |
+| `2t`, `2d` | Mean temperature or dewpoint | K |
+| `10u`, `10v` | Mean wind component, not mean wind speed | m s⁻¹ |
+| `sp` | Mean surface pressure | Pa |
+| `ssrd`, `strd`, `ssr`, `str` | Total radiation energy | J m⁻² |
+| `mtpr` | Total precipitation (`total_precipitation`) | mm |
+
+Only complete 24-hour variable-days are published. Means use instantaneous observations at 00:00 through 23:00 UTC. Precipitation and radiation use the 24 hourly intervals ending at 01:00 through the following 00:00 UTC. The following midnight belongs to the preceding day's total, including across month and year boundaries. Precipitation rates are multiplied by 3,600 seconds before summation; radiation values already represent hourly energy and are summed directly. See the [ECMWF conversion table](https://confluence.ecmwf.int/spaces/CKB/pages/197702790/Conversion%2Btable%2Bfor%2Baccumulated%2Bvariables%2Btotal%2Bprecipitation%2Bfluxes).
+
+Missing hours leave the day unpublished and are reported for retry. A missing pixel in any contributing hour produces a missing daily pixel; missing values are not replaced with zero or ignored. Reductions and daily COGs use float64. Grid coordinates and sample centers are unchanged. Daily precipitation is an accumulation: sum these totals directly rather than integrating them as precipitation rates.
+
+The public `observations` columns are unchanged. Each daily row has a full-day interval, `temporal_type` of `mean` or `accumulation`, and `valid_time` at the **following midnight**. For example, the January 31 product is timestamped February 1 and stored under `2000/02/`. Daily archives have a distinct dataset identity and title. Because a daily product can combine multiple provider files and forecast initializations, its single-source provenance and forecast-reference columns are NULL. `derived_observations.provenance_json` records the reduction and all contributing hourly observations and provider identities; it is committed together with the daily observation.
+
+`pull-daily` uses the existing hourly downloader and COG conversion in private temporary storage, then applies the same daily reduction as `aggregate-daily`. Choose `--work-dir` outside the daily archive and outside directories scanned by a catalog consumer. This workflow writes temporary hourly COGs and needs space for one month of a variable plus its NetCDF sources. It stops at the first incomplete monthly variable selection and reports remaining pending days, retaining unfinished work for the same command to resume. Owned temporary data are removed only after the corresponding daily products have been published. It does not change an existing hourly archive.
+
+The daily pull accepts the same `--download-workers`, `--processing-workers`, `--upload-workers`, `--max-source-gb` and `--max-decoded-gb` limits as the hourly pull. Those limits govern hourly preparation; daily reduction reads one hour at a time. Only the hourly observations needed by the requested daily products are staged, including the following midnight for interval totals. NCAR still supplies whole source files, and a boundary source can be downloaded again for the next month's selection. Temporary hourly conversion adds I/O; it does not expose hourly products in the daily output catalog.
+
+## Download an hourly date range
 
 This example retrieves three UTC days of temperature, solar radiation, and precipitation across a year boundary:
 
