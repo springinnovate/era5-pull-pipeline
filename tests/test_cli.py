@@ -90,3 +90,42 @@ def test_local_staging_and_upload_workers(monkeypatch: pytest.MonkeyPatch) -> No
                      "--staging-dir", "local-cache", "--upload-workers", "3"]) == 0
     assert pull.call_args.kwargs["staging_dir"] == Path("local-cache")
     assert pull.call_args.kwargs["upload_workers"] == 3
+
+
+def test_daily_pull_cli_dates_and_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forward explicit daily selection and temporary-storage limits."""
+    pull = Mock()
+    monkeypatch.setattr(cli, "pull_daily", pull)
+    assert cli.main([
+        "pull-daily", "--start-date", "2024-02-29", "--end-date", "2024-03-01",
+        "--variables", "2t", "mtpr", "--archive", "daily", "--work-dir", "work",
+        "--download-workers", "3", "--processing-workers", "2", "--upload-workers", "1",
+        "--max-source-gb", "20", "--max-decoded-gb", "4", "--refresh",
+    ]) == 0
+    pull.assert_called_once_with(
+        date(2024, 2, 29), date(2024, 3, 1), ["2t", "mtpr"], Path("daily"),
+        work_dir=Path("work"), download_workers=3, processing_workers=2,
+        upload_workers=1, max_source_gb=20, max_decoded_gb=4, refresh=True,
+    )
+
+
+def test_daily_conversion_cli_keeps_source_separate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pass the read-only hourly source and daily destination independently."""
+    aggregate = Mock()
+    monkeypatch.setattr(cli, "aggregate_daily", aggregate)
+    assert cli.main([
+        "aggregate-daily", "--start-date", "1999-12-31", "--end-date", "2000-01-01",
+        "--variables", "2t", "ssrd", "--source-archive", "hourly", "--archive", "daily",
+    ]) == 0
+    aggregate.assert_called_once_with(
+        date(1999, 12, 31), date(2000, 1, 1), ["2t", "ssrd"], Path("hourly"),
+        Path("daily"), refresh=False,
+    )
+
+
+@pytest.mark.parametrize("command", ["pull-daily", "aggregate-daily"])
+def test_daily_commands_require_explicit_output(command: str) -> None:
+    """Avoid accidentally writing daily products into the default hourly archive."""
+    with pytest.raises(SystemExit) as caught:
+        cli.main([command, "--start-date", "2000-01-01", "--variables", "2t"])
+    assert caught.value.code == 2
