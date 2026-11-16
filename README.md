@@ -214,6 +214,19 @@ python -m era5_pull_pipeline ingest-ncar --archive downloads/local-ncar --year 2
 
 `download-ncar` retains all selected files under `staging/ncar/` and records selected hours in SQLite. Both standalone commands honor a local staging directory previously configured by `pull`. It supports `--download-workers` but does not impose the bulk workflow's source budget; use `pull` for long backfills. `ingest-ncar` publishes pending selections for one month without network access, using the serial offline ingestion path and disk-backed decoded scratch arrays. Add `--refresh` to ingestion to replace their stored values.
 
+## Standalone CDS daily downloads
+
+[scripts/fetch_era5.py](scripts/fetch_era5.py) downloads global daily temperature means and precipitation totals as NetCDF ZIP archives from the [CDS daily-statistics service](https://cds.climate.copernicus.eu/datasets/derived-era5-single-levels-daily-statistics). Configure credentials through [cdsapi's normal setup](https://cds.climate.copernicus.eu/how-to-api) and accept the dataset terms before downloading. Install its optional client separately:
+
+```powershell
+python -m pip install "cdsapi>=0.7.7"
+python scripts/fetch_era5.py --start-date 2026-10-01 --end-date 2026-10-31 --output-dir downloads/cds-daily --dry-run
+```
+
+Remove `--dry-run` to download. Dates are inclusive UTC days; omitting `--end-date` selects just the start date. Requests are grouped by calendar month and use hourly inputs for the daily statistics. Filenames identify the selected dates, variable, and statistic. Without `--output-dir`, files go in `era5_daily_<selected dates>` under the current directory. Existing ZIPs are skipped; failed or interrupted downloads leave no completed ZIP and can be retried. A dry run prints requests without loading credentials, contacting CDS, or writing files.
+
+This standalone helper produces daily NetCDF ZIPs. The NCAR commands above maintain the COG archive; the helper does not convert existing hourly COGs or publish an observation catalog.
+
 ## Tests
 
 Install the optional test dependencies and run:
