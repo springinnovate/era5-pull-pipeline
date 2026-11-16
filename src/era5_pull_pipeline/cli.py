@@ -11,6 +11,7 @@ from era5_pull_pipeline.ncar_ingest import ingest_ncar
 from era5_pull_pipeline.pipeline import pull_range
 from era5_pull_pipeline.daily import aggregate_daily
 from era5_pull_pipeline.daily_pipeline import pull_daily
+from era5_pull_pipeline.catalog import rebuild_observation_summary
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -27,6 +28,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(prog="era5-pull", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    summary = commands.add_parser(
+        "build-summary", help="Build compact catalog metadata for an existing archive.",
+        description=(
+            "Read and validate the observation catalog once, then publish its compact "
+            "metadata summary. Later updates maintain the summary automatically."
+        ),
+    )
+    summary.add_argument("--archive", type=Path, required=True,
+                         help="Existing hourly or daily archive containing catalog.sqlite.")
     pull = commands.add_parser(
         "pull", help="Download missing global hours and publish hourly COG files.",
         description=(
@@ -128,7 +138,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                              help="Separate output directory for the daily catalog and COG files.")
     args = parser.parse_args(argv)
     try:
-        if args.command == "pull":
+        if args.command == "build-summary":
+            print(f"Building catalog metadata summary for {args.archive}.", flush=True)
+            counts = rebuild_observation_summary(args.archive)
+            print("Metadata summary: " + ", ".join(f"{name}={count}" for name, count in counts.items()), flush=True)
+        elif args.command == "pull":
             pull_range(
                 args.start_date, args.end_date, args.variables, args.archive,
                 download_workers=args.download_workers,

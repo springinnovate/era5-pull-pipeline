@@ -221,6 +221,20 @@ with rasterio.open(archive / row[0]) as raster:
 
 One writer owns the archive. Consumers follow **update → refresh → calculate**: finish the producer update, refresh their observation listing, then calculate while source files remain unchanged. Each COG is finished, read back, and validated before publication. A durable SQLite journal bridges file installation and coverage recording so interrupted publication can finish on restart. Observations awaiting that commit are excluded from the public view. There are no historical raster copies or concurrent-reader snapshots.
 
+## Compact catalog metadata
+
+New archives publish an `observation_summary` relation for consumers that need variables, grids and time coverage without reading every observation. Publication maintains its counts and bounds together with the observation catalog. Summaries preserve distinct metadata groups so consumers can still detect inconsistent grids or variable descriptions. The public `observations` interface remains available for selecting and reading individual rasters.
+
+For an existing hourly or daily archive, install the updated producer and build the summary once:
+
+```powershell
+python -m era5_pull_pipeline build-summary --archive archive
+```
+
+This command holds the archive's existing writer lock and validates its observation metadata without opening TIFFs. The first build reads the full index and may take several minutes for a large network archive. It reports observation, variable and metadata-group counts. Rerun it to rebuild after an interrupted attempt. Use this producer version for subsequent archive updates so publication keeps the summary current, then refresh the consuming application's catalog before calculating.
+
+The summary is unavailable while a ready publication remains unfinished; consumers can use `observations` until recovery completes. An archive without an initialized summary also continues to support the ordinary observation interface. Summary field definitions and publication maintenance are in [the summary module](src/era5_pull_pipeline/observation_summary.py).
+
 ## Representative sample
 
 [examples/era5-cog-sample.zip](examples/era5-cog-sample.zip) contains a ready-to-read `era5-cog-sample/` archive: the descriptor, SQLite catalog, and six real global rasters for temperature, accumulated solar radiation, and mean precipitation rate at **1999-12-31 23:00 UTC** and **2000-01-01 00:00 UTC**. It has no pending downloads and uses the same output contract as a full archive.
