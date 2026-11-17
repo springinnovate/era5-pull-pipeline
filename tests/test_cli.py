@@ -129,3 +129,22 @@ def test_daily_commands_require_explicit_output(command: str) -> None:
     with pytest.raises(SystemExit) as caught:
         cli.main([command, "--start-date", "2000-01-01", "--variables", "2t"])
     assert caught.value.code == 2
+
+
+def test_build_summary_reports_existing_archive_metadata(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Build the requested archive summary and report observation/group counts."""
+    rebuild = Mock(return_value={"observations": 48, "variables": 2, "groups": 2})
+    monkeypatch.setattr(cli, "rebuild_observation_summary", rebuild)
+    assert cli.main(["build-summary", "--archive", "existing-archive"]) == 0
+    rebuild.assert_called_once_with(Path("existing-archive"))
+    output = capsys.readouterr().out
+    assert "observations=48" in output and "variables=2" in output and "groups=2" in output
+
+
+def test_build_summary_requires_explicit_archive() -> None:
+    """Require an existing archive selection before starting a summary build."""
+    with pytest.raises(SystemExit) as caught:
+        cli.main(["build-summary"])
+    assert caught.value.code == 2

@@ -18,6 +18,13 @@ import warnings
 import portalocker
 
 from era5_pull_pipeline.ncar import SourceFile
+from era5_pull_pipeline.observation_summary import (
+    SUMMARY_SCHEMA,
+    apply_observation_summary_changes,
+    initialize_observation_summary,
+    prepare_observation_summary_changes,
+    rebuild_observation_summary_rows,
+)
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 COMMIT_RETRY_DELAYS = (1, 2, 4)
@@ -213,7 +220,7 @@ def _install_observation(source: Path, destination: Path) -> None:
 def _recover_publications(
     db: sqlite3.Connection, archive: Path, identifiers: Sequence[str] | None = None,
 ) -> None:
-    """Install ready COGs and atomically record coverage and derived provenance.
+    """Install ready COGs and atomically record coverage, provenance and summaries.
 
     At most eight file operations run together, after the ready journal commits.
     All file workers settle before coverage recording or error propagation. The
@@ -270,6 +277,7 @@ def _recover_publications(
             derived.append((field["variable"], field["valid_time"], json.dumps(field["derivation"])))
     completed = [(publication["id"],) for publication in publications]
     with catalog_transaction(db):
+        summary_changes = prepare_observation_summary_changes(db, publications)
         db.executemany(
             """INSERT INTO variables VALUES (?, ?)
                ON CONFLICT (name) DO UPDATE SET attributes_json = excluded.attributes_json""",
@@ -290,6 +298,7 @@ def _recover_publications(
                 source_variable = excluded.source_variable, raster_json = excluded.raster_json""",
             coverage,
         )
+        apply_observation_summary_changes(db, summary_changes)
         db.executemany(
             "DELETE FROM derived_observations WHERE variable=? AND valid_time=?",
             [(row[0], row[1]) for row in coverage],
@@ -335,7 +344,7 @@ def _discard_unpublished_local_cogs(db: sqlite3.Connection, archive: Path, local
 @contextmanager
 def archive_session(
     archive: Path, *, staging_dir: Path | None = None,
-    resolution: Literal["hourly", "daily"] = "hourly",
+    resolution: Literal["hourly", "daily"] | None = "hourly",
 ) -> Iterator[sqlite3.Connection]:
     """Open the catalog with one writer and finish interrupted publications.
 
@@ -346,7 +355,8 @@ def archive_session(
         archive: Archive directory to create or extend.
         staging_dir: Optional local directory to remember for new temporary files.
         resolution: Observation frequency for this archive. Hourly and daily
-            observations use separate catalogs and dataset identities.
+            observations use separate catalogs and dataset identities. None
+            detects an existing archive's frequency for metadata maintenance.
 
     Yields:
         A catalog connection protected from other pipeline writers.
@@ -373,15 +383,16 @@ def archive_session(
             has_publication_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='publications'").fetchone() is not None
             has_pending_publications = has_publication_table and db.execute("SELECT 1 FROM publications LIMIT 1").fetchone() is not None
             existing_resolution = configured["resolution"] if configured is not None else (
-                "hourly" if has_observations or has_pending_publications or (archive / "dataset.yaml").exists() else resolution
+                "hourly" if has_observations or has_pending_publications or (archive / "dataset.yaml").exists() else (resolution or "hourly")
             )
-            if existing_resolution != resolution:
+            if resolution is not None and existing_resolution != resolution:
                 raise ValueError(f"This is an {existing_resolution} archive. Choose a separate {resolution} archive directory.")
             db.execute("PRAGMA foreign_keys = ON")
             db.execute("PRAGMA synchronous = FULL")
-            db.executescript(SCHEMA)
+            db.executescript(SCHEMA + SUMMARY_SCHEMA)
             with catalog_transaction(db):
-                db.execute("INSERT OR IGNORE INTO archive_config VALUES (1, ?)", (resolution,))
+                db.execute("INSERT OR IGNORE INTO archive_config VALUES (1, ?)", (existing_resolution,))
+                initialize_observation_summary(db)
             local_root = get_staging_dir(db)
             if staging_dir is not None:
                 requested = staging_dir.expanduser().resolve()
@@ -405,9 +416,36 @@ def archive_session(
             descriptor = archive / "dataset.yaml"
             if not descriptor.exists():
                 staged_descriptor = archive / ".dataset.yaml.tmp"
-                staged_descriptor.write_text(DAILY_DATASET_YAML if resolution == "daily" else DATASET_YAML, encoding="utf-8")
+                staged_descriptor.write_text(DAILY_DATASET_YAML if existing_resolution == "daily" else DATASET_YAML, encoding="utf-8")
                 os.replace(staged_descriptor, descriptor)
             yield db
+
+
+def rebuild_observation_summary(archive: Path) -> dict[str, int]:
+    """Initialize or rebuild an existing archive's compact observation metadata.
+
+    Hold the ordinary writer lock, finish ready publications, then validate
+    published metadata without reading TIFFs. Disable the previous summary
+    before rebuilding so a failed rebuild leaves consumers using observations.
+    Subsequent publications maintain the successful summary incrementally.
+
+    Args:
+        archive: Existing hourly or daily producer archive.
+
+    Returns:
+        Counts of summarized observations, variables, and metadata groups.
+
+    Raises:
+        FileNotFoundError: The archive has no existing catalog.
+        Exception: Locking, recovery, validation or catalog operations fail.
+    """
+    if not (archive / "catalog.sqlite").is_file():
+        raise FileNotFoundError(f"No observation catalog exists in {archive}.")
+    with archive_session(archive, resolution=None) as db:
+        with catalog_transaction(db):
+            db.execute("UPDATE observation_summary_state SET enabled=0 WHERE id=1")
+        with catalog_transaction(db):
+            return rebuild_observation_summary_rows(db)
 
 
 def prepare_observation(
